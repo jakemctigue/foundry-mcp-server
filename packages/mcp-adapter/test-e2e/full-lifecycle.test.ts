@@ -6,6 +6,7 @@ import path from "node:path";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import {
   base32Encode,
+  getIntelligenceStatus,
   setCapabilityGrant,
   startDaemon,
   FakeHookEventBridge,
@@ -368,6 +369,12 @@ describe("MOCKED FOUNDRY v14 full lifecycle E2E", () => {
         };
 
         await startHost();
+        await waitFor(
+          () =>
+            getIntelligenceStatus(required(daemon, "host daemon").db, CONNECTION_ID).status ===
+            "complete",
+          "initial intelligence reconciliation",
+        );
         const client = required(mcp, "MCP client").client;
         expect(await callTool(client, "foundry.connections.list", {})).toMatchObject({
           connections: [

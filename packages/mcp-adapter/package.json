@@ -16,7 +16,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint src test",
     "test": "vitest run",
-    "test:e2e": "vitest run test-e2e"
+    "test:e2e": "vitest run test-e2e --no-file-parallelism"
   },
   "dependencies": {
     "@foundry-mcp/host": "workspace:*",
