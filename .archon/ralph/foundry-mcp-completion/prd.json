@@ -42,17 +42,21 @@
     },
     {
       "id": "US-003",
-      "title": "Dual-era stdio adapter child-process tests",
-      "description": "As a maintainer, I want child-process tests proving the stdio adapter initializes correctly under both the current negotiated version and the declared legacy version(s), so that dual-era support claimed in docs/PRD.md §2 has real evidence.",
+      "title": "Migrate to stable MCP v2 and prove dual-era stdio",
+      "description": "As a maintainer, I want the adapter migrated from the legacy monolithic SDK to the stable MCP TypeScript SDK v2 server package and tested as a real child process, so that it truthfully serves MCP 2026-07-28 while retaining documented legacy compatibility.",
       "acceptanceCriteria": [
-        "Test spawns the adapter and performs an initialize handshake advertising the current version — asserts success",
-        "Test spawns the adapter and performs an initialize handshake advertising each entry in LEGACY_PROTOCOL_VERSIONS — asserts either graceful negotiation or a documented, structured rejection (no crash, no stdout corruption)",
-        "Both tests assert stdout contains only JSON-RPC frames (no log lines) per PRD §8",
+        "Production adapter dependencies use @modelcontextprotocol/server@2.0.0 and zod@^4.2.0; the legacy @modelcontextprotocol/sdk package is removed from production dependencies, with @modelcontextprotocol/client@2.0.0 allowed only for conformance tests",
+        "The executable stdio entry uses serveStdio(() => buildServer()) from @modelcontextprotocol/server/stdio with the default dual-era behavior; it does not use server.connect(new StdioServerTransport())",
+        "The MCP wire revision is distinct from the private Foundry bridge revision in code and capability output; MCP_PROTOCOL_VERSION is 2026-07-28 and legacy MCP versions include every intentionally tested supported era",
+        "A test spawns the built adapter and connects with the v2 client pinned using versionNegotiation.mode.pin = 2026-07-28, then asserts getNegotiatedProtocolVersion() reports 2026-07-28 and representative tools work",
+        "A separate child-process test performs a legacy initialize flow for each declared legacy MCP version and asserts successful or explicitly documented structured handling without a crash",
+        "Modern and legacy tests assert stdout contains only protocol frames and that logs remain on stderr/files per PRD §8",
+        "The migration follows the official TypeScript SDK v2 protocol-version and serveStdio guidance rather than changing only a string constant",
         "pnpm --filter @foundry-mcp/mcp-adapter test:e2e passes",
         "Type-check passes",
         "Tests pass"
       ],
-      "technicalNotes": "Extend packages/mcp-adapter/test-e2e/smoke.test.ts. Reuse the stub bridge path (createStubBridgeConnection in bridge-connection.ts) so the test doesn't require a running daemon.",
+      "technicalNotes": "Use @modelcontextprotocol/server and @modelcontextprotocol/server/stdio. Official v2 migration guidance requires serveStdio for 2026-07-28; merely changing imports while retaining StdioServerTransport serves only the legacy wire. Keep dual-era support by default and verify both paths with built child processes.",
       "dependsOn": ["US-002"],
       "priority": 3,
       "passes": false,
@@ -134,6 +138,8 @@
       "description": "As an AI client, I want a foundry.documents.types tool that reports the runtime-registered Document types for the connected world, so that I never assume a hard-coded Actor/Item/Scene list.",
       "acceptanceCriteria": [
         "New protocol schema for documents.types request/response added under packages/protocol/src/ (input: connectionId or implicit-single-connection; output: array of {type, creatable, reason?})",
+        "Actor and Item capability output includes every subtype registered by the active game system at runtime, with read/create/update support and an explicit reason for unsupported or permission-forbidden subtypes",
+        "Fake runtime tests register at least two Actor subtypes and two Item subtypes with arbitrary system-specific fields and prove discovery is data-driven rather than a hard-coded subtype list",
         "packages/host/src/fake-foundry/documents.ts extended if needed to report registered types generically",
         "New tool foundry.documents.types registered in server.ts following the existing registerTool pattern (server.ts:44-73)",
         "Derived/locked/permission-forbidden types report creatable: false with a reason string, not omission",
@@ -156,6 +162,7 @@
         "Deterministic ordering documented and tested (e.g. by id ascending) so repeated calls with the same cursor are stable",
         "pageSize above the documented max is clamped or rejected with INVALID_DATA, not silently ignored",
         "Fake runtime (fake-foundry/documents.ts) seeded with >1 page of documents; test walks all pages via cursor and asserts full coverage with no duplicates/gaps",
+        "Listing tests include world Actors of every registered fake-system subtype and world Items of every registered fake-system subtype",
         "Type-check passes",
         "Tests pass"
       ],
@@ -192,6 +199,7 @@
         "Protocol schema: input {type, data, parentUuid?} or {items: [...]} for batch; output returns created uuid/document per item with no partial-success ambiguity (each item's outcome is explicit: created | error with reason)",
         "Batch call with one invalid item still reports success for valid items and a structured per-item error for the invalid one",
         "Fake runtime records created documents so subsequent get/list calls see them within the same test",
+        "Tests create a world Actor for every runtime-reported Actor subtype, a world Item for every runtime-reported Item subtype, and an Item embedded in an Actor without hard-coding subtype names in production logic",
         "Permission-denied case (simulated) returns structured PERMISSION_DENIED, not a generic failure",
         "Type-check passes",
         "Tests pass"
@@ -210,7 +218,8 @@
         "Protocol schema: input {uuid, data, expectedVersion or expectedHash, forceOverwrite?: boolean}, output {uuid, newVersion/hash}",
         "Mismatched precondition returns structured CONFLICT error and does not apply the update",
         "forceOverwrite: true bypasses the precondition explicitly and is logged/audited as a waiver",
-        "Fields present in the stored document but absent from the update payload are preserved, not dropped",
+        "Fields present in the stored document but absent from the update payload are preserved, not dropped, including unknown system-specific Actor and Item fields",
+        "Update tests cover a system-defined Actor subtype, a world Item subtype, and an Item embedded in an Actor",
         "Test covers matching precondition (succeeds), mismatched precondition (CONFLICT), and forced overwrite",
         "Type-check passes",
         "Tests pass"
@@ -229,6 +238,7 @@
         "Protocol schema: input {parentUuid, embeddedType?, recursive?: boolean, maxDepth (bounded)}, output {items[], nextCursor?}",
         "recursive traversal enforces maxDepth and returns a truncated: true flag plus reason when the cap is hit, rather than silently stopping",
         "Non-recursive call with parentUuid + embeddedType returns only direct children of that type",
+        "An Actor fixture with embedded Items of multiple runtime-defined subtypes is fully enumerable and preserves parent UUID and subtype metadata",
         "Test covers a 3-level nested fixture, asserting depth cap and truncation flag behavior",
         "Type-check passes",
         "Tests pass"
@@ -248,6 +258,7 @@
         "foundry.compendiums.documents.list accepts {packId, hydrate: boolean, cursor?, pageSize} and returns index-only fields when hydrate is false, full document data when true",
         "Inaccessible/locked packs are excluded from the list, not returned with an error",
         "Fake runtime seeded with at least one compendium pack fixture",
+        "Fixtures include accessible Actor and Item packs with multiple system subtypes plus locked packs; accessible entries enumerate/hydrate and locked-pack writes fail closed",
         "Type-check passes",
         "Tests pass"
       ],
@@ -297,10 +308,10 @@
       "title": "Image asset listing across sources",
       "description": "As an AI client, I want foundry.assets.images.list to enumerate image assets across configured sources (data/public/optional S3) with filters, pagination, dedup, and bounded recursion, so that I can browse available art without downloading every file.",
       "acceptanceCriteria": [
-        "Protocol schema: input {source?, pathPrefix?, extensions?, cursor?, pageSize, maxDepth}, output {items: [{path, source, size?, mimeType?}], nextCursor?}",
+        "Protocol schema: input {source?, pathPrefix?, extensions?, cursor?, pageSize, maxDepth}, output {items: [{path, source, size?, mimeType?, writable, writeReason?}], sources: [{id, writable, reason?}], nextCursor?}",
         "Duplicate paths across sources are deduplicated per a documented rule (e.g. first-seen source wins)",
         "maxDepth caps recursive directory walks; exceeding it truncates with a reported reason",
-        "Fake runtime exposes a mock FilePicker-equivalent source tree for testing",
+        "Fake runtime exposes writable and read-only FilePicker-equivalent source trees; tests prove capability reporting and enumeration across both without attempting direct host/container filesystem access",
         "Type-check passes",
         "Tests pass"
       ],
@@ -337,6 +348,8 @@
         "MIME/extension mismatch (e.g. .png extension with JPEG magic bytes) is rejected",
         "Oversized payload (above a documented max) is rejected before full buffering when feasible",
         "Collision policy is honored and tested for all three onCollision values",
+        "Uploads and generated assets succeed only in destinations reported writable by the Foundry FilePicker source; read-only source/path writes fail with PERMISSION_DENIED and leave assets unchanged",
+        "Tests prove create, explicit overwrite, collision-safe rename, and persistence/listing of the resulting writable assets",
         "Type-check passes",
         "Tests pass"
       ],
@@ -388,6 +401,7 @@
       "description": "As an AI client, I want foundry.assets.images.attach to create/update a Document referencing an uploaded image as one auditable operation, and any URL-import path to block SSRF-prone targets by default, so that attaching art is atomic and importing from a URL can't be abused to probe internal networks.",
       "acceptanceCriteria": [
         "foundry.assets.images.attach combines upload-or-reference + document field update into a single tool call with one audit entry, not two independently-failable steps",
+        "Attachment tests update image fields on system-defined Actor and Item subtypes while preserving their unknown system data, and reject writes when either the asset destination or Document is not writable",
         "If URL import is implemented: loopback, link-local, private-network (RFC1918), credential-bearing URLs, redirect chains, and oversized responses are rejected by default before any bytes are fetched into memory beyond a small probe",
         "Test asserts each blocked category (loopback, link-local, private-network, credentialed URL, oversized) is rejected with a structured error",
         "Type-check passes",
@@ -569,6 +583,9 @@
         "packages/foundry-module/src/ gains document-operation handlers that call Foundry's public generic Document APIs (create/update, embedded documents) under the connected user's permissions",
         "Asset upload handler uses Foundry's FilePicker upload API respecting the same path/MIME/size policy validated in US-019",
         "Hook listeners (createDocument/updateDocument/deleteDocument etc.) emit the event envelope shape defined in US-026 over the module's WebSocket bridge",
+        "Companion endpoint configuration supports ws:// for local HTTP Foundry and wss:// for HTTPS/reverse-proxied or remote Docker-hosted Foundry, with an explicit Foundry Origin allowlist and no wildcard-origin fallback",
+        "The module architecture remains browser-client based and behaves identically when Foundry v14 runs in the desktop application or a user-managed Docker container; it never reads Foundry's database or container filesystem directly",
+        "Reconnect/resume logic survives Foundry container, browser client, and Windows broker restarts without duplicate requests or event loss beyond the documented reconciliation window",
         "Module-side code contains no direct file-system or credential access beyond what Foundry's client APIs expose (PRD §3 no-exfiltration constraint)",
         "Tests run against the module's logic with a mocked Foundry global (game/foundry namespace stubs) since no live Foundry install is available — clearly labeled as fake/mocked evidence",
         "Type-check passes",
@@ -588,6 +605,7 @@
         "scripts/windows/install.ps1, pair.ps1, uninstall.ps1 created (or equivalent naming), each idempotent and using literal quoted paths (no $HOME/$home reassignment)",
         "uninstall.ps1 only deletes files/paths it can prove it created/owns (e.g. via a manifest written at install time) — refuses to recursively delete an unrecognized directory",
         "Scripts support Foundry User Data paths containing spaces and Unicode (tested with a fixture path)",
+        "install.ps1 and uninstall.ps1 accept an explicit Docker bind-mounted Foundry User Data path and install/remove only the owned module directory inside that mount without invoking Docker or mutating unrelated container data",
         "pair.ps1 prints the MCP client JSON snippet after generating/rotating the pairing secret, without ever echoing the secret in a way that lands in shell history logs beyond the intended one-time display",
         "Type-check passes (for any TS backing these scripts) and a PowerShell script analyzer (or manual review checklist) passes",
         "Tests pass"
@@ -605,6 +623,7 @@
       "acceptanceCriteria": [
         "packages/cli/src/doctor.ts extended with checks for: DB migration status (US-025), Foundry module installed in the configured User Data directory, active bridge connections, and provider configuration presence (never the provider secret value itself)",
         "Each check reports pass/fail/warn with a human-readable remediation hint",
+        "Doctor validates configured ws:// or wss:// broker/module endpoints, Foundry Origin allowlisting, TLS/mixed-content compatibility, and an explicitly configured Docker bind-mounted User Data path without requiring Docker to be running",
         "Provider configuration check confirms presence/absence only — a test asserts no secret value ever appears in doctor output",
         "packages/cli/test/doctor.test.ts extended to cover each new check's pass and fail path",
         "Type-check passes",
@@ -625,6 +644,7 @@
         "Command also produces a versioned zip artifact",
         "`npm pack --dry-run`-equivalent content check run against the module package confirms no secrets, databases, logs, or dev-only fixtures are included",
         "Test asserts module.json parses and contains required Foundry manifest fields (id, title, version, compatibility)",
+        "The same module directory/zip is installable through Foundry's manifest flow or copied into an explicit Docker bind-mounted Data/modules directory; packaging does not assume the Windows desktop Foundry layout",
         "Type-check passes",
         "Tests pass"
       ],
@@ -641,6 +661,8 @@
       "acceptanceCriteria": [
         "Single test file (e.g. packages/mcp-adapter/test-e2e/lifecycle.test.ts) walks the entire sequence described above against the fake runtime end-to-end",
         "Test explicitly restarts the host/daemon process (or its in-process equivalent) mid-test and asserts prior state (documents, session, events, index) survived",
+        "A container-restart simulation disconnects and reconnects the module bridge, resumes from the last acknowledged event sequence, and proves no duplicate mutation/event after reconnect",
+        "Lifecycle fixtures explicitly enumerate and write multiple runtime-defined Actor and Item subtypes plus writable/read-only asset sources",
         "Test output/comments clearly label this as fake-runtime evidence, not live-Foundry evidence, per PRD §10's honesty requirement",
         "pnpm test:e2e passes in CI",
         "Type-check passes",
@@ -678,6 +700,8 @@
         "docs/architecture.md (or equivalent) includes a data-flow diagram and threat model covering DNS rebinding, CSRF/origin, named-pipe ACLs, token theft/replay, prompt injection, SSRF, traversal, decompression bombs, malicious SVG, private-content leakage, and malicious module-socket messages",
         "docs/tools-reference.md documents every registered tool/resource/prompt with schema and example",
         "docs/windows-quickstart.md walks clone-through-first-successful-foundry.connections.list",
+        "A Docker-hosted Foundry guide covers explicit bind-mounted User Data/module installation, Docker Desktop and remote-host layouts, ws:// versus wss:// reverse-proxy/TLS requirements, strict Origin allowlisting, broker discovery, restart/reconnect behavior, and removal without touching world data",
+        "The Docker guide provides an overlay/example that references but never bundles a user-owned licensed Foundry image, plus an opt-in real-container smoke checklist whose unrun steps are not presented as evidence",
         "docs/validation-matrix.md explicitly lists, per capability, whether evidence is fake-runtime or real-Foundry (real-Foundry rows marked 'not available in this environment' with the manual smoke-test procedure instead, per PRD's no-fabrication rule)",
         "All doc code samples/commands are copy-paste runnable and were actually run once during authoring",
         "Type-check passes",

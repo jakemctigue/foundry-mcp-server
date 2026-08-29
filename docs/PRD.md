@@ -14,8 +14,10 @@ Normative scope definitions:
 
 - **Any object** means every runtime-registered Foundry root or embedded `Document` visible to the paired user, including accessible compendium Documents. It does not include the JavaScript heap, DOM, functions, prototypes, runtime globals, credentials, or arbitrary files.
 - **Create any object** means every runtime-reported Document type which is creatable for the paired principal and valid under Foundry's runtime schema. Derived, locked, or permission-forbidden types report `creatable: false` and a reason.
+- **Actors and Items** explicitly include every Actor and Item subtype registered by the active game system at runtime, world-level Actors and Items, Items embedded in Actors, and accessible Actor/Item compendium Documents. The integration must preserve unknown system-specific fields and must not reduce support to a hard-coded core subtype list.
 - **Any image** means image assets visible through authorized Foundry FilePicker sources plus image references in visible Documents. It does not include arbitrary Windows files or protected assets that Foundry does not expose.
 - **Create images** includes safe upload/import, genuine generation through an explicitly configured provider, and attachment to a Foundry Document. Upload alone must not be described as generation.
+- **Writable assets** means every configured Foundry FilePicker source/path for which the paired principal and source provider report write permission. Asset capability responses expose `writable` plus a reason when false; uploads, generated images, collision-safe replacement, and Document attachment must work through Foundry's public file APIs without direct container or host filesystem mutation.
 - **Background intelligence** includes local incremental indexing/retrieval by default and optional scheduled model analysis which produces cited drafts. It never grants a model authority to bypass policy or mutate the world autonomously.
 
 ## 2. Product shape
@@ -27,6 +29,8 @@ Implement a small monorepo with these independently testable parts:
 3. **Foundry companion module** — a distributable Foundry v14 module which runs in an authenticated active Foundry client, executes operations through public Foundry APIs under the connected user's permissions, and streams relevant hooks/events to the local host.
 4. **Shared protocol package** — versioned request, response, event, error, and capability schemas used by both sides.
 5. **Windows tooling** — PowerShell install/update/uninstall/status scripts or equivalent CLI commands for installing the companion module into a chosen Foundry User Data directory and configuring MCP clients.
+
+Foundry may run as the Windows desktop application or in a user-managed Docker container. Docker compatibility is a release requirement: the same companion module must work against a licensed Foundry v14 instance whose User Data directory is bind-mounted, without direct database access or a special server-side bypass. Tooling accepts an explicit mounted User Data path, and documentation covers local HTTP/WebSocket and HTTPS/WSS reverse-proxy layouts, strict origin allowlisting, reconnect after container restart, and Docker Desktop/remote-host networking.
 
 Use Node.js 22 LTS or newer, TypeScript strict mode, the stable MCP TypeScript SDK v2 packages and MCP `2026-07-28` protocol (with tested legacy-era compatibility where supported), Zod 4 validation, a maintained WebSocket implementation, and SQLite with migrations. Keep one MCP registry builder for stdio and HTTP so capabilities cannot drift. Pin deliberate dependency versions; do not advertise experimental MCP extensions which the selected SDK/client matrix cannot pass in conformance tests.
 
@@ -50,11 +54,13 @@ Use Node.js 22 LTS or newer, TypeScript strict mode, the stable MCP TypeScript S
 Required operations:
 
 - Discover connected world metadata, current user/role, system/module versions, supported document types, world collections, compendium packs, and module capabilities.
+- Discover runtime-registered Actor and Item subtypes from the active system and report read/create/update capability for each subtype. Tests must include at least two system-defined Actor subtypes and two Item subtypes without special-casing their names.
 - Enumerate root world Documents of any registered type with cursor pagination, deterministic ordering, field projection, folder/type/name query filters, ownership visibility, and bounded page size.
 - Enumerate compendium indexes and documents for any accessible pack, with an explicit choice between index-only and hydrated results.
 - Enumerate embedded Documents recursively or by parent UUID/embedded type without unbounded traversal.
 - Resolve and read an arbitrary Document with async `fromUuid` and `foundry.utils.parseUuid`, returning a JSON-safe representation with UUID, type, parent/pack provenance, ownership summary, and schema/version metadata. Do not manually parse UUID strings or expose live object prototypes.
 - Create any supported root or embedded Document from caller-supplied JSON data, using Foundry's generic document APIs and returning the created UUID/document. Support batch create with per-item results and no partial-success ambiguity.
+- Prove create/read/update/list behavior for world Actors, every runtime-reported Actor subtype, world Items, every runtime-reported Item subtype, and Items embedded in Actors. Actor and Item compendium entries are enumerable and hydrated subject to pack permissions; locked packs fail closed for writes.
 - Update documents by UUID with a required optimistic source-hash/version precondition unless explicitly waived, and dry-run validation when Foundry exposes enough information. Preserve unknown system-specific fields.
 - Export a bounded snapshot of selected objects for AI context. Detect cycles, cap depth/bytes/items, redact configured paths, and report truncation.
 - Surface structured errors for offline bridge, ambiguous connection, unsupported type, invalid data, permission denied, not found, conflict, timeout, cancellation, and Foundry-side failure.
@@ -77,6 +83,7 @@ Suggested MCP tools (names may change only for a clearer consistent namespace):
 Required operations:
 
 - Enumerate image assets recursively through Foundry's supported file browsing APIs across configured/available sources (`data`, `public`, and optional S3 when exposed), with source/path filters, image-extension filters, cursor pagination, bounded recursion, deduplication, and metadata available without downloading every file.
+- Report source/path write capability (`writable` and an explicit reason when false) and use only writable Foundry FilePicker destinations for creation, overwrite/rename collision handling, and generated asset persistence.
 - Find image references embedded in selected Foundry Documents by recursively inspecting JSON-safe document data. Return the owning UUID and JSON path for each reference.
 - Upload/create an image asset into an allowed Foundry data path from a local file, base64 payload, or generated result. Normalize names, reject traversal/absolute destination paths, enforce MIME/extension/size policy, handle collisions explicitly, and return the Foundry asset path.
 - Create or update a Foundry Document which references an uploaded image as a single auditable operation where requested.
@@ -158,6 +165,8 @@ Suggested tools/resources/prompts:
 - Include troubleshooting for no active GM, mixed-content/WebSocket restrictions, wrong Foundry data directory, port conflict, pairing failure, provider failure, permissions, and protocol/log corruption.
 - Provide an opt-in per-user Scheduled Task/logon launcher for the broker; do not require administrator rights, a Windows Service, firewall rules, UPnP, or LAN exposure.
 - Support install paths and Foundry User Data paths containing spaces and Unicode. Never assume the default Foundry data path when a user selected a custom one.
+- Support a Docker bind-mounted Foundry User Data directory supplied explicitly to install/update/uninstall commands. Provide a container-safe module installation path and a deployment example that references, but never bundles, the user's licensed Foundry image and data.
+- Support companion-module connectivity when Foundry is served from a container over HTTP (`ws://`) or behind an HTTPS reverse proxy (`wss://`). Validate an explicit Foundry origin allowlist, document certificate/proxy requirements, and reconnect cleanly after the Foundry container, browser client, or broker restarts.
 
 ## 10. Testing and release gates
 
@@ -168,6 +177,8 @@ Required automated coverage:
 - Unit tests for schemas, pagination/cursors, path safety, redaction, permission/policy decisions, idempotency, event coalescing, retry/timeout/cancellation, image validation, journal transforms, and config precedence.
 - Shared-protocol contract tests between Node host and companion module.
 - A deterministic fake Foundry runtime/bridge exercising generic world, compendium, embedded document, asset, upload, hook event, and journal behavior. Production code must not silently use the fake.
+- Actor/Item fixtures must cover multiple runtime-defined subtypes, world and embedded Items, accessible/locked compendium entries, preservation of unknown system fields, and permission-denied mutations with identical before/after state.
+- Asset fixtures must distinguish writable and read-only FilePicker sources and prove upload, generated-image persistence, collision-safe replace/rename, attachment, and rejection of writes to read-only destinations.
 - MCP in-process or child-process tests which list tools/resources/prompts and call representative read, create, image, session, and intelligence operations over stdio without stdout corruption.
 - MCP protocol/conformance tests for the declared `2026-07-28` surface and any advertised legacy compatibility.
 - End-to-end test: fake Foundry connects and pairs; MCP client enumerates types/documents/images; creates a root and embedded object; uploads or locally generates an image and attaches it; starts/appends/ends a journal session; emits a world event; waits for indexing; retrieves a context pack; verifies persisted state after restart.
@@ -176,6 +187,7 @@ Required automated coverage:
 - Restart/recovery tests interrupt the broker, module bridge, MCP adapter, image job, and queued mutation; recovery must not duplicate documents, session entries, events, or charges.
 - Build/typecheck/lint/test commands and coverage thresholds run in CI on `windows-latest` and at least one non-Windows runner for portability.
 - Build a loadable Foundry module directory and zip with a valid `module.json` for Foundry v14.
+- Validate Docker compatibility without redistributing Foundry: test configurable `ws://`/`wss://` endpoints, strict Origin decisions, reconnect/resume across simulated container restarts, and safe installation into an explicit bind-mounted User Data path. Provide an opt-in real licensed-container smoke checklist rather than fabricated CI evidence.
 - Run `npm pack --dry-run` or equivalent package-content validation so secrets, databases, logs, fixtures with sensitive content, and development artifacts are excluded.
 
 If a real local Foundry v14 installation is available, provide an opt-in non-destructive smoke-test checklist/script. Never manufacture a claim that proprietary Foundry was launched or validated when only the fake runtime was used.
@@ -186,6 +198,7 @@ If a real local Foundry v14 installation is available, provide an opt-in non-des
 - Tool/resource/prompt reference with schemas and examples.
 - Windows quick start from clone through first successful `foundry.connections.list`.
 - Foundry module install/enable/pair guide.
+- Docker-hosted Foundry guide covering bind-mounted module installation, Docker Desktop and remote-host layouts, reverse-proxy TLS/WSS, origin allowlisting, restart/reconnect behavior, and the boundary between automated fake-runtime evidence and the user's licensed container smoke test.
 - Image provider configuration and privacy/cost notes.
 - Journal session and background intelligence behavior.
 - Developer guide for build, tests, module packaging, migrations, and adding document/image providers.
