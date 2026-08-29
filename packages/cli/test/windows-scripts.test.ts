@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { deflateRawSync } from "node:zlib";
 import { afterEach, describe, expect, it } from "vitest";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -24,6 +25,74 @@ interface ScriptResult {
   status: number | null;
   stdout: string;
   stderr: string;
+}
+
+interface RawZipEntry {
+  name: string;
+  data?: Buffer | string;
+  compression?: "store" | "deflate";
+  declaredUncompressedSize?: number;
+  externalAttributes?: number;
+}
+
+function crc32(data: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function createRawZip(entries: RawZipEntry[]): Buffer {
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let localOffset = 0;
+  for (const entry of entries) {
+    const name = Buffer.from(entry.name, "utf8");
+    const data =
+      typeof entry.data === "string" ? Buffer.from(entry.data, "utf8") : (entry.data ?? Buffer.alloc(0));
+    const method = entry.compression === "deflate" ? 8 : 0;
+    const compressed = method === 8 ? deflateRawSync(data) : data;
+    const uncompressedSize = entry.declaredUncompressedSize ?? data.length;
+    const checksum = crc32(data);
+    const localHeader = Buffer.alloc(30);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt16LE(0x0800, 6);
+    localHeader.writeUInt16LE(method, 8);
+    localHeader.writeUInt32LE(checksum, 14);
+    localHeader.writeUInt32LE(compressed.length, 18);
+    localHeader.writeUInt32LE(uncompressedSize, 22);
+    localHeader.writeUInt16LE(name.length, 26);
+    localParts.push(localHeader, name, compressed);
+
+    const centralHeader = Buffer.alloc(46);
+    centralHeader.writeUInt32LE(0x02014b50, 0);
+    centralHeader.writeUInt16LE(0x0314, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0x0800, 8);
+    centralHeader.writeUInt16LE(method, 10);
+    centralHeader.writeUInt32LE(checksum, 16);
+    centralHeader.writeUInt32LE(compressed.length, 20);
+    centralHeader.writeUInt32LE(uncompressedSize, 24);
+    centralHeader.writeUInt16LE(name.length, 28);
+    centralHeader.writeUInt32LE(entry.externalAttributes ?? ((0o100644 << 16) >>> 0), 38);
+    centralHeader.writeUInt32LE(localOffset, 42);
+    centralParts.push(centralHeader, name);
+    localOffset += localHeader.length + name.length + compressed.length;
+  }
+
+  const centralDirectory = Buffer.concat(centralParts);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  end.writeUInt32LE(localOffset, 16);
+  return Buffer.concat([...localParts, centralDirectory, end]);
 }
 
 function runScriptWith(executable: string, scriptName: string, args: string[]): ScriptResult {
@@ -379,6 +448,210 @@ describe.runIf(process.platform === "win32")(
           expect(pair.stderr).toMatch(/reparse|junction/i);
           expect(fs.readdirSync(outsideSecrets)).toHaveLength(0);
         }, 60000);
+
+        it("rejects hostile ZIP metadata before extraction and leaves the live module untouched", () => {
+          const userData = tmpDir("zip-preflight-user-data");
+          const oldSource = moduleFixture("zip-preflight-old", "1.0.0", "old-version\n");
+          const initial = runScriptWith(shell.executable, "install.ps1", [
+            "-FoundryUserDataPath",
+            userData,
+            "-ModuleSourcePath",
+            oldSource,
+          ]);
+          expect(initial.status, initial.stderr).toBe(0);
+          const target = path.join(userData, "Data", "modules", "foundry-mcp");
+          const modulesRoot = path.dirname(target);
+          const absoluteGuard = path.join(tmpDir("zip-absolute-guard"), "absolute.txt");
+          const validEntries = (): RawZipEntry[] => [
+            {
+              name: "module.json",
+              data: JSON.stringify({ id: "foundry-mcp", title: "Foundry MCP", version: "2.0.0" }),
+            },
+            { name: "scripts/main.js", data: "new-version\n" },
+          ];
+          const excessEntries = [
+            ...validEntries(),
+            ...Array.from({ length: 4095 }, (_, index) => ({
+              name: `filler/${index.toString().padStart(4, "0")}.txt`,
+            })),
+          ];
+          const totalDeclaredEntries = [
+            ...validEntries(),
+            ...Array.from({ length: 5 }, (_, index) => ({
+              name: `declared/${index}.bin`,
+              data: Buffer.alloc(700_000),
+              declaredUncompressedSize: 60 * 1024 * 1024,
+            })),
+          ];
+          const cases: Array<{ name: string; entries: RawZipEntry[]; expected: RegExp }> = [
+            {
+              name: "traversal",
+              entries: [...validEntries(), { name: "../escape.txt", data: "escape" }],
+              expected: /traversal|parent segment/i,
+            },
+            {
+              name: "absolute",
+              entries: [
+                ...validEntries(),
+                { name: absoluteGuard.replaceAll("\\", "/"), data: "escape" },
+              ],
+              expected: /absolute/i,
+            },
+            {
+              name: "alternate-data-stream",
+              entries: [...validEntries(), { name: "module.json:payload", data: "stream" }],
+              expected: /alternate data stream|colon/i,
+            },
+            {
+              name: "symbolic-link",
+              entries: [
+                ...validEntries(),
+                {
+                  name: "link-to-outside",
+                  data: "../outside",
+                  externalAttributes: (0xa1ff << 16) >>> 0,
+                },
+              ],
+              expected: /symbolic link|reparse/i,
+            },
+            {
+              name: "reparse-point",
+              entries: [
+                ...validEntries(),
+                {
+                  name: "reparse.bin",
+                  data: "reparse",
+                  externalAttributes: (((0o100644 << 16) >>> 0) | 0x400) >>> 0,
+                },
+              ],
+              expected: /reparse/i,
+            },
+            {
+              name: "nested-archive",
+              entries: [...validEntries(), { name: "payload.zip", data: "PK" }],
+              expected: /nested archive/i,
+            },
+            {
+              name: "entry-count",
+              entries: excessEntries,
+              expected: /entry count|too many entries/i,
+            },
+            {
+              name: "path-depth",
+              entries: [
+                ...validEntries(),
+                {
+                  name: `${Array.from({ length: 25 }, (_, index) => `d${index}`).join("/")}/file.txt`,
+                  data: "deep",
+                },
+              ],
+              expected: /depth/i,
+            },
+            {
+              name: "single-declared-size",
+              entries: [
+                ...validEntries(),
+                {
+                  name: "oversized.bin",
+                  declaredUncompressedSize: 64 * 1024 * 1024 + 1,
+                },
+              ],
+              expected: /declared|uncompressed.*limit|entry.*size/i,
+            },
+            {
+              name: "total-declared-size",
+              entries: totalDeclaredEntries,
+              expected: /total.*declared|expanded.*limit|archive.*size/i,
+            },
+            {
+              name: "compression-ratio",
+              entries: [
+                ...validEntries(),
+                {
+                  name: "compressed-bomb.bin",
+                  data: Buffer.alloc(1024 * 1024),
+                  compression: "deflate",
+                },
+              ],
+              expected: /compression ratio/i,
+            },
+            {
+              name: "expanded-size-mismatch",
+              entries: [
+                ...validEntries(),
+                {
+                  name: "lying-expanded-size.bin",
+                  data: Buffer.alloc(1024, 0x41),
+                  declaredUncompressedSize: 2048,
+                },
+              ],
+              expected: /actual expanded byte count does not match its declaration/i,
+            },
+          ];
+          const wrapper = path.join(tmpDir("zip-preflight-wrapper"), "guard-extraction.ps1");
+          fs.writeFileSync(
+            wrapper,
+            [
+              "$ErrorActionPreference = 'Stop'",
+              "function global:Expand-Archive {",
+              "  [CmdletBinding()] param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force)",
+              "  [IO.File]::WriteAllText($env:FMCP_EXPANSION_MARKER, 'called')",
+              "  throw 'Unsafe extraction was attempted before ZIP preflight'",
+              "}",
+              "& $env:FMCP_INSTALL_SCRIPT -FoundryUserDataPath $env:FMCP_USER_DATA -ModuleSourcePath $env:FMCP_ZIP_PATH",
+            ].join("\r\n"),
+          );
+
+          const validZipPath = path.join(tmpDir("zip-valid"), "valid.zip");
+          fs.writeFileSync(validZipPath, createRawZip(validEntries()));
+          const validInstall = runScriptWith(shell.executable, "install.ps1", [
+            "-FoundryUserDataPath",
+            userData,
+            "-ModuleSourcePath",
+            validZipPath,
+          ]);
+          expect(validInstall.status, validInstall.stderr).toBe(0);
+          expect(fs.readFileSync(path.join(target, "scripts", "main.js"), "utf8")).toBe(
+            "new-version\n",
+          );
+          const restoreOld = runScriptWith(shell.executable, "install.ps1", [
+            "-FoundryUserDataPath",
+            userData,
+            "-ModuleSourcePath",
+            oldSource,
+          ]);
+          expect(restoreOld.status, restoreOld.stderr).toBe(0);
+
+          for (const testCase of cases) {
+            const zipPath = path.join(tmpDir(`zip-${testCase.name}`), `${testCase.name}.zip`);
+            const expansionMarker = path.join(
+              tmpDir(`zip-marker-${testCase.name}`),
+              "expanded.txt",
+            );
+            fs.writeFileSync(zipPath, createRawZip(testCase.entries));
+            const result = runPowerShellFile(shell.executable, wrapper, {
+              ...process.env,
+              FMCP_EXPANSION_MARKER: expansionMarker,
+              FMCP_INSTALL_SCRIPT: path.join(scriptsDir, "install.ps1"),
+              FMCP_USER_DATA: userData,
+              FMCP_ZIP_PATH: zipPath,
+            });
+            expect(result.status, `${testCase.name}: ${result.stderr}`).not.toBe(0);
+            expect(result.stderr, testCase.name).toMatch(testCase.expected);
+            expect(fs.existsSync(expansionMarker), testCase.name).toBe(false);
+            expect(
+              fs.readFileSync(path.join(target, "scripts", "main.js"), "utf8"),
+              testCase.name,
+            ).toBe("old-version\n");
+            expect(
+              fs
+                .readdirSync(modulesRoot)
+                .filter((name) => name.startsWith(".foundry-mcp.")),
+              testCase.name,
+            ).toEqual([]);
+            expect(fs.existsSync(absoluteGuard), testCase.name).toBe(false);
+          }
+        }, 180000);
 
         it("leaves the previous complete module untouched when staging copy is injected to fail", () => {
           const userData = tmpDir("copy-failure-user-data");

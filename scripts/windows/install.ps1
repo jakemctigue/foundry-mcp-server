@@ -15,6 +15,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression
 
 $ownershipManifestName = '.foundry-mcp-install-manifest.json'
 
@@ -119,6 +120,245 @@ function Assert-NoReparseTree {
     }
 }
 
+function Expand-ValidatedZipArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$DestinationRoot
+    )
+    $maxEntries = 4096
+    $maxDepth = 24
+    $maxEntryNameLength = 512
+    $maxArchiveBytes = 128MB
+    $maxEntryExpandedBytes = 64MB
+    $maxTotalExpandedBytes = 256MB
+    $maxCompressionRatio = 100.0
+    $nestedArchiveExtensions = @('.zip', '.jar', '.7z', '.rar', '.tar', '.gz', '.tgz', '.bz2', '.xz', '.cab')
+
+    if (Test-Path -LiteralPath $DestinationRoot) {
+        throw "ZIP extraction destination must not already exist: $DestinationRoot"
+    }
+    [void](Assert-NoReparsePathComponents -LiteralPath (Split-Path -Path $DestinationRoot -Parent))
+    [void](Assert-NoReparsePathComponents -LiteralPath $DestinationRoot)
+
+    $archiveStream = $null
+    $archive = $null
+    try {
+        $archiveStream = New-Object System.IO.FileStream(
+            $ArchivePath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        if ($archiveStream.Length -gt $maxArchiveBytes) {
+            throw "ZIP archive exceeds the compressed-byte limit of $maxArchiveBytes bytes."
+        }
+        $archive = New-Object System.IO.Compression.ZipArchive(
+            $archiveStream,
+            [System.IO.Compression.ZipArchiveMode]::Read,
+            $true
+        )
+        $entries = @($archive.Entries)
+        if ($entries.Count -gt $maxEntries) {
+            throw "ZIP entry count $($entries.Count) exceeds the limit of $maxEntries."
+        }
+
+        $destinationRootFull = [System.IO.Path]::GetFullPath($DestinationRoot).TrimEnd(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+        $destinationPrefix = $destinationRootFull + [System.IO.Path]::DirectorySeparatorChar
+        $pathTypes = @{}
+        $records = New-Object System.Collections.Generic.List[object]
+        [int64]$totalDeclaredBytes = 0
+        [int64]$totalCompressedBytes = 0
+
+        foreach ($entry in $entries) {
+            $entryName = [string]$entry.FullName
+            if ([string]::IsNullOrWhiteSpace($entryName) -or $entryName.Length -gt $maxEntryNameLength) {
+                throw "ZIP entry name is empty or exceeds the $maxEntryNameLength-character limit."
+            }
+            if ($entryName.IndexOf([char]0) -ge 0 -or $entryName -match '[\x00-\x1f]') {
+                throw "ZIP entry name contains a control character: $entryName"
+            }
+            $normalizedName = $entryName.Replace('\', '/')
+            if ($normalizedName.StartsWith('/') -or $normalizedName -match '^[a-zA-Z]:') {
+                throw "ZIP entry uses an absolute path: $entryName"
+            }
+            $isDirectory = $normalizedName.EndsWith('/')
+            $trimmedName = $normalizedName.TrimEnd('/')
+            if ([string]::IsNullOrWhiteSpace($trimmedName) -or $normalizedName.Contains('//')) {
+                throw "ZIP entry has an invalid or ambiguous path: $entryName"
+            }
+            $segments = @(
+                $trimmedName.Split(
+                    [char[]]@('/'),
+                    [System.StringSplitOptions]::None
+                )
+            )
+            if ($segments.Count -gt $maxDepth) {
+                throw "ZIP entry path depth $($segments.Count) exceeds the limit of ${maxDepth}: $entryName"
+            }
+            foreach ($segment in $segments) {
+                if (($segment -eq '.') -or ($segment -eq '..')) {
+                    throw "ZIP entry contains a traversal parent segment: $entryName"
+                }
+                if ($segment.Contains(':')) {
+                    throw "ZIP entry contains a colon or alternate data stream path: $entryName"
+                }
+                if ($segment -match '[<>"|?*]' -or $segment.Length -gt 255 -or $segment.EndsWith('.') -or $segment.EndsWith(' ')) {
+                    throw "ZIP entry contains an invalid Windows path segment: $entryName"
+                }
+                $deviceStem = [System.IO.Path]::GetFileNameWithoutExtension($segment)
+                if ($deviceStem -match '^(?i:con|prn|aux|nul|com[1-9]|lpt[1-9])$') {
+                    throw "ZIP entry contains a reserved Windows device name: $entryName"
+                }
+            }
+            $canonicalName = $segments -join '/'
+            if ($pathTypes.ContainsKey($canonicalName)) {
+                throw "ZIP contains duplicate case-insensitive entry paths: $entryName"
+            }
+
+            [int64]$rawAttributes = ([int64]$entry.ExternalAttributes) -band 4294967295
+            [int64]$dosAttributes = $rawAttributes -band 65535
+            [int64]$unixMode = ($rawAttributes -shr 16) -band 65535
+            [int64]$unixFileType = $unixMode -band 61440
+            if (($dosAttributes -band 1024) -ne 0) {
+                throw "ZIP entry carries a Windows reparse-point attribute: $entryName"
+            }
+            if ($unixFileType -eq 40960) {
+                throw "ZIP entry is a symbolic link: $entryName"
+            }
+            if (($unixFileType -ne 0) -and ($unixFileType -notin @(16384, 32768))) {
+                throw "ZIP entry is an unsupported special file: $entryName"
+            }
+            if (($isDirectory -and $unixFileType -eq 32768) -or (-not $isDirectory -and $unixFileType -eq 16384)) {
+                throw "ZIP entry type conflicts with its path form: $entryName"
+            }
+
+            [int64]$declaredBytes = $entry.Length
+            [int64]$compressedBytes = $entry.CompressedLength
+            if ($declaredBytes -lt 0 -or $compressedBytes -lt 0) {
+                throw "ZIP entry has an invalid declared size: $entryName"
+            }
+            if ($isDirectory) {
+                if ($declaredBytes -ne 0 -or $compressedBytes -ne 0) {
+                    throw "ZIP directory entry declares file content: $entryName"
+                }
+                $pathTypes[$canonicalName] = 'directory'
+            }
+            else {
+                if ($nestedArchiveExtensions -contains [System.IO.Path]::GetExtension($segments[-1]).ToLowerInvariant()) {
+                    throw "ZIP contains a nested archive, which is not allowed: $entryName"
+                }
+                if ($declaredBytes -gt $maxEntryExpandedBytes) {
+                    throw "ZIP entry declared expanded size exceeds the per-entry limit of $maxEntryExpandedBytes bytes: $entryName"
+                }
+                if ($declaredBytes -gt 0 -and $compressedBytes -eq 0) {
+                    throw "ZIP entry has an unbounded compression ratio: $entryName"
+                }
+                if ($compressedBytes -gt 0) {
+                    $compressionRatio = [double]$declaredBytes / [double]$compressedBytes
+                    if ($compressionRatio -gt $maxCompressionRatio) {
+                        throw "ZIP entry compression ratio exceeds the limit of ${maxCompressionRatio}:1: $entryName"
+                    }
+                }
+                $totalDeclaredBytes += $declaredBytes
+                $totalCompressedBytes += $compressedBytes
+                if ($totalDeclaredBytes -gt $maxTotalExpandedBytes) {
+                    throw "ZIP total declared expanded size exceeds the limit of $maxTotalExpandedBytes bytes."
+                }
+                if ($totalCompressedBytes -gt $maxArchiveBytes) {
+                    throw "ZIP total compressed entry size exceeds the limit of $maxArchiveBytes bytes."
+                }
+                $pathTypes[$canonicalName] = 'file'
+            }
+
+            $platformRelativePath = $canonicalName.Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+            $destinationPath = [System.IO.Path]::GetFullPath((Join-Path -Path $destinationRootFull -ChildPath $platformRelativePath))
+            if (-not $destinationPath.StartsWith($destinationPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "ZIP entry destination escapes the owned extraction root: $entryName"
+            }
+            [void]$records.Add([pscustomobject]@{
+                entry = $entry
+                canonicalName = $canonicalName
+                destinationPath = $destinationPath
+                isDirectory = $isDirectory
+                declaredBytes = $declaredBytes
+            })
+        }
+
+        foreach ($record in $records) {
+            $recordSegments = @($record.canonicalName.Split('/'))
+            for ($index = 1; $index -lt $recordSegments.Count; $index += 1) {
+                $parentName = $recordSegments[0..($index - 1)] -join '/'
+                if ($pathTypes.ContainsKey($parentName) -and $pathTypes[$parentName] -eq 'file') {
+                    throw "ZIP entry path descends through another file entry: $($record.canonicalName)"
+                }
+            }
+        }
+
+        [void][System.IO.Directory]::CreateDirectory($destinationRootFull)
+        [void](Assert-NoReparsePathComponents -LiteralPath $destinationRootFull)
+        [int64]$totalExpandedBytes = 0
+        foreach ($record in $records) {
+            if ($record.isDirectory) {
+                [void][System.IO.Directory]::CreateDirectory($record.destinationPath)
+                [void](Assert-NoReparsePathComponents -LiteralPath $record.destinationPath)
+                continue
+            }
+            $destinationDirectory = Split-Path -Path $record.destinationPath -Parent
+            [void][System.IO.Directory]::CreateDirectory($destinationDirectory)
+            [void](Assert-NoReparsePathComponents -LiteralPath $destinationDirectory)
+            [void](Assert-NoReparsePathComponents -LiteralPath $record.destinationPath)
+
+            $entryStream = $null
+            $destinationStream = $null
+            [int64]$entryExpandedBytes = 0
+            try {
+                $entryStream = $record.entry.Open()
+                $destinationStream = New-Object System.IO.FileStream(
+                    $record.destinationPath,
+                    [System.IO.FileMode]::CreateNew,
+                    [System.IO.FileAccess]::Write,
+                    [System.IO.FileShare]::None
+                )
+                $buffer = New-Object byte[] 65536
+                while (($read = $entryStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $entryExpandedBytes += $read
+                    $totalExpandedBytes += $read
+                    if ($entryExpandedBytes -gt $record.declaredBytes) {
+                        throw "ZIP entry expanded beyond its declared byte count: $($record.canonicalName)"
+                    }
+                    if ($entryExpandedBytes -gt $maxEntryExpandedBytes -or $totalExpandedBytes -gt $maxTotalExpandedBytes) {
+                        throw "ZIP actual expanded bytes exceeded the configured extraction limit: $($record.canonicalName)"
+                    }
+                    $destinationStream.Write($buffer, 0, $read)
+                }
+                if ($entryExpandedBytes -ne $record.declaredBytes) {
+                    throw "ZIP entry actual expanded byte count does not match its declaration: $($record.canonicalName)"
+                }
+            }
+            finally {
+                if ($null -ne $destinationStream) {
+                    $destinationStream.Dispose()
+                }
+                if ($null -ne $entryStream) {
+                    $entryStream.Dispose()
+                }
+            }
+        }
+        Assert-NoReparseTree -LiteralPath $destinationRootFull
+    }
+    finally {
+        if ($null -ne $archive) {
+            $archive.Dispose()
+        }
+        if ($null -ne $archiveStream) {
+            $archiveStream.Dispose()
+        }
+    }
+}
+
 function Copy-DirectoryContents {
     param(
         [Parameter(Mandatory = $true)][string]$SourcePath,
@@ -216,8 +456,7 @@ try {
 
     if ($sourceIsZip) {
         $extractPath = Assert-ContainedPath -LiteralPath (Join-Path -Path $modulesRoot -ChildPath ($extractPrefix + $operationId)) -RootPath $modulesRoot
-        New-Item -ItemType Directory -Path $extractPath | Out-Null
-        Expand-Archive -LiteralPath $resolvedSource -DestinationPath $extractPath
+        Expand-ValidatedZipArchive -ArchivePath $resolvedSource -DestinationRoot $extractPath
         if (Test-Path -LiteralPath (Join-Path -Path $extractPath -ChildPath 'module.json') -PathType Leaf) {
             $sourceRoot = $extractPath
         }
