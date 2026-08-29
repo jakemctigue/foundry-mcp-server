@@ -32,7 +32,13 @@ export interface ReconciliationBridge {
     connectionId: string,
     method: string,
     params?: Record<string, JsonValue>,
+    requestId?: string,
+    options?: { signal?: AbortSignal },
   ): Promise<JsonValue>;
+}
+
+export interface ReconcileInvocationOptions {
+  signal?: AbortSignal;
 }
 
 export interface ReconcileOptions extends EventCaptureOptions {
@@ -134,6 +140,13 @@ function safeError(error: unknown): string {
     0,
     2_000,
   );
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new Error("intelligence reconciliation cancelled");
 }
 
 function taskKey(kind: TaskKind, value: string): string {
@@ -339,7 +352,10 @@ export function getIntelligenceStatus(
 
 /** Durable, bounded reconciliation over the companion's existing read-only document APIs. */
 export class IntelligenceReconciler {
-  readonly #active = new Map<string, Promise<IntelligenceStatusOutput>>();
+  readonly #active = new Map<
+    string,
+    { promise: Promise<IntelligenceStatusOutput>; controller: AbortController }
+  >();
   readonly #now: () => Date;
   readonly #documentBudget: number;
 
@@ -355,14 +371,32 @@ export class IntelligenceReconciler {
   reconcile(
     connectionId: string,
     reason: ReconcileReason = "manual",
+    invocation: ReconcileInvocationOptions = {},
   ): Promise<IntelligenceStatusOutput> {
     const existing = this.#active.get(connectionId);
-    if (existing) return existing;
-    const operation = this.#reconcile(connectionId, reason).finally(() => {
+    if (existing) {
+      const removeAbortForwarder = this.#forwardAbort(invocation.signal, existing.controller);
+      return existing.promise.finally(removeAbortForwarder);
+    }
+    const controller = new AbortController();
+    const removeAbortForwarder = this.#forwardAbort(invocation.signal, controller);
+    const operation = this.#reconcile(connectionId, reason, controller.signal).finally(() => {
+      removeAbortForwarder();
       this.#active.delete(connectionId);
     });
-    this.#active.set(connectionId, operation);
+    this.#active.set(connectionId, { promise: operation, controller });
     return operation;
+  }
+
+  #forwardAbort(signal: AbortSignal | undefined, controller: AbortController): () => void {
+    if (!signal) return () => undefined;
+    const abort = (): void => controller.abort(signal.reason);
+    if (signal.aborted) {
+      abort();
+      return () => undefined;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    return () => signal.removeEventListener("abort", abort);
   }
 
   async #request<T>(
@@ -370,11 +404,22 @@ export class IntelligenceReconciler {
     method: string,
     params: Record<string, JsonValue>,
     parse: (value: unknown) => T,
+    signal?: AbortSignal,
   ): Promise<T> {
-    return requestValue(await this.bridge.request(connectionId, method, params), parse, method);
+    throwIfAborted(signal);
+    return requestValue(
+      await this.bridge.request(connectionId, method, params, undefined, signal ? { signal } : {}),
+      parse,
+      method,
+    );
   }
 
-  async #newRun(connectionId: string, reason: ReconcileReason): Promise<JobRow> {
+  async #newRun(
+    connectionId: string,
+    reason: ReconcileReason,
+    signal?: AbortSignal,
+  ): Promise<JobRow> {
+    throwIfAborted(signal);
     const now = this.#now().toISOString();
     const runId = crypto.randomUUID();
     const previous = this.db
@@ -403,14 +448,19 @@ export class IntelligenceReconciler {
       )
       .run(connectionId, runId, reason, now, now, previous?.last_completed_at ?? null);
 
-    const types = await this.#request(connectionId, "documents.types", { connectionId }, (value) =>
-      DocumentsTypesOutput.parse(value),
+    const types = await this.#request(
+      connectionId,
+      "documents.types",
+      { connectionId },
+      (value) => DocumentsTypesOutput.parse(value),
+      signal,
     );
     const compendiums = await this.#request(
       connectionId,
       "compendiums.list",
       { connectionId },
       (value) => CompendiumsListOutput.parse(value),
+      signal,
     );
     let taskCount = 0;
     let truncated = false;
@@ -444,7 +494,12 @@ export class IntelligenceReconciler {
       .get(connectionId) as JobRow;
   }
 
-  async #resumeOrStart(connectionId: string, reason: ReconcileReason): Promise<JobRow> {
+  async #resumeOrStart(
+    connectionId: string,
+    reason: ReconcileReason,
+    signal?: AbortSignal,
+  ): Promise<JobRow> {
+    throwIfAborted(signal);
     const existing = this.db
       .prepare("SELECT * FROM reconciliation_jobs WHERE connection_id = ?")
       .get(connectionId) as JobRow | undefined;
@@ -469,7 +524,7 @@ export class IntelligenceReconciler {
         return { ...existing, status: "running", reason, updated_at: now, queue_depth: depth };
       }
     }
-    return this.#newRun(connectionId, reason);
+    return this.#newRun(connectionId, reason, signal);
   }
 
   async #document(
@@ -477,12 +532,14 @@ export class IntelligenceReconciler {
     runId: string,
     uuid: string,
     now: string,
+    signal?: AbortSignal,
   ): Promise<{ changed: boolean; privateFiltered: boolean; truncated: boolean }> {
     const document = await this.#request(
       connectionId,
       "documents.get",
       { connectionId, uuid },
       (value) => DocumentsGetOutput.parse(value),
+      signal,
     );
     return upsertSnapshot(
       this.db,
@@ -499,7 +556,9 @@ export class IntelligenceReconciler {
     runId: string,
     task: TaskRow,
     budget: number,
+    signal?: AbortSignal,
   ): Promise<PageResult> {
+    throwIfAborted(signal);
     const now = this.#now().toISOString();
     const params = JSON.parse(task.params_json) as Record<string, JsonValue>;
     const pageSize = Math.min(PAGE_SIZE, budget);
@@ -516,17 +575,20 @@ export class IntelligenceReconciler {
           ...(task.cursor ? { cursor: task.cursor } : {}),
         },
         (value) => DocumentsListOutput.parse(value),
+        signal,
       );
       for (const summary of page.items) {
+        throwIfAborted(signal);
         result.scanned += 1;
         let traverseChildren = false;
         try {
-          const stored = await this.#document(connectionId, runId, summary.uuid, now);
+          const stored = await this.#document(connectionId, runId, summary.uuid, now, signal);
           if (stored.changed) result.changed += 1;
           if (stored.privateFiltered) result.privateFiltered += 1;
           if (stored.truncated) result.truncated = true;
           traverseChildren = !stored.privateFiltered;
         } catch (error) {
+          if (signal?.aborted) throw error;
           result.truncated = true;
           result.lastError = safeError(error);
         }
@@ -560,18 +622,21 @@ export class IntelligenceReconciler {
           ...(task.cursor ? { cursor: task.cursor } : {}),
         },
         (value) => EmbeddedDocumentsListOutput.parse(value),
+        signal,
       );
       result.truncated = page.truncated;
       for (const summary of page.items) {
+        throwIfAborted(signal);
         result.scanned += 1;
         let traverseChildren = false;
         try {
-          const stored = await this.#document(connectionId, runId, summary.uuid, now);
+          const stored = await this.#document(connectionId, runId, summary.uuid, now, signal);
           if (stored.changed) result.changed += 1;
           if (stored.privateFiltered) result.privateFiltered += 1;
           if (stored.truncated) result.truncated = true;
           traverseChildren = !stored.privateFiltered;
         } catch (error) {
+          if (signal?.aborted) throw error;
           result.truncated = true;
           result.lastError = safeError(error);
         }
@@ -610,8 +675,10 @@ export class IntelligenceReconciler {
         ...(task.cursor ? { cursor: task.cursor } : {}),
       },
       (value) => CompendiumDocumentsListOutput.parse(value),
+      signal,
     );
     for (const item of page.items) {
+      throwIfAborted(signal);
       result.scanned += 1;
       const parsed = DocumentsGetOutput.safeParse(item);
       if (!parsed.success) {
@@ -650,12 +717,15 @@ export class IntelligenceReconciler {
   async #reconcile(
     connectionId: string,
     reason: ReconcileReason,
+    signal?: AbortSignal,
   ): Promise<IntelligenceStatusOutput> {
     let job: JobRow | undefined;
     try {
-      job = await this.#resumeOrStart(connectionId, reason);
+      throwIfAborted(signal);
+      job = await this.#resumeOrStart(connectionId, reason, signal);
       let remaining = this.#documentBudget;
       while (remaining > 0) {
+        throwIfAborted(signal);
         const task = nextTask(this.db, connectionId, job.run_id);
         if (!task) break;
         const now = this.#now().toISOString();
@@ -665,7 +735,7 @@ export class IntelligenceReconciler {
            WHERE connection_id = ? AND run_id = ? AND task_key = ?`,
           )
           .run(now, connectionId, job.run_id, task.task_key);
-        const page = await this.#processTask(connectionId, job.run_id, task, remaining);
+        const page = await this.#processTask(connectionId, job.run_id, task, remaining, signal);
         remaining -= page.scanned;
         const taskStatus = page.nextCursor ? "pending" : "complete";
         this.db

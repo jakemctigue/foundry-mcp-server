@@ -34,6 +34,8 @@ export class IntelligenceCoordinator {
   readonly #now: () => Date;
   readonly #reconciliationIntervalMs: number;
   readonly #retentionIntervalMs: number;
+  #abortController = new AbortController();
+  #stopped = false;
   #reconciliationTimer: ReturnType<typeof setInterval> | undefined;
   #retentionTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -60,6 +62,8 @@ export class IntelligenceCoordinator {
 
   start(): void {
     if (this.#reconciliationTimer || this.#retentionTimer) return;
+    if (this.#abortController.signal.aborted) this.#abortController = new AbortController();
+    this.#stopped = false;
     this.runRetention();
     this.#reconciliationTimer = setInterval(
       () => this.runPeriodic(),
@@ -71,20 +75,30 @@ export class IntelligenceCoordinator {
   }
 
   updateConnections(connectionIds: readonly string[]): void {
+    if (this.#stopped) return;
     const next = new Set(connectionIds);
     for (const connectionId of next) {
       if (this.#connected.has(connectionId)) continue;
       const reason =
         getIntelligenceStatus(this.db, connectionId).status === "never" ? "initial" : "reconnect";
-      this.#track(this.reconciler.reconcile(connectionId, reason));
+      this.#track(
+        this.reconciler.reconcile(connectionId, reason, {
+          signal: this.#abortController.signal,
+        }),
+      );
     }
     this.#connected.clear();
     for (const connectionId of next) this.#connected.add(connectionId);
   }
 
   runPeriodic(): void {
+    if (this.#stopped) return;
     for (const connectionId of this.#connected) {
-      this.#track(this.reconciler.reconcile(connectionId, "periodic"));
+      this.#track(
+        this.reconciler.reconcile(connectionId, "periodic", {
+          signal: this.#abortController.signal,
+        }),
+      );
     }
   }
 
@@ -100,15 +114,19 @@ export class IntelligenceCoordinator {
   }
 
   async drain(): Promise<void> {
-    await Promise.all([...this.#pending]);
+    while (this.#pending.size > 0) {
+      await Promise.allSettled([...this.#pending]);
+    }
   }
 
   stop(): void {
+    this.#stopped = true;
     if (this.#reconciliationTimer) clearInterval(this.#reconciliationTimer);
     if (this.#retentionTimer) clearInterval(this.#retentionTimer);
     this.#reconciliationTimer = undefined;
     this.#retentionTimer = undefined;
     this.#connected.clear();
+    this.#abortController.abort(new Error("intelligence coordinator stopped"));
   }
 
   #track(operation: Promise<unknown>): void {

@@ -473,4 +473,48 @@ describe("background intelligence reconciliation", () => {
       (db.prepare("SELECT count(*) AS count FROM events").get() as { count: number }).count,
     ).toBe(0);
   });
+
+  it("aborts active reconciliation so coordinator shutdown drains cleanly", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    let requestCount = 0;
+    let markRequestStarted: (() => void) | undefined;
+    const requestStarted = new Promise<void>((resolve) => {
+      markRequestStarted = resolve;
+    });
+    const bridge: ReconciliationBridge = {
+      request: (_connectionId, _method, _params, _requestId, options) => {
+        requestCount += 1;
+        receivedSignal = options?.signal;
+        markRequestStarted?.();
+        return new Promise<JsonValue>((_resolve, reject) => {
+          const rejectCancelled = (): void => reject(new Error("reconciliation cancelled"));
+          if (receivedSignal?.aborted) {
+            rejectCancelled();
+            return;
+          }
+          receivedSignal?.addEventListener("abort", rejectCancelled, { once: true });
+        });
+      },
+    };
+    const reconciler = new IntelligenceReconciler(db, bridge);
+    const initialOperation = reconciler.reconcile(CONNECTION_ID, "manual");
+    await requestStarted;
+    const coordinator = new IntelligenceCoordinator(db, reconciler, {
+      retentionDays: 30,
+    });
+
+    coordinator.updateConnections([CONNECTION_ID]);
+    coordinator.stop();
+    coordinator.updateConnections([CONNECTION_ID]);
+    await coordinator.drain();
+    await initialOperation;
+
+    expect(receivedSignal?.aborted).toBe(true);
+    expect(requestCount).toBe(1);
+    expect(getIntelligenceStatus(db, CONNECTION_ID)).toMatchObject({
+      status: "failed",
+      gap: true,
+      truncated: true,
+    });
+  });
 });
