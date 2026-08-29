@@ -19,6 +19,7 @@
     "test:e2e": "echo \"no e2e tests in cli\" && exit 0"
   },
   "dependencies": {
+    "@foundry-mcp/foundry-module": "workspace:*",
     "@foundry-mcp/host": "workspace:*"
   },
   "devDependencies": {

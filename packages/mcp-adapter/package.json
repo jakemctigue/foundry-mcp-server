@@ -26,8 +26,10 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.0.0",
+    "@types/ws": "^8.18.1",
     "tsup": "^8.5.1",
     "typescript": "^5.7.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.11",
+    "ws": "^8.21.3"
   }
 }

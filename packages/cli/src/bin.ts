@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { runDoctor, formatDoctorText, formatDoctorJson, type DoctorOptions } from "./doctor.js";
+import { buildFoundryModule } from "./build-module.js";
 
 function optionValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
@@ -52,8 +53,23 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "build-module") {
+    const outputDir = optionValue(rest, "--output");
+    const version = optionValue(rest, "--version");
+    const result = buildFoundryModule({
+      ...(outputDir ? { outputDir } : {}),
+      ...(version ? { version } : {}),
+    });
+    process.stdout.write(
+      json
+        ? `${JSON.stringify(result, null, 2)}\n`
+        : `Built Foundry v14 module ${result.version}\nDirectory: ${result.moduleDir}\nZIP: ${result.zipPath}\n`,
+    );
+    return;
+  }
+
   process.stderr.write(
-    `unknown command: ${command ?? "(none)"}\nusage: foundry-mcp doctor [--json] [--config PATH] [--app-data PATH] [--foundry-data PATH | --docker-data PATH] [--bridge-url URL] [--foundry-origin ORIGIN] [--allow-origin ORIGIN]\n`,
+    `unknown command: ${command ?? "(none)"}\nusage:\n  foundry-mcp doctor [--json] [--config PATH] [--app-data PATH] [--foundry-data PATH | --docker-data PATH] [--bridge-url URL] [--foundry-origin ORIGIN] [--allow-origin ORIGIN]\n  foundry-mcp build-module [--json] [--output DIR] [--version SEMVER]\n`,
   );
   process.exitCode = 1;
 }
