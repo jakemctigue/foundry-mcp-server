@@ -17,6 +17,8 @@ export const SessionMetadata = z.object({
   startedAt: z.string().datetime(),
   endedAt: z.string().datetime().optional(),
   updatedAt: z.string().datetime(),
+  folderUuid: z.string().min(1).optional(),
+  initialPageUuid: z.string().min(1).optional(),
 });
 export type SessionMetadata = z.infer<typeof SessionMetadata>;
 
@@ -38,11 +40,27 @@ export const SessionsStartInput = ConnectionSelector.extend({
   participants: z.array(z.string().min(1).max(200)).max(100).default([]),
   linkedUuids: z.array(z.string().min(1)).max(100).default([]),
   folder: z.string().min(1).nullable().optional(),
+  folderName: z.string().min(1).max(200).optional(),
+  initialHtml: z.string().min(1).max(100_000).optional(),
   idempotencyKey: z.string().min(8).max(200),
-}).strict();
+})
+  .strict()
+  .superRefine((input, context) => {
+    if (input.folder !== undefined && input.folderName !== undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "folder and folderName are mutually exclusive",
+        path: ["folderName"],
+      });
+    }
+  });
 export type SessionsStartInput = z.infer<typeof SessionsStartInput>;
 
-export const SessionsStartOutput = z.object({ session: SessionMetadata, journal: DocumentView });
+export const SessionsStartOutput = z.object({
+  session: SessionMetadata,
+  journal: DocumentView,
+  page: SessionPage,
+});
 export type SessionsStartOutput = z.infer<typeof SessionsStartOutput>;
 
 export const SessionsAppendInput = ConnectionSelector.extend({

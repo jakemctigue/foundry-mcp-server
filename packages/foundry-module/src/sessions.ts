@@ -46,11 +46,57 @@ function idempotencyKeys(document: DocumentView, category: "startKeys" | "status
 }
 
 function sanitizeJournalHtml(value: string): string {
-  return value
+  const stripped = value
     .replace(/<\s*(script|style|iframe|object|embed)\b[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, "")
     .replace(/<\s*(script|style|iframe|object|embed)\b[^>]*\/?>/gi, "")
     .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
     .replace(/(?:href|src)\s*=\s*(["'])\s*javascript:[\s\S]*?\1/gi, 'href="#"');
+  const allowed = new Set([
+    "p",
+    "br",
+    "strong",
+    "em",
+    "b",
+    "i",
+    "ul",
+    "ol",
+    "li",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "blockquote",
+    "code",
+    "pre",
+    "a",
+  ]);
+  return stripped.replace(
+    /<\s*(\/?)\s*([a-z][a-z0-9]*)\b([^>]*)>/gi,
+    (_match: string, closing: string, rawTag: string, rawAttributes: string) => {
+      const tag = rawTag.toLocaleLowerCase();
+      if (!allowed.has(tag)) return "";
+      if (closing) return tag === "br" ? "" : `</${tag}>`;
+      if (tag === "br") return "<br>";
+      if (tag !== "a") return `<${tag}>`;
+      const hrefMatch = /\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(rawAttributes);
+      const href = hrefMatch?.[1] ?? hrefMatch?.[2];
+      if (!href) return "<a>";
+      const safe = /^(?:https?:\/\/|\/|#)/i.test(href) ? href : "#";
+      const escaped = safe.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
+      return `<a href="${escaped}" rel="noreferrer noopener">`;
+    },
+  );
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function cursorEncode(offset: number): string {
@@ -70,11 +116,13 @@ function failure<T>(error: ErrorEnvelope): OperationResult<T> {
 export interface FoundrySessionServiceOptions {
   now?: () => Date;
   idFactory?: () => string;
+  journalFolderName?: string | null;
 }
 
 export class FoundrySessionService {
   readonly #now: () => Date;
   readonly #idFactory: () => string;
+  readonly #journalFolderName: string | null;
 
   constructor(
     readonly documents: FoundryDocumentService,
@@ -91,6 +139,7 @@ export class FoundrySessionService {
           `session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
         );
       });
+    this.#journalFolderName = options.journalFolderName ?? "Foundry MCP Sessions";
   }
 
   async start(input: unknown): Promise<OperationResult<SessionsStartOutput>> {
@@ -107,10 +156,29 @@ export class FoundrySessionService {
       const metadata = metadataFromDocument(existing.value);
       if (!metadata)
         return failure(makeError("FOUNDRY_ERROR", "Stored session metadata is invalid"));
-      return { ok: true, value: { session: metadata, journal: existing.value } };
+      const page = await this.#ensureInitialPage(
+        existing.value,
+        metadata,
+        parsed.data.idempotencyKey,
+        parsed.data.initialHtml,
+      );
+      if (!page.ok) return page;
+      return {
+        ok: true,
+        value: { session: page.value.session, journal: page.value.journal, page: page.value.page },
+      };
     }
     const now = this.#now().toISOString();
     const sessionId = this.#idFactory();
+    let folder = parsed.data.folder;
+    if (folder === undefined) {
+      const requestedFolderName = parsed.data.folderName ?? this.#journalFolderName;
+      if (requestedFolderName) {
+        const ensuredFolder = await this.#ensureFolder(requestedFolderName);
+        if (!ensuredFolder.ok) return ensuredFolder;
+        folder = ensuredFolder.value.uuid;
+      }
+    }
     const metadata: SessionMetadata = {
       sessionId,
       journalUuid: "pending",
@@ -122,12 +190,13 @@ export class FoundrySessionService {
       status: "open",
       startedAt: now,
       updatedAt: now,
+      ...(typeof folder === "string" ? { folderUuid: folder } : {}),
     };
     const created = await this.documents.create({
       type: "JournalEntry",
       data: {
         name: parsed.data.title,
-        ...(parsed.data.folder !== undefined ? { folder: parsed.data.folder } : {}),
+        ...(folder !== undefined ? { folder } : {}),
         flags: {
           foundryMcp: {
             session: metadata,
@@ -150,7 +219,17 @@ export class FoundrySessionService {
       expectedHash: result.document.sourceHash,
     });
     if (!updated.ok) return updated;
-    return { ok: true, value: { session: finalMetadata, journal: updated.value.document } };
+    const page = await this.#ensureInitialPage(
+      updated.value.document,
+      finalMetadata,
+      parsed.data.idempotencyKey,
+      parsed.data.initialHtml,
+    );
+    if (!page.ok) return page;
+    return {
+      ok: true,
+      value: { session: page.value.session, journal: page.value.journal, page: page.value.page },
+    };
   }
 
   async append(input: unknown): Promise<OperationResult<SessionsAppendOutput>> {
@@ -219,10 +298,12 @@ export class FoundrySessionService {
     });
     if (!pageUpdated.ok) return pageUpdated;
     const finalMetadata = { ...metadata, updatedAt: timestamp };
+    const currentJournal = await this.documents.get({ uuid: found.value.uuid });
+    if (!currentJournal.ok) return currentJournal;
     const journalUpdated = await this.documents.update({
       uuid: found.value.uuid,
       data: { flags: { foundryMcp: { session: finalMetadata } } },
-      expectedHash: found.value.sourceHash,
+      expectedHash: currentJournal.value.sourceHash,
     });
     if (!journalUpdated.ok) return journalUpdated;
     return { ok: true, value: { session: finalMetadata, page: finalPage } };
@@ -347,6 +428,127 @@ export class FoundrySessionService {
     });
     if (!updated.ok) return updated;
     return { ok: true, value: { session: nextMetadata, journalData: updated.value.document.data } };
+  }
+
+  async #ensureFolder(name: string): Promise<OperationResult<{ uuid: string }>> {
+    let cursor: string | undefined;
+    do {
+      const listed = await this.documents.list({
+        type: "Folder",
+        nameFilter: name,
+        fields: ["name", "type"],
+        pageSize: 200,
+        ...(cursor ? { cursor } : {}),
+      });
+      if (!listed.ok) return listed;
+      const existing = listed.value.items.find(
+        (item) => item.name === name && item.data?.type === "JournalEntry",
+      );
+      if (existing) return { ok: true, value: { uuid: existing.uuid } };
+      cursor = listed.value.nextCursor;
+    } while (cursor);
+    const created = await this.documents.create({
+      type: "Folder",
+      data: { name, type: "JournalEntry", sorting: "a", folder: null },
+    });
+    if (!created.ok) return created;
+    const result = created.value.results[0];
+    if (!result || result.status !== "created")
+      return failure(
+        result?.error ?? makeError("FOUNDRY_ERROR", "Foundry did not create the session folder"),
+      );
+    return { ok: true, value: { uuid: result.document.uuid } };
+  }
+
+  async #ensureInitialPage(
+    journal: DocumentView,
+    metadata: SessionMetadata,
+    idempotencyKey: string,
+    initialHtml?: string,
+  ): Promise<
+    OperationResult<{ session: SessionMetadata; journal: DocumentView; page: SessionPage }>
+  > {
+    const pages = await this.#allPages(journal.uuid);
+    if (!pages.ok) return pages;
+    const existing = pages.value.find(
+      (document) => foundryMcpFlags(document.data).sessionInitialPage === true,
+    );
+    if (existing) {
+      const page = pageFromDocument(existing);
+      if (!page)
+        return failure(
+          makeError("FOUNDRY_ERROR", "Stored initial session page metadata is invalid"),
+        );
+      if (metadata.initialPageUuid === page.uuid)
+        return { ok: true, value: { session: metadata, journal, page } };
+      const nextMetadata: SessionMetadata = { ...metadata, initialPageUuid: page.uuid };
+      const updated = await this.documents.update({
+        uuid: journal.uuid,
+        data: { flags: { foundryMcp: { session: nextMetadata } } },
+        expectedHash: journal.sourceHash,
+      });
+      if (!updated.ok) return updated;
+      return {
+        ok: true,
+        value: { session: nextMetadata, journal: updated.value.document, page },
+      };
+    }
+
+    const html = sanitizeJournalHtml(initialHtml ?? `<p>${escapeHtml(metadata.purpose)}</p>`);
+    const pendingPage: SessionPage = {
+      uuid: "pending",
+      timestamp: metadata.startedAt,
+      kind: "summary",
+      attribution: "foundry-mcp",
+      html,
+      linkedUuids: metadata.linkedUuids,
+      private: false,
+    };
+    const created = await this.documents.create({
+      type: "JournalEntryPage",
+      parentUuid: journal.uuid,
+      data: {
+        name: "Session Overview",
+        type: "text",
+        text: { content: html, format: 1 },
+        flags: {
+          foundryMcp: {
+            sessionId: metadata.sessionId,
+            sessionPage: pendingPage,
+            sessionInitialPage: true,
+            idempotencyKey,
+            excludeFromIntelligence: false,
+          },
+        },
+      },
+    });
+    if (!created.ok) return created;
+    const result = created.value.results[0];
+    if (!result || result.status !== "created")
+      return failure(
+        result?.error ??
+          makeError("FOUNDRY_ERROR", "Foundry did not create the initial session page"),
+      );
+    const page: SessionPage = { ...pendingPage, uuid: result.document.uuid };
+    const pageUpdated = await this.documents.update({
+      uuid: result.document.uuid,
+      data: { flags: { foundryMcp: { sessionPage: page } } },
+      expectedHash: result.document.sourceHash,
+    });
+    if (!pageUpdated.ok) return pageUpdated;
+    const nextMetadata: SessionMetadata = { ...metadata, initialPageUuid: page.uuid };
+    const currentJournal = await this.documents.get({ uuid: journal.uuid });
+    if (!currentJournal.ok) return currentJournal;
+    const journalUpdated = await this.documents.update({
+      uuid: journal.uuid,
+      data: { flags: { foundryMcp: { session: nextMetadata } } },
+      expectedHash: currentJournal.value.sourceHash,
+    });
+    if (!journalUpdated.ok) return journalUpdated;
+    return {
+      ok: true,
+      value: { session: nextMetadata, journal: journalUpdated.value.document, page },
+    };
   }
 
   async #allSessionJournals(): Promise<OperationResult<DocumentView[]>> {

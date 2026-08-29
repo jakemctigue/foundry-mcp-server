@@ -6,7 +6,11 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./dist/index.js"
+    ".": "./dist/index.js",
+    "./assets/local-file": "./dist/assets/local-file.js",
+    "./assets/url-import": "./dist/assets/url-import.js",
+    "./providers/images": "./dist/providers/images.js",
+    "./secrets/image-provider": "./dist/secrets/image-provider.js"
   },
   "files": [
     "dist/",
@@ -17,7 +21,7 @@
     "native/README.md"
   ],
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts --sourcemap --clean",
+    "build": "tsup src/index.ts src/assets/local-file.ts src/assets/url-import.ts src/providers/images.ts src/secrets/image-provider.ts --format esm --dts --sourcemap --clean",
     "native:build": "dotnet build native/windows-pipe-broker/FoundryMcp.WindowsPipeBroker.csproj --configuration Release --nologo",
     "native:publish": "pwsh -NoProfile -File native/publish.ps1",
     "typecheck": "tsc --noEmit -p tsconfig.json",

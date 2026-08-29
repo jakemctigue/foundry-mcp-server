@@ -41,6 +41,10 @@ describe("FoundrySessionService", () => {
     const duplicateStart = unwrap(await sessions.start(startInput));
     expect(duplicateStart.session.sessionId).toBe(started.session.sessionId);
     expect(unwrap(await documents.list({ type: "JournalEntry" })).items).toHaveLength(1);
+    expect(duplicateStart.page.uuid).toBe(started.page.uuid);
+    expect(unwrap(await documents.list({ type: "Folder" })).items).toHaveLength(1);
+    expect(started.session.folderUuid).toBeDefined();
+    expect(started.session.initialPageUuid).toBe(started.page.uuid);
 
     const appendInput = {
       sessionId: started.session.sessionId,
@@ -64,7 +68,7 @@ describe("FoundrySessionService", () => {
           maxDepth: 1,
         }),
       ).items,
-    ).toHaveLength(1);
+    ).toHaveLength(2);
 
     const statusInput = { sessionId: started.session.sessionId, idempotencyKey: "status-key-0001" };
     const ended = unwrap(await sessions.end(statusInput));
@@ -90,7 +94,8 @@ describe("FoundrySessionService", () => {
     const timeline = unwrap(
       await sessions.get({ sessionId: started.session.sessionId, pageSize: 1 }),
     );
-    expect(timeline.pages).toEqual([appended.page]);
+    expect(timeline.pages).toEqual([started.page]);
+    expect(timeline.nextCursor).toBeDefined();
   });
 
   it("marks private pages for default intelligence exclusion without changing journal ownership", async () => {
@@ -122,11 +127,64 @@ describe("FoundrySessionService", () => {
     expect(started.journal.ownershipSummary).toEqual({ default: 1 });
   });
 
+  it("reuses a configured JournalEntry folder and preserves unrelated journal content", async () => {
+    const runtime = createRichFakeRuntime();
+    const documents = new FoundryDocumentService(runtime);
+    const existingFolder = runtime.seedDocument("Folder", {
+      name: "Campaign Logs",
+      type: "JournalEntry",
+      flags: { anotherModule: { keep: true } },
+    });
+    const sessions = new FoundrySessionService(documents, {
+      now: () => new Date("2026-08-29T13:00:00.000Z"),
+      idFactory: () => "folder-session",
+      journalFolderName: "Campaign Logs",
+    });
+    const started = unwrap(
+      await sessions.start({
+        title: "Folder-backed Session",
+        purpose: "Preserve world-authored content",
+        initialHtml: '<h2>Overview</h2><form action="evil"><p>Safe</p></form>',
+        idempotencyKey: "folder-start-key",
+      }),
+    );
+    expect(started.session.folderUuid).toBe(existingFolder.uuid);
+    expect(started.page.html).toBe("<h2>Overview</h2><p>Safe</p>");
+    const beforeAppend = unwrap(await documents.get({ uuid: started.journal.uuid }));
+    const external = unwrap(
+      await documents.update({
+        uuid: started.journal.uuid,
+        data: {
+          content: "Unrelated human-authored content",
+          flags: { anotherModule: { untouched: true } },
+        },
+        expectedHash: beforeAppend.sourceHash,
+      }),
+    );
+    unwrap(
+      await sessions.append({
+        sessionId: started.session.sessionId,
+        kind: "note",
+        html: "New note",
+        attribution: "GM",
+        idempotencyKey: "folder-append-key",
+      }),
+    );
+    expect(unwrap(await documents.get({ uuid: started.journal.uuid })).data).toMatchObject({
+      content: "Unrelated human-authored content",
+      flags: {
+        anotherModule: { untouched: true },
+        foundryMcp: { session: { sessionId: "folder-session" } },
+      },
+    });
+    expect(external.document.data.flags).toHaveProperty("anotherModule.untouched", true);
+  });
+
   it("sanitizes unsafe active content", () => {
     expect(
       sanitizeJournalHtml(
         '<style>body{display:none}</style><p onmouseover="x()"><a href="javascript:evil()">Safe text</a></p>',
       ),
-    ).toBe('<p><a href="#">Safe text</a></p>');
+    ).toBe('<p><a href="#" rel="noreferrer noopener">Safe text</a></p>');
   });
 });

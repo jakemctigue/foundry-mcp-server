@@ -10,6 +10,8 @@ import {
   type CapabilitiesGetOutput as CapabilitiesGetOutputData,
 } from "@foundry-mcp/protocol";
 import type { BridgeConnection } from "./bridge-connection.js";
+import { registerAssetTools } from "./tools/assets.js";
+import { registerSessionTools } from "./tools/sessions.js";
 
 // Accepts any object shape so the SDK never rejects the call before our
 // handler runs; we perform the "no unexpected arguments" check ourselves so
@@ -90,6 +92,8 @@ export function createFoundryMcpServer(options: CreateServerOptions): McpServer 
         capabilities: [
           { name: "documents", version: "0.1.0", readOnly: true },
           { name: "connections", version: "0.1.0", readOnly: true },
+          { name: "assets", version: "0.1.0", readOnly: false },
+          { name: "sessions", version: "0.1.0", readOnly: false },
         ],
       };
       const parsed = CapabilitiesGetOutput.parse(data);
@@ -104,6 +108,9 @@ export function createFoundryMcpServer(options: CreateServerOptions): McpServer 
       };
     },
   );
+
+  registerAssetTools(server, bridge);
+  registerSessionTools(server, bridge);
 
   return server;
 }

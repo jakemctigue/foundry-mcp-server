@@ -527,6 +527,7 @@ export function createRichFakeRuntime(role: FakeRole = FakeRole.GAMEMASTER): Fak
       },
     })
     .registerDocumentType("JournalEntry", { collection: "journal" })
+    .registerDocumentType("Folder", { collection: "folders" })
     .registerDocumentType("JournalEntryPage", {
       embedded: true,
       parentTypes: ["JournalEntry"],
