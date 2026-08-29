@@ -10,6 +10,7 @@ export interface PipeClient {
   send: (message: unknown) => void;
   onMessage: (handler: (message: unknown) => void) => void;
   onError: (handler: (error: Error) => void) => void;
+  onClose?: (handler: () => void) => void;
   close: () => Promise<void>;
 }
 
@@ -42,6 +43,8 @@ export async function connectPipeClient(
   const authenticator = new BridgeAuthenticator(authKey);
   const handlers: Array<(message: unknown) => void> = [];
   const errorHandlers: Array<(error: Error) => void> = [];
+  const closeHandlers: Array<() => void> = [];
+  let closed = false;
 
   // Keep a permanent listener so an authenticated-framing failure closes the
   // transport without becoming an uncaught EventEmitter error when a caller
@@ -49,6 +52,12 @@ export async function connectPipeClient(
   socket.on("error", (error) => {
     for (const handler of errorHandlers) {
       handler(error);
+    }
+  });
+  socket.on("close", () => {
+    closed = true;
+    for (const handler of closeHandlers) {
+      handler();
     }
   });
 
@@ -87,6 +96,13 @@ export async function connectPipeClient(
     },
     onError: (handler) => {
       errorHandlers.push(handler);
+    },
+    onClose: (handler) => {
+      if (closed) {
+        queueMicrotask(handler);
+        return;
+      }
+      closeHandlers.push(handler);
     },
     close: () =>
       new Promise<void>((resolve) => {
