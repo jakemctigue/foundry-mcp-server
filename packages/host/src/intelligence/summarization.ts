@@ -1,0 +1,108 @@
+import type Database from "better-sqlite3";
+import { redactSecrets, redactSecretText } from "../security/redaction.js";
+import type { StoredEvent } from "./event-ledger.js";
+import { getEventsByIds } from "./queries.js";
+
+export interface IntelligenceSummaryProvider {
+  name: string;
+  model: string;
+  summarize(input: {
+    connectionId: string;
+    events: readonly StoredEvent[];
+  }): Promise<unknown>;
+}
+
+export interface SummarizeEventsOptions {
+  connectionId: string;
+  eventIds: readonly number[];
+  provider: IntelligenceSummaryProvider;
+  now?: () => Date;
+}
+
+export type SummarizeEventsResult =
+  | {
+      status: "success";
+      provenanceId: number;
+      suggestion: unknown;
+      sourceEventIds: number[];
+    }
+  | {
+      status: "failed";
+      provenanceId: number;
+      error: string;
+      sourceEventIds: number[];
+    };
+
+function insertProvenance(
+  db: Database.Database,
+  values: {
+    timestamp: string;
+    connectionId: string;
+    provider: string;
+    model: string;
+    sourceEventIds: readonly number[];
+    status: "success" | "failed";
+    suggestion?: unknown;
+    errorMessage?: string;
+  },
+): number {
+  const result = db
+    .prepare(
+      `INSERT INTO summary_provenance
+        (timestamp, connection_id, provider, model, source_event_ids_json,
+         status, suggestion_json, error_message)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      values.timestamp,
+      values.connectionId,
+      values.provider,
+      values.model,
+      JSON.stringify(values.sourceEventIds),
+      values.status,
+      values.suggestion === undefined ? null : JSON.stringify(values.suggestion),
+      values.errorMessage ?? null,
+    );
+  return Number(result.lastInsertRowid);
+}
+
+/**
+ * Calls an optional intelligence provider without allowing provider failure to
+ * escape into event ingestion. The only persisted output is an auditable
+ * suggestion/provenance record; this function has no Foundry mutation path.
+ */
+export async function summarizeEvents(
+  db: Database.Database,
+  options: SummarizeEventsOptions,
+): Promise<SummarizeEventsResult> {
+  const timestamp = (options.now?.() ?? new Date()).toISOString();
+  const sourceEventIds = [...new Set(options.eventIds)];
+  try {
+    const events = getEventsByIds(db, options.connectionId, sourceEventIds);
+    const suggestion = redactSecrets(
+      await options.provider.summarize({ connectionId: options.connectionId, events }),
+    );
+    const provenanceId = insertProvenance(db, {
+      timestamp,
+      connectionId: options.connectionId,
+      provider: options.provider.name,
+      model: options.provider.model,
+      sourceEventIds,
+      status: "success",
+      suggestion,
+    });
+    return { status: "success", provenanceId, suggestion, sourceEventIds };
+  } catch (error) {
+    const message = redactSecretText(error instanceof Error ? error.message : String(error));
+    const provenanceId = insertProvenance(db, {
+      timestamp,
+      connectionId: options.connectionId,
+      provider: options.provider.name,
+      model: options.provider.model,
+      sourceEventIds,
+      status: "failed",
+      errorMessage: message,
+    });
+    return { status: "failed", provenanceId, error: message, sourceEventIds };
+  }
+}

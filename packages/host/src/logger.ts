@@ -1,3 +1,5 @@
+import { redactSecrets, redactSecretText } from "./security/redaction.js";
+
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface LogSink {
@@ -30,11 +32,12 @@ export function createLogger(options: CreateLoggerOptions): Logger {
     if (LEVEL_ORDER[level] < LEVEL_ORDER[minLevel]) {
       return;
     }
+    const safeFields = redactSecrets(fields ?? {}) as Record<string, unknown>;
     const record = {
+      ...safeFields,
       timestamp: new Date().toISOString(),
       level,
-      message,
-      ...fields,
+      message: redactSecretText(message),
     };
     const line = JSON.stringify(record) + "\n";
     for (const sink of options.sinks) {

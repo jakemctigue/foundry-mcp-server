@@ -28,5 +28,23 @@ describe("resolveConfig precedence", () => {
   it("falls back to the built-in default", () => {
     const config = resolveConfig({}, {}, {});
     expect(config.pipeName).toBe("foundry-mcp");
+    expect(config.capturePrivateContent).toBe(false);
+    expect(config.eventRetentionDays).toBe(30);
+    expect(config.eventCategories).toContain("chat.public");
+    expect(config.eventCategories).not.toContain("chat.private");
+  });
+
+  it("parses event capture and retention environment settings", () => {
+    const config = resolveConfig(
+      {},
+      {
+        FOUNDRY_MCP_EVENT_CATEGORIES: "document.create, combat ,chat.private",
+        FOUNDRY_MCP_CAPTURE_PRIVATE_CONTENT: "yes",
+        FOUNDRY_MCP_EVENT_RETENTION_DAYS: "14",
+      },
+    );
+    expect(config.eventCategories).toEqual(["document.create", "combat", "chat.private"]);
+    expect(config.capturePrivateContent).toBe(true);
+    expect(config.eventRetentionDays).toBe(14);
   });
 });

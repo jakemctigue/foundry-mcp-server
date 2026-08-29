@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { openDatabase, runMigrations } from "../src/db/index.js";
+import { MIGRATIONS } from "../src/db/migrations.js";
 
 describe("SQLite init and migrations", () => {
   const tmpFiles: string[] = [];
@@ -35,7 +36,7 @@ describe("SQLite init and migrations", () => {
     db.close();
   });
 
-  it("creates schema_migrations, events, and documents_index tables", () => {
+  it("creates the ledger, stream, audit, provenance, and policy tables", () => {
     const db = openDatabase(tmpDbPath());
     runMigrations(db);
 
@@ -47,13 +48,29 @@ describe("SQLite init and migrations", () => {
     expect(tables).toContain("schema_migrations");
     expect(tables).toContain("events");
     expect(tables).toContain("documents_index");
+    expect(tables).toContain("event_stream_state");
+    expect(tables).toContain("event_receipts");
+    expect(tables).toContain("audit_log");
+    expect(tables).toContain("summary_provenance");
+    expect(tables).toContain("capability_grants");
 
     const eventColumns = db
       .prepare("PRAGMA table_info(events)")
       .all()
       .map((r) => (r as { name: string }).name);
     expect(eventColumns).toEqual(
-      expect.arrayContaining(["id", "sequence", "type", "payload", "created_at"]),
+      expect.arrayContaining([
+        "id",
+        "sequence_id",
+        "connection_id",
+        "category",
+        "payload",
+        "received_at",
+        "emitted_at",
+        "session_id",
+        "world_id",
+        "search_text",
+      ]),
     );
 
     const docColumns = db
@@ -62,6 +79,41 @@ describe("SQLite init and migrations", () => {
       .map((r) => (r as { name: string }).name);
     expect(docColumns).toEqual(expect.arrayContaining(["uuid", "type", "data", "updated_at"]));
 
+    db.close();
+  });
+
+  it("forward-migrates and backfills a version-one event ledger", () => {
+    const db = openDatabase(tmpDbPath());
+    const initial = MIGRATIONS[0];
+    if (initial === undefined) {
+      throw new Error("missing initial migration");
+    }
+    db.exec(initial.sql);
+    db.prepare("INSERT INTO schema_migrations (id, name) VALUES (?, ?)").run(
+      initial.id,
+      initial.name,
+    );
+    db.prepare("INSERT INTO events (sequence, type, payload) VALUES (?, ?, ?)").run(
+      7,
+      "journal.update",
+      '{"name":"Old note"}',
+    );
+
+    expect(runMigrations(db).applied).toEqual([2, 3, 4, 5]);
+    const row = db
+      .prepare(
+        `SELECT connection_id, sequence_id, category, payload, received_at, search_text
+         FROM events WHERE sequence_id = 7`,
+      )
+      .get() as Record<string, unknown>;
+    expect(row).toMatchObject({
+      connection_id: "legacy",
+      sequence_id: 7,
+      category: "journal.update",
+      payload: '{"name":"Old note"}',
+    });
+    expect(row["received_at"]).toMatch(/Z$/);
+    expect(row["search_text"]).toContain("Old note");
     db.close();
   });
 

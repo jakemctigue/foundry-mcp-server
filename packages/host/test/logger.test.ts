@@ -41,4 +41,23 @@ describe("logger", () => {
     logger.warn("audible");
     expect(fileLines.length).toBe(1);
   });
+
+  it("redacts secret fields and inline bearer credentials", () => {
+    const fileLines: string[] = [];
+    const logger = createLogger({ sinks: [{ write: (line) => fileLines.push(line) }] });
+    logger.error("provider rejected Bearer abc.def.ghi", {
+      apiKey: "sk-not-safe-12345",
+      nested: { pairing_secret: "pair-me", tokenCount: 42 },
+    });
+
+    const line = fileLines[0] ?? "";
+    expect(line).not.toContain("abc.def.ghi");
+    expect(line).not.toContain("sk-not-safe-12345");
+    expect(line).not.toContain("pair-me");
+    expect(line).toContain("[REDACTED]");
+    expect(JSON.parse(line)).toMatchObject({
+      apiKey: "[REDACTED]",
+      nested: { pairing_secret: "[REDACTED]", tokenCount: 42 },
+    });
+  });
 });
