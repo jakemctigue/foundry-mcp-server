@@ -1,0 +1,693 @@
+{
+  "project": "foundry-mcp-server",
+  "branchName": "archon/task-feat-windows-foundry-mcp",
+  "prdFile": "prd.md",
+  "description": "Repair Sprint 1's MCP protocol-negotiation and Windows pipe-ACL gaps, then implement every remaining Foundry MCP Server capability in docs/PRD.md through the Definition of Done.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Verify real MCP SDK protocol negotiation",
+      "description": "As a maintainer, I want a child-process test that spawns the mcp-adapter over stdio using the real @modelcontextprotocol/sdk@^1.30.0 client and inspects the negotiated protocol version, so that the PRD's claimed '2026-07-28' wire version is proven or disproven against actual SDK behavior instead of asserted in a constant.",
+      "acceptanceCriteria": [
+        "New test in packages/mcp-adapter/test-e2e/ spawns the built adapter (StdioServerTransport from cli.ts) via the SDK's Client + StdioClientTransport and captures the negotiated protocolVersion from the initialize response",
+        "Test asserts the actual negotiated value returned by the SDK, not the PROTOCOL_VERSION constant in packages/protocol/src/version.ts",
+        "Test fails loudly (not silently passes) if negotiation errors or the client falls back unexpectedly",
+        "pnpm --filter @foundry-mcp/mcp-adapter test:e2e passes",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Use packages/mcp-adapter/test-e2e/smoke.test.ts as the harness pattern. server.connect(transport) in cli.ts:26-27 is where negotiation happens server-side; use the SDK's own Client class client-side rather than hand-rolling JSON-RPC.",
+      "dependsOn": [],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Correct PROTOCOL_VERSION and legacy compatibility list",
+      "description": "As a maintainer, I want packages/protocol/src/version.ts to reflect the protocol version(s) the installed SDK actually supports, so that foundry.capabilities.get and internal negotiation logic never advertise a version the toolchain cannot pass conformance tests for.",
+      "acceptanceCriteria": [
+        "PROTOCOL_VERSION and LEGACY_PROTOCOL_VERSIONS in packages/protocol/src/version.ts are set to values confirmed by US-001's test evidence",
+        "packages/protocol/test/version.test.ts updated to assert the corrected constants",
+        "If '2026-07-28' cannot be substantiated, code/docs are updated to stop claiming it as a currently-negotiated wire version (PRD framing as target vs. actual is preserved in comments only where non-obvious)",
+        "foundry.capabilities.get output (server.ts:84-101) reflects the corrected constant with no other behavior change",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/protocol/src/version.ts:1-2; consumed by packages/mcp-adapter/src/bridge-connection.ts negotiateProtocolVersion and server.ts:84-101.",
+      "dependsOn": ["US-001"],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "Dual-era stdio adapter child-process tests",
+      "description": "As a maintainer, I want child-process tests proving the stdio adapter initializes correctly under both the current negotiated version and the declared legacy version(s), so that dual-era support claimed in docs/PRD.md §2 has real evidence.",
+      "acceptanceCriteria": [
+        "Test spawns the adapter and performs an initialize handshake advertising the current version — asserts success",
+        "Test spawns the adapter and performs an initialize handshake advertising each entry in LEGACY_PROTOCOL_VERSIONS — asserts either graceful negotiation or a documented, structured rejection (no crash, no stdout corruption)",
+        "Both tests assert stdout contains only JSON-RPC frames (no log lines) per PRD §8",
+        "pnpm --filter @foundry-mcp/mcp-adapter test:e2e passes",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Extend packages/mcp-adapter/test-e2e/smoke.test.ts. Reuse the stub bridge path (createStubBridgeConnection in bridge-connection.ts) so the test doesn't require a running daemon.",
+      "dependsOn": ["US-002"],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Real Windows pipe ACL: current-logon-SID DACL",
+      "description": "As a GM running the host daemon, I want the named pipe's security descriptor restricted to my current Windows logon SID, so that other local users on the same machine cannot connect to the bridge pipe.",
+      "acceptanceCriteria": [
+        "New win32-only implementation replaces defaultAclCheck's Promise.resolve(true) with a real check: reads the pipe's security descriptor and confirms it grants access only to the current process's logon SID (or an equivalent verified mechanism, e.g. a native/sidecar helper)",
+        "AclCheck function signature in packages/host/src/bridge/acl.ts is unchanged so startPipeServer's injection seam (pipe-server.ts:40,51,53) requires no caller changes",
+        "Non-Windows platforms keep existing passthrough behavior with a comment explaining why (filesystem-mode-enforced Unix socket)",
+        "Unit test simulates a descriptor that does NOT match the current SID and asserts enforceAcl returns false and logs the failure (acl.ts:14-26 logging path)",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/host/src/bridge/acl.ts:3,12; packages/host/test covers the injection pattern already used for pipe-bridge.test.ts. May require a native addon or a `net`/Windows API call (e.g. via a small helper binary) — document the chosen approach in code comments only if non-obvious.",
+      "dependsOn": [],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "Reject remote clients + verify descriptor and client token",
+      "description": "As a GM, I want the pipe server to refuse any connection attempt that isn't from a local, current-user process, so that the bridge cannot be reached remotely or by an impersonating local process.",
+      "acceptanceCriteria": [
+        "startPipeServer (pipe-server.ts:49-96) verifies, on each accepted socket, that the peer is local (named pipes are inherently local on Windows, but the check must still validate the client's process token/SID matches the expected owner before processing the first frame)",
+        "Connections failing the client-token check are closed immediately without invoking onMessage, and the failure is logged",
+        "Unit test simulates a client with a mismatched token and asserts the socket is closed and no message handler fires",
+        "Existing pipe-bridge.test.ts continues to pass unmodified in intent (may need updated mocks for the new check)",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/host/src/bridge/pipe-server.ts:65-75 net.createServer callback is where the per-connection check is added, following the same AclCheck-style injection pattern as acl.ts for testability.",
+      "dependsOn": ["US-004"],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Retain HMAC bridge auth alongside ACL; fail-closed tests",
+      "description": "As a security reviewer, I want the existing HMAC-based bridge message authentication (packages/host/src/secrets/pairing.ts) to remain in force in addition to the new ACL/token checks, and every failure mode to fail closed, so that ACL and HMAC are defense-in-depth rather than either replacing the other.",
+      "acceptanceCriteria": [
+        "Bridge message handling path requires both a passing ACL/token check AND a valid HMAC signature before any request reaches document/asset/journal logic",
+        "Test matrix: (ACL pass, HMAC pass) succeeds; (ACL pass, HMAC fail) rejects; (ACL fail, HMAC pass) rejects; (ACL fail, HMAC fail) rejects — all four cases asserted",
+        "No code path exists where a check failure silently defaults to allow",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/host/src/secrets/pairing.ts for existing HMAC logic; packages/host/test/pairing.test.ts and pipe-bridge.test.ts for the pattern to extend.",
+      "dependsOn": ["US-005"],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Package win-x64/win-arm64 broker artifacts",
+      "description": "As a Windows user, I want the pipe broker/ACL component packaged as verified win-x64 and win-arm64 build artifacts, so that install doesn't require a local native-module compile toolchain if a helper binary approach was used in US-004/US-005.",
+      "acceptanceCriteria": [
+        "If US-004/US-005 required a native helper/sidecar, a build script produces win-x64 and win-arm64 artifacts under a documented output path",
+        "If no native helper was needed (pure Node/Windows-API approach), this story documents that decision and instead adds a CI matrix job proving the ACL path works on both win-x64 and win-arm64 GitHub-hosted runners (or documents the runner limitation)",
+        "CI workflow (.github/workflows/ci.yml) updated accordingly",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": ".github/workflows/ci.yml is the existing CI entry point; extend its matrix rather than adding a parallel workflow.",
+      "dependsOn": ["US-006"],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Document type discovery tool",
+      "description": "As an AI client, I want a foundry.documents.types tool that reports the runtime-registered Document types for the connected world, so that I never assume a hard-coded Actor/Item/Scene list.",
+      "acceptanceCriteria": [
+        "New protocol schema for documents.types request/response added under packages/protocol/src/ (input: connectionId or implicit-single-connection; output: array of {type, creatable, reason?})",
+        "packages/host/src/fake-foundry/documents.ts extended if needed to report registered types generically",
+        "New tool foundry.documents.types registered in server.ts following the existing registerTool pattern (server.ts:44-73)",
+        "Derived/locked/permission-forbidden types report creatable: false with a reason string, not omission",
+        "Vitest covers empty-world, single-type, and forbidden-type cases against the fake runtime",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Mirror server.ts:44-73 registration shape; add schema to packages/protocol/src alongside connection.ts/capability.ts.",
+      "dependsOn": ["US-003"],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Root document listing with cursor pagination",
+      "description": "As an AI client, I want foundry.documents.list to enumerate root Documents of any type with cursor pagination, ordering, field projection, and folder/type/name filters, so that I can browse a world's content without unbounded results.",
+      "acceptanceCriteria": [
+        "Protocol schema: input {connectionId?, type, folder?, nameFilter?, fields?, cursor?, pageSize (bounded, default+max enforced)}, output {items[], nextCursor?}",
+        "Deterministic ordering documented and tested (e.g. by id ascending) so repeated calls with the same cursor are stable",
+        "pageSize above the documented max is clamped or rejected with INVALID_DATA, not silently ignored",
+        "Fake runtime (fake-foundry/documents.ts) seeded with >1 page of documents; test walks all pages via cursor and asserts full coverage with no duplicates/gaps",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/host/src/fake-foundry/documents.ts is the seam for fake data; pagination style should match any existing cursor helper in packages/protocol (none yet — establish the pattern here for reuse by US-013/US-014).",
+      "dependsOn": ["US-008"],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Document get via UUID resolution",
+      "description": "As an AI client, I want foundry.documents.get to resolve an arbitrary Document by UUID (root, embedded, or compendium) and return a JSON-safe representation with provenance and schema metadata, so that I can read any object the PRD scope covers without manually parsing UUID strings.",
+      "acceptanceCriteria": [
+        "Protocol schema: input {uuid}, output {uuid, type, data (JSON-safe), parent?, pack?, ownershipSummary, schemaVersion}",
+        "Resolution uses the fake runtime's equivalent of fromUuid/parseUuid semantics (no manual string splitting in production code)",
+        "Not-found UUID returns structured NOT_FOUND error via makeError, not a thrown exception across the tool boundary",
+        "Live object prototypes are never serialized into the response (plain JSON only)",
+        "Test covers root, embedded, and not-found UUID cases",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/protocol/src/error.ts makeError pattern already used in server.ts:22-34 errorContent helper.",
+      "dependsOn": ["US-008"],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "Document create (root + embedded, batch)",
+      "description": "As an authorized GM-connected AI client, I want foundry.documents.create to create root or embedded Documents from caller-supplied JSON, including batch creation with per-item results, so that content can be authored generically.",
+      "acceptanceCriteria": [
+        "Protocol schema: input {type, data, parentUuid?} or {items: [...]} for batch; output returns created uuid/document per item with no partial-success ambiguity (each item's outcome is explicit: created | error with reason)",
+        "Batch call with one invalid item still reports success for valid items and a structured per-item error for the invalid one",
+        "Fake runtime records created documents so subsequent get/list calls see them within the same test",
+        "Permission-denied case (simulated) returns structured PERMISSION_DENIED, not a generic failure",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Builds on US-010's UUID/error patterns; fake-foundry/documents.ts needs a mutable in-memory store if not already present.",
+      "dependsOn": ["US-010"],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-012",
+      "title": "Document update with optimistic precondition",
+      "description": "As an authorized AI client, I want foundry.documents.update to require a source-hash/version precondition by default (waivable explicitly) and preserve unknown system-specific fields, so that concurrent edits don't silently clobber each other.",
+      "acceptanceCriteria": [
+        "Protocol schema: input {uuid, data, expectedVersion or expectedHash, forceOverwrite?: boolean}, output {uuid, newVersion/hash}",
+        "Mismatched precondition returns structured CONFLICT error and does not apply the update",
+        "forceOverwrite: true bypasses the precondition explicitly and is logged/audited as a waiver",
+        "Fields present in the stored document but absent from the update payload are preserved, not dropped",
+        "Test covers matching precondition (succeeds), mismatched precondition (CONFLICT), and forced overwrite",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Depends on US-011's mutable fake store for update-in-place semantics.",
+      "dependsOn": ["US-011"],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "Embedded document listing",
+      "description": "As an AI client, I want foundry.documents.embedded.list to enumerate embedded Documents recursively or by parent UUID/embedded type without unbounded traversal, so that I can browse nested content (e.g. Items on an Actor) safely.",
+      "acceptanceCriteria": [
+        "Protocol schema: input {parentUuid, embeddedType?, recursive?: boolean, maxDepth (bounded)}, output {items[], nextCursor?}",
+        "recursive traversal enforces maxDepth and returns a truncated: true flag plus reason when the cap is hit, rather than silently stopping",
+        "Non-recursive call with parentUuid + embeddedType returns only direct children of that type",
+        "Test covers a 3-level nested fixture, asserting depth cap and truncation flag behavior",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Reuses the cursor pagination convention established in US-009.",
+      "dependsOn": ["US-010"],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-014",
+      "title": "Compendium pack + document listing",
+      "description": "As an AI client, I want foundry.compendiums.list and foundry.compendiums.documents.list, so that I can enumerate accessible compendium packs and their contents with an explicit index-only vs hydrated choice.",
+      "acceptanceCriteria": [
+        "foundry.compendiums.list returns accessible packs with {id, label, type, documentCount}",
+        "foundry.compendiums.documents.list accepts {packId, hydrate: boolean, cursor?, pageSize} and returns index-only fields when hydrate is false, full document data when true",
+        "Inaccessible/locked packs are excluded from the list, not returned with an error",
+        "Fake runtime seeded with at least one compendium pack fixture",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "New fixture data likely needed in packages/host/src/fake-foundry/documents.ts or a new compendiums.ts sibling file.",
+      "dependsOn": ["US-008"],
+      "priority": 14,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-015",
+      "title": "Bounded snapshot/export with cycle detection & redaction",
+      "description": "As an AI client, I want an export tool that produces a bounded JSON snapshot of selected objects (by UUID list or query) for prompt context, detecting reference cycles and capping depth/bytes/items, so that I never receive an unbounded or infinitely-recursive payload.",
+      "acceptanceCriteria": [
+        "Protocol schema: input {uuids[] or query, maxDepth, maxBytes, maxItems}, output {snapshot, truncated: boolean, truncationReasons[]}",
+        "Cyclic reference fixture (A references B references A) does not hang or crash; cycle is detected and represented as a reference marker, not re-expanded",
+        "Configured redaction paths are stripped from output and reported in a redactedPaths list",
+        "Exceeding any of maxDepth/maxBytes/maxItems sets truncated: true with the specific reason(s)",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Builds on US-010's get semantics; this is the PRD §4 'Export a bounded snapshot' requirement.",
+      "dependsOn": ["US-010"],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-016",
+      "title": "Structured document-op error taxonomy",
+      "description": "As an AI client, I want every document operation to surface one of the PRD-defined structured error codes (offline bridge, ambiguous connection, unsupported type, invalid data, permission denied, not found, conflict, timeout, cancellation, Foundry-side failure), so that error handling is consistent and machine-parseable across all document tools.",
+      "acceptanceCriteria": [
+        "packages/protocol/src/error.ts enumerates all PRD §4 error codes (extend existing makeError code union if incomplete)",
+        "Every document tool added in US-008–US-013 is audited to map its failure paths onto this taxonomy — no ad-hoc error strings",
+        "Test asserts each code is reachable from at least one tool via a fixture that triggers it",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/protocol/src/error.ts existing makeError signature (see server.ts:22-34 errorContent usage) is extended, not replaced.",
+      "dependsOn": ["US-011", "US-012"],
+      "priority": 16,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-017",
+      "title": "Image asset listing across sources",
+      "description": "As an AI client, I want foundry.assets.images.list to enumerate image assets across configured sources (data/public/optional S3) with filters, pagination, dedup, and bounded recursion, so that I can browse available art without downloading every file.",
+      "acceptanceCriteria": [
+        "Protocol schema: input {source?, pathPrefix?, extensions?, cursor?, pageSize, maxDepth}, output {items: [{path, source, size?, mimeType?}], nextCursor?}",
+        "Duplicate paths across sources are deduplicated per a documented rule (e.g. first-seen source wins)",
+        "maxDepth caps recursive directory walks; exceeding it truncates with a reported reason",
+        "Fake runtime exposes a mock FilePicker-equivalent source tree for testing",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "New fake-foundry fixture needed for file/asset sources — sibling to fake-foundry/documents.ts.",
+      "dependsOn": ["US-003"],
+      "priority": 17,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-018",
+      "title": "Image reference discovery in documents",
+      "description": "As an AI client, I want foundry.assets.references.find to recursively inspect selected Documents' JSON data and return every image reference found with its owning UUID and JSON path, so that I can locate art already in use.",
+      "acceptanceCriteria": [
+        "Protocol schema: input {uuids[] or query}, output {references: [{uuid, jsonPath, imagePath}]}",
+        "Detects image-looking string fields by extension/heuristic documented in code comments only if non-obvious",
+        "Test fixture with nested embedded documents containing image paths at varying depths asserts all are found with correct JSON paths",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Reuses US-010 get + US-017 asset listing conventions.",
+      "dependsOn": ["US-010", "US-017"],
+      "priority": 18,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-019",
+      "title": "Image upload with path/MIME/size validation",
+      "description": "As an authorized GM-connected AI client, I want foundry.assets.images.upload to write an image into an allowed Foundry data path from a local file, base64 payload, or generated result, rejecting traversal/absolute destinations and enforcing MIME/extension/size policy, so that uploads can't escape the sandboxed asset directory.",
+      "acceptanceCriteria": [
+        "Protocol schema: input {destinationPath, source: {file|base64|generated}, onCollision: 'error'|'rename'|'overwrite'}, output {assetPath}",
+        "Path traversal attempts (../, absolute paths, drive letters) are rejected with INVALID_DATA before any write occurs",
+        "MIME/extension mismatch (e.g. .png extension with JPEG magic bytes) is rejected",
+        "Oversized payload (above a documented max) is rejected before full buffering when feasible",
+        "Collision policy is honored and tested for all three onCollision values",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "This is a security-sensitive path — mirror the traversal-rejection style expected in PRD §10's security test list (US-037 will add adversarial coverage).",
+      "dependsOn": ["US-017"],
+      "priority": 19,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-020",
+      "title": "Deterministic local image-generation test provider",
+      "description": "As a developer, I want a deterministic local image-generation provider (no network calls) implementing the provider interface, so that generation-dependent tools and tests are reproducible without any external provider configured.",
+      "acceptanceCriteria": [
+        "Provider interface defined (packages/host/src/ or a new providers/ module) with a generate(prompt, options) -> {bytes, mimeType} contract",
+        "Deterministic test provider produces a fixed, valid image (e.g. solid-color PNG) for a given prompt hash, with no network access",
+        "foundry.assets.images.generate tool registered, defaulting to the deterministic provider when no external provider is configured",
+        "Generated bytes are MIME-sniffed and pixel/byte-bounded before any downstream use",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "PRD §5 requires 'at least one genuinely usable production provider path... plus a deterministic local test provider' — this story is the deterministic half; US-021 is the real provider.",
+      "dependsOn": ["US-019"],
+      "priority": 20,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-021",
+      "title": "Opt-in real image-generation provider (OpenAI Images)",
+      "description": "As a GM who has configured an API key, I want an opt-in OpenAI Images provider behind the same provider interface, disabled until explicitly configured, so that real generation is available without being on by default.",
+      "acceptanceCriteria": [
+        "Provider is only registered/selectable when its config (API key etc.) is present; absent config means the tool falls back to reporting the provider as unavailable, not silently using the deterministic provider without saying so",
+        "API key is read from host-side secret storage (packages/host/src/secrets/storage.ts) and never included in any MCP response, log, or error message",
+        "Network failures from the provider return a structured error, do not crash the process, and do not fall back silently to a different provider",
+        "Unit test mocks the HTTP call (no real network access in CI) and asserts request shaping + key redaction in logs",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/host/src/secrets/storage.ts is the existing DPAPI/fallback secret store to reuse for the API key.",
+      "dependsOn": ["US-020"],
+      "priority": 21,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-022",
+      "title": "Image attach + SSRF-safe URL import guard",
+      "description": "As an AI client, I want foundry.assets.images.attach to create/update a Document referencing an uploaded image as one auditable operation, and any URL-import path to block SSRF-prone targets by default, so that attaching art is atomic and importing from a URL can't be abused to probe internal networks.",
+      "acceptanceCriteria": [
+        "foundry.assets.images.attach combines upload-or-reference + document field update into a single tool call with one audit entry, not two independently-failable steps",
+        "If URL import is implemented: loopback, link-local, private-network (RFC1918), credential-bearing URLs, redirect chains, and oversized responses are rejected by default before any bytes are fetched into memory beyond a small probe",
+        "Test asserts each blocked category (loopback, link-local, private-network, credentialed URL, oversized) is rejected with a structured error",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "SSRF guard should validate resolved IPs, not just hostnames, to avoid DNS-rebinding bypass — call this out for US-037's security suite too.",
+      "dependsOn": ["US-019"],
+      "priority": 22,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-023",
+      "title": "Journal session start/append on real Document types",
+      "description": "As a GM, I want foundry.sessions.start and foundry.sessions.append backed by real JournalEntry/JournalEntryPage Documents (via US-011's create tool), so that AI-authored session notes remain visible and editable in Foundry itself.",
+      "acceptanceCriteria": [
+        "foundry.sessions.start creates or reuses a configurable journal folder, creates a JournalEntry + initial page, and returns stable session/journal/page UUIDs",
+        "foundry.sessions.append adds timestamped notes/decisions/TODOs/links as new page content, sanitizing any HTML input before storage",
+        "A machine-readable metadata block (flags) is kept separate from human-readable page content and is owned exclusively by this module's namespace",
+        "Test verifies appending does not overwrite unrelated existing journal content in the fake runtime",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Depends on US-011's document create tool for the underlying JournalEntry/Page writes; HTML sanitization should reuse an existing sanitizer if one exists in the dependency tree, else add a minimal allow-list sanitizer.",
+      "dependsOn": ["US-011"],
+      "priority": 23,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-024",
+      "title": "Journal list/get/end/reopen + idempotency keys",
+      "description": "As a GM, I want foundry.sessions.list/get/end/reopen with request idempotency keys, so that a network retry of start/append never duplicates journal entries or pages.",
+      "acceptanceCriteria": [
+        "foundry.sessions.list supports pagination and returns session summaries; foundry.sessions.get returns a full timeline",
+        "foundry.sessions.end/reopen update status/end-time metadata without deleting prior page content",
+        "start/append accept an idempotencyKey; a repeated call with the same key returns the original result without creating a duplicate page/entry",
+        "Test replays the same start call twice with the same idempotency key and asserts only one JournalEntry exists",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Idempotency store can be the same SQLite instance used for config (packages/host/src/db/index.ts) — add a migration if a dedicated table is needed.",
+      "dependsOn": ["US-023"],
+      "priority": 24,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-025",
+      "title": "Event ledger schema + SQLite migrations",
+      "description": "As the host daemon, I want an append-only event ledger table (with retention controls and WAL-safe migrations), so that world activity events have durable, queryable storage.",
+      "acceptanceCriteria": [
+        "New migration added via packages/host/src/db/migrations.ts pattern creating an events table (sequenceId, connectionId, category, payload, receivedAt, and any needed indexes)",
+        "Migration is additive/forward-only and tested for idempotent re-application (running migrations twice does not error or duplicate schema)",
+        "A retention/prune function exists (e.g. delete-events-older-than) with a unit test",
+        "packages/host/test/db.test.ts extended to cover the new table",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/host/src/db/migrations.ts is the existing migration runner; packages/host/src/db/index.ts wraps better-sqlite3 with WAL mode already per package.json dependency.",
+      "dependsOn": [],
+      "priority": 25,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-026",
+      "title": "Companion module event envelope emission",
+      "description": "As the host daemon, I want the (fake, then real) Foundry module to emit ordered event envelopes with sequence IDs for create/update/delete hooks and journal/scene/combat/chat activity, with broker acknowledgement supporting resume and duplicate suppression, so that the ledger stays complete across reconnects.",
+      "acceptanceCriteria": [
+        "Event envelope schema added to packages/protocol/src/ with {sequenceId, category, payload, emittedAt}",
+        "packages/host/src/fake-foundry/hooks.ts extended to emit these envelopes for document create/update/delete and at least one of journal/scene/combat/chat",
+        "Host acknowledges receipt with the last processed sequenceId; module resumes from that point on reconnect instead of resending from zero",
+        "Duplicate envelopes (same sequenceId redelivered) are suppressed at ingestion, not double-written to the ledger",
+        "Event category capture is configurable and private chat/content capture defaults off",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/host/src/fake-foundry/hooks.ts and ws-server.ts are the existing fake-side event plumbing to extend before wiring the real module (US-032).",
+      "dependsOn": ["US-025"],
+      "priority": 26,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-027",
+      "title": "Local intelligence: changed-since, full-text search, timeline",
+      "description": "As an AI client, I want deterministic local intelligence queries (changed-since, full-text search, relevant-object retrieval, timeline) with no external model dependency, so that I always have some useful background context even without a configured provider.",
+      "acceptanceCriteria": [
+        "foundry.intelligence.search performs full-text search over indexed ledger/document content (SQLite FTS or equivalent) and returns ranked results",
+        "foundry.intelligence.timeline returns paginated, chronologically ordered events for a session/world/date-range",
+        "A changed-since query (by sequenceId or timestamp) returns only events/documents modified after the cursor",
+        "All three are covered by tests seeded from the event ledger (US-025/US-026)",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Consider SQLite FTS5 (bundled with better-sqlite3 builds) for full-text search rather than an external search engine, to keep the 'local, no external model' guarantee.",
+      "dependsOn": ["US-026"],
+      "priority": 27,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-028",
+      "title": "Context pack export tool + foundry:// resources",
+      "description": "As an AI client, I want foundry.intelligence.context plus MCP resources (foundry://connections, foundry://world/{connectionId}, foundry://document/{uuid}, foundry://session/{uuid}, foundry://intelligence/latest), so that read-only campaign context is available as resources, not just tools.",
+      "acceptanceCriteria": [
+        "foundry.intelligence.context returns a bounded context pack (reuses US-015's bounding/redaction logic) suitable for direct prompt inclusion",
+        "Each listed foundry:// resource URI is registered on the McpServer and resolves to the correct read-only data via existing tool logic (no duplicated business logic between tool and resource handlers)",
+        "Resource list is enumerable via the MCP resources/list call in a child-process test",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "McpServer supports registerResource alongside registerTool (see @modelcontextprotocol/sdk server/mcp.js used in server.ts) — reuse the same handler functions where possible.",
+      "dependsOn": ["US-027"],
+      "priority": 28,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-029",
+      "title": "Optional provider-based summarization with provenance",
+      "description": "As a GM, I want foundry.intelligence.summarize to optionally use a configured provider or MCP sampling to summarize/classify event batches, always recording provenance (model/provider, source event IDs, timestamp, status), so that generated intelligence is auditable and provider failure never blocks ingestion.",
+      "acceptanceCriteria": [
+        "Provider/sampling failure is caught and recorded as a failed provenance record; ledger ingestion (US-025/026) continues unaffected",
+        "Every summarize call, success or failure, writes a provenance record with model/provider name, source event IDs, timestamp, and status",
+        "No summarize call can mutate Foundry documents directly — it only returns/stores a suggestion",
+        "Test simulates a provider throwing and asserts ingestion pipeline is unaffected and a failed provenance record exists",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Reuses the provider interface pattern established in US-020/US-021.",
+      "dependsOn": ["US-027"],
+      "priority": 29,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-030",
+      "title": "Permission policy engine + structured permission errors",
+      "description": "As a GM, I want a policy engine enforcing read-only-by-default with scoped create/update/asset/AI-network grants per connected user, so that mutating tools are refused unless explicitly authorized, with structured PERMISSION_DENIED errors.",
+      "acceptanceCriteria": [
+        "A policy module evaluates {connectionId, foundryUserRole, requestedCapability} against stored grants and returns allow/deny",
+        "All mutating tools added so far (documents.create/update, assets.upload/attach, sessions.start/append) call this policy check before performing any side effect",
+        "Denied requests return a structured PERMISSION_DENIED error including the missing capability name",
+        "Permission fixtures for Player, Trusted, Assistant, and GM roles (PRD §10) each get at least one test proving correct allow/deny",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "This is the PRD §3/§10 permission-fixture requirement — centralize the check so US-031's audit log has one interception point.",
+      "dependsOn": ["US-012"],
+      "priority": 30,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-031",
+      "title": "Audit log for mutations",
+      "description": "As a security-conscious GM, I want every mutating operation (and every permission denial) recorded in a local audit log, so that I can review what the AI actually did or attempted.",
+      "acceptanceCriteria": [
+        "New audit table (migration, following US-025's pattern) records {timestamp, connectionId, tool, outcome (success|denied|error), correlationId}",
+        "Every call through US-030's policy engine writes an audit entry regardless of outcome",
+        "Audit entries never contain secret material (API keys, pairing secrets) even if present in the request payload — redact known secret fields",
+        "Test asserts a denied call and a successful call both produce exactly one audit row each",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Single interception point from US-030 makes this additive rather than scattered across every tool handler.",
+      "dependsOn": ["US-030"],
+      "priority": 31,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-032",
+      "title": "Real Foundry companion module: document/asset operations",
+      "description": "As a GM, I want the real packages/foundry-module (beyond its current handshake-only implementation) to execute document create/update, asset upload, and event-hook emission against a real Foundry v14 client using public Foundry APIs, so that the bridge is backed by an actual Foundry module rather than only the fake runtime.",
+      "acceptanceCriteria": [
+        "packages/foundry-module/src/ gains document-operation handlers that call Foundry's public generic Document APIs (create/update, embedded documents) under the connected user's permissions",
+        "Asset upload handler uses Foundry's FilePicker upload API respecting the same path/MIME/size policy validated in US-019",
+        "Hook listeners (createDocument/updateDocument/deleteDocument etc.) emit the event envelope shape defined in US-026 over the module's WebSocket bridge",
+        "Module-side code contains no direct file-system or credential access beyond what Foundry's client APIs expose (PRD §3 no-exfiltration constraint)",
+        "Tests run against the module's logic with a mocked Foundry global (game/foundry namespace stubs) since no live Foundry install is available — clearly labeled as fake/mocked evidence",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/foundry-module/src/handshake.ts is the only real precedent so far; packages/host/src/fake-foundry/ws-server.ts shows the host-side counterpart the module must interoperate with.",
+      "dependsOn": ["US-011", "US-019", "US-030"],
+      "priority": 32,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-033",
+      "title": "PowerShell install/pair/uninstall scripts",
+      "description": "As a Windows GM, I want PowerShell scripts under scripts/windows/ to install the module zip into a chosen Foundry User Data directory, generate/rotate the pairing secret, print MCP client config JSON, start the host, run doctor, and uninstall only files this product owns, so that setup doesn't require manual file copying.",
+      "acceptanceCriteria": [
+        "scripts/windows/install.ps1, pair.ps1, uninstall.ps1 created (or equivalent naming), each idempotent and using literal quoted paths (no $HOME/$home reassignment)",
+        "uninstall.ps1 only deletes files/paths it can prove it created/owns (e.g. via a manifest written at install time) — refuses to recursively delete an unrecognized directory",
+        "Scripts support Foundry User Data paths containing spaces and Unicode (tested with a fixture path)",
+        "pair.ps1 prints the MCP client JSON snippet after generating/rotating the pairing secret, without ever echoing the secret in a way that lands in shell history logs beyond the intended one-time display",
+        "Type-check passes (for any TS backing these scripts) and a PowerShell script analyzer (or manual review checklist) passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "PRD §9 lists these exact requirements; packages/cli/src/doctor.ts pattern shows how CLI commands wrap host functionality that scripts can shell out to.",
+      "dependsOn": ["US-006"],
+      "priority": 33,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-034",
+      "title": "Extend doctor CLI for full PRD §8 checklist",
+      "description": "As a GM troubleshooting setup, I want `foundry-mcp doctor` to check config permissions, DB migrations, bridge/MCP ports, Foundry module installation, active connections, and provider configuration (without printing secrets), so that setup problems are diagnosable from one command.",
+      "acceptanceCriteria": [
+        "packages/cli/src/doctor.ts extended with checks for: DB migration status (US-025), Foundry module installed in the configured User Data directory, active bridge connections, and provider configuration presence (never the provider secret value itself)",
+        "Each check reports pass/fail/warn with a human-readable remediation hint",
+        "Provider configuration check confirms presence/absence only — a test asserts no secret value ever appears in doctor output",
+        "packages/cli/test/doctor.test.ts extended to cover each new check's pass and fail path",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/cli/src/doctor.ts and packages/cli/test/doctor.test.ts are the existing pattern to extend, not replace.",
+      "dependsOn": ["US-025", "US-032"],
+      "priority": 34,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-035",
+      "title": "Foundry module zip packaging (v14 module.json)",
+      "description": "As a GM, I want a build command that produces a loadable Foundry module directory and zip with a valid module.json targeting Foundry v14, so that I can install the companion module through Foundry's normal module installation flow.",
+      "acceptanceCriteria": [
+        "New CLI command (e.g. `foundry-mcp build-module`) builds packages/foundry-module into a self-contained directory with a valid module.json (compatibility.minimum/verified set for v14)",
+        "Command also produces a versioned zip artifact",
+        "`npm pack --dry-run`-equivalent content check run against the module package confirms no secrets, databases, logs, or dev-only fixtures are included",
+        "Test asserts module.json parses and contains required Foundry manifest fields (id, title, version, compatibility)",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "packages/foundry-module/package.json is the source package; esbuild/tsup bundling pattern should match other packages' build scripts.",
+      "dependsOn": ["US-032"],
+      "priority": 35,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-036",
+      "title": "E2E lifecycle test against fake runtime",
+      "description": "As a maintainer, I want one end-to-end test that pairs the fake Foundry runtime, enumerates types/documents/images, creates a root and embedded object, uploads or generates an image and attaches it, runs a full journal session, emits a world event, waits for indexing, retrieves a context pack, and verifies persisted state after a simulated restart, so that the whole PRD-required flow has one integrated proof point.",
+      "acceptanceCriteria": [
+        "Single test file (e.g. packages/mcp-adapter/test-e2e/lifecycle.test.ts) walks the entire sequence described above against the fake runtime end-to-end",
+        "Test explicitly restarts the host/daemon process (or its in-process equivalent) mid-test and asserts prior state (documents, session, events, index) survived",
+        "Test output/comments clearly label this as fake-runtime evidence, not live-Foundry evidence, per PRD §10's honesty requirement",
+        "pnpm test:e2e passes in CI",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Builds directly on US-028 (context pack) and US-032 (module operations) plus every prior document/asset/journal/intelligence story.",
+      "dependsOn": ["US-028", "US-029", "US-032"],
+      "priority": 36,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-037",
+      "title": "Security test suite (traversal, replay, oversized, wrong-world, non-GM)",
+      "description": "As a security reviewer, I want a dedicated adversarial test suite covering bad/expired token, origin/host failure, path traversal, oversized payload, schema abuse, wrong-world targeting, replay/idempotency, non-GM mutation, secret redaction, and external-provider-disabled defaults, so that PRD §10's security gate has explicit, repeatable evidence.",
+      "acceptanceCriteria": [
+        "One test file per category (or one well-organized suite) exercises each of the ten listed attack categories against the running fake-runtime stack",
+        "Each test asserts a structured rejection (correct error code) and that no side effect occurred (e.g. no document created, no file written)",
+        "External-provider-disabled-by-default test confirms US-021's real provider is inert with no config present",
+        "Secret-redaction test confirms no pairing secret or provider API key ever appears in a log line or MCP response across the whole suite",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "Draws on guards built in US-004/005/006 (ACL/HMAC), US-012 (conflict/versioning), US-019/022 (traversal/SSRF), US-021 (provider disabled), US-024 (idempotency), US-030 (permission).",
+      "dependsOn": ["US-036"],
+      "priority": 37,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-038",
+      "title": "Documentation set + validation matrix",
+      "description": "As a new user or contributor, I want architecture/threat-model docs, a tool/resource/prompt reference, a Windows quick start, module install/pair guide, image-provider and privacy notes, journal/intelligence behavior docs, a developer guide, and an explicit validation matrix distinguishing fake-runtime from real-Foundry evidence, so that the project satisfies PRD §11 and §12's documentation and honesty requirements.",
+      "acceptanceCriteria": [
+        "docs/architecture.md (or equivalent) includes a data-flow diagram and threat model covering DNS rebinding, CSRF/origin, named-pipe ACLs, token theft/replay, prompt injection, SSRF, traversal, decompression bombs, malicious SVG, private-content leakage, and malicious module-socket messages",
+        "docs/tools-reference.md documents every registered tool/resource/prompt with schema and example",
+        "docs/windows-quickstart.md walks clone-through-first-successful-foundry.connections.list",
+        "docs/validation-matrix.md explicitly lists, per capability, whether evidence is fake-runtime or real-Foundry (real-Foundry rows marked 'not available in this environment' with the manual smoke-test procedure instead, per PRD's no-fabrication rule)",
+        "All doc code samples/commands are copy-paste runnable and were actually run once during authoring",
+        "Type-check passes",
+        "Tests pass"
+      ],
+      "technicalNotes": "This is the final PRD §12 Definition-of-Done story — the final report should cite exact commands/outcomes, known limitations, and what still requires a user's live Foundry/provider credentials.",
+      "dependsOn": ["US-037"],
+      "priority": 38,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}
