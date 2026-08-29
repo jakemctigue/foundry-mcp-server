@@ -1,0 +1,23 @@
+{
+  "name": "@foundry-mcp/foundry-module",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --sourcemap --clean",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src test",
+    "test": "vitest run",
+    "test:e2e": "echo \"no e2e tests in foundry-module\" && exit 0"
+  },
+  "dependencies": {
+    "@foundry-mcp/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "tsup": "^8.5.1",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.11"
+  }
+}

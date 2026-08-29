@@ -1,0 +1,34 @@
+{
+  "name": "@foundry-mcp/host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --sourcemap --clean",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src test",
+    "test": "vitest run --coverage",
+    "test:e2e": "echo \"no e2e tests in host\" && exit 0"
+  },
+  "dependencies": {
+    "@foundry-mcp/protocol": "workspace:*",
+    "better-sqlite3": "^13.0.3",
+    "ws": "^8.21.3",
+    "zod": "^4.5.2"
+  },
+  "optionalDependencies": {
+    "@primno/dpapi": "^2.0.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/ws": "^8.18.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.11"
+  }
+}

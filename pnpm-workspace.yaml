@@ -1,0 +1,6 @@
+packages:
+  - "packages/protocol"
+  - "packages/host"
+  - "packages/mcp-adapter"
+  - "packages/foundry-module"
+  - "packages/cli"
