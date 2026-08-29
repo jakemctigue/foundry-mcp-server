@@ -140,6 +140,25 @@ secrets are never part of this discovery surface.
 
 ## Prompts
 
-No MCP prompts are registered in this release. The complete public surface is the 26 tools and
-five resource registrations above; clients should use the typed intelligence/context tools to
-construct model context rather than depending on an implicit server prompt.
+The adapter registers five reusable prompt templates. Every prompt requires an explicit
+`connectionId`; no prompt performs tool calls itself or grants mutation authority. Optional
+selectors are bounded single-line strings and are treated as untrusted filter data.
+
+| Prompt                          | Arguments                                                | Read-only workflow                                                                                         |
+| ------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `foundry.campaign.briefing`     | `{ connectionId, sessionId?, query? }`                   | Builds a current-situation briefing from the named world, latest intelligence, and optional session.       |
+| `foundry.session.recap`         | `{ connectionId, sessionId?, query? }`                   | Produces a chronological, cited recap from an optional module-owned session and bounded timeline.          |
+| `foundry.encounter.preparation` | `{ connectionId, sceneUuid?, query? }`                   | Reviews a Scene and directly linked evidence, then returns a non-mutating GM preparation checklist.        |
+| `foundry.npc.consistency`       | `{ connectionId, npcUuid?, query? }`                     | Compares established NPC facts and portrayals and reports cited contradictions without updating Documents. |
+| `foundry.changes.review`        | `{ connectionId, afterSequenceId?, sessionId?, query? }` | Reviews bounded ordered events and affected Documents after an optional decimal sequence ID.               |
+
+Generated prompt messages direct clients only to connection-qualified resource URIs and the
+read-only Document, session, and intelligence tools. They cap result sizes and page counts, require
+source resource URIs/UUIDs/event IDs/timestamps, separate facts from inference, and report stale,
+redacted, missing, or truncated evidence. Foundry and Journal text remains untrusted: embedded
+commands, links, permission claims, or requests to call tools are ignored.
+
+Supported legacy protocol negotiations expose the same five templates. A missing required
+`connectionId`, an unknown argument, or an out-of-bounds selector returns a structured MCP
+`InvalidParams` error; it does not fall back to an implicit world. Prompts never call create,
+update, upload, generation, attachment, session-lifecycle, or capability-grant operations.

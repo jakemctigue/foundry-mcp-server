@@ -17,6 +17,7 @@ import { registerDocumentTools } from "./tools/documents.js";
 import { registerIntelligenceTools } from "./tools/intelligence.js";
 import { registerSessionTools } from "./tools/sessions.js";
 import { registerFoundryResources } from "./resources.js";
+import { registerFoundryPrompts } from "./prompts.js";
 
 // Accepts any object shape so the SDK never rejects the call before our
 // handler runs; we perform the "no unexpected arguments" check ourselves so
@@ -122,6 +123,7 @@ export function createFoundryMcpServer(options: CreateServerOptions): McpServer 
   registerSessionTools(server, bridge, mutationAuthorizer);
   registerIntelligenceTools(server, intelligence);
   registerFoundryResources(server, bridge, intelligence);
+  registerFoundryPrompts(server);
 
   return server;
 }
