@@ -43,8 +43,18 @@ export interface ChangedSinceOptions {
   connectionId: string;
   afterSequenceId?: number;
   afterTimestamp?: string;
+  cursor?: string;
   limit?: number;
 }
+
+export interface ChangedSincePage {
+  events: StoredEvent[];
+  nextCursor?: string;
+}
+
+type ChangedSinceCursor =
+  | { mode: "sequence"; sequenceId: number; id: number }
+  | { mode: "timestamp"; receivedAt: string; id: number };
 
 interface TimelineCursor {
   receivedAt: string;
@@ -91,6 +101,46 @@ function decodeCursor(cursor: string): TimelineCursor {
     return { receivedAt: validTimestamp(decoded.receivedAt, "cursor timestamp"), id: decoded.id };
   } catch (error) {
     throw new Error("cursor must be a valid timeline cursor", { cause: error });
+  }
+}
+
+function encodeChangedSinceCursor(cursor: ChangedSinceCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeChangedSinceCursor(cursor: string): ChangedSinceCursor {
+  try {
+    const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Partial<
+      ChangedSinceCursor
+    >;
+    if (decoded.mode === "sequence") {
+      if (
+        !Number.isSafeInteger(decoded.sequenceId) ||
+        (decoded.sequenceId as number) < 0 ||
+        !Number.isSafeInteger(decoded.id) ||
+        (decoded.id as number) < 1
+      )
+        throw new Error("invalid sequence fields");
+      return {
+        mode: "sequence",
+        sequenceId: decoded.sequenceId as number,
+        id: decoded.id as number,
+      };
+    }
+    if (
+      decoded.mode !== "timestamp" ||
+      typeof decoded.receivedAt !== "string" ||
+      !Number.isSafeInteger(decoded.id) ||
+      (decoded.id as number) < 1
+    )
+      throw new Error("invalid timestamp fields");
+    return {
+      mode: "timestamp",
+      receivedAt: validTimestamp(decoded.receivedAt, "changed-since cursor timestamp"),
+      id: decoded.id as number,
+    };
+  } catch (error) {
+    throw new Error("cursor must be a valid changed-since cursor", { cause: error });
   }
 }
 
@@ -203,6 +253,13 @@ export function getChangedSince(
   db: Database.Database,
   options: ChangedSinceOptions,
 ): StoredEvent[] {
+  return getChangedSincePage(db, options).events;
+}
+
+export function getChangedSincePage(
+  db: Database.Database,
+  options: ChangedSinceOptions,
+): ChangedSincePage {
   const sequenceCursor = options.afterSequenceId;
   const timestampCursor = options.afterTimestamp;
   if ((sequenceCursor === undefined) === (timestampCursor === undefined)) {
@@ -210,32 +267,58 @@ export function getChangedSince(
   }
 
   const limit = boundedLimit(options.limit, 100);
-  let cursorClause: string;
-  let cursorValue: number | string;
+  const clauses = ["connection_id = ?"];
+  const parameters: unknown[] = [options.connectionId];
   let orderBy: string;
+  let mode: ChangedSinceCursor["mode"];
   if (sequenceCursor !== undefined) {
     if (!Number.isSafeInteger(sequenceCursor) || sequenceCursor < 0) {
       throw new Error("afterSequenceId must be a non-negative safe integer");
     }
-    cursorClause = "sequence_id > ?";
-    cursorValue = sequenceCursor;
+    mode = "sequence";
+    clauses.push("sequence_id > ?");
+    parameters.push(sequenceCursor);
     orderBy = "sequence_id ASC, id ASC";
   } else {
-    cursorClause = "received_at > ?";
-    cursorValue = validTimestamp(timestampCursor as string, "afterTimestamp");
+    mode = "timestamp";
+    clauses.push("received_at > ?");
+    parameters.push(validTimestamp(timestampCursor as string, "afterTimestamp"));
     orderBy = "received_at ASC, id ASC";
+  }
+
+  if (options.cursor !== undefined) {
+    const cursor = decodeChangedSinceCursor(options.cursor);
+    if (cursor.mode !== mode) throw new Error("changed-since cursor mode does not match input");
+    if (cursor.mode === "sequence") {
+      clauses.push("(sequence_id > ? OR (sequence_id = ? AND id > ?))");
+      parameters.push(cursor.sequenceId, cursor.sequenceId, cursor.id);
+    } else {
+      clauses.push("(received_at > ? OR (received_at = ? AND id > ?))");
+      parameters.push(cursor.receivedAt, cursor.receivedAt, cursor.id);
+    }
   }
 
   const rows = db
     .prepare(
       `SELECT ${EVENT_COLUMNS}
        FROM events
-       WHERE connection_id = ? AND ${cursorClause}
+       WHERE ${clauses.join(" AND ")}
        ORDER BY ${orderBy}
        LIMIT ?`,
     )
-    .all(options.connectionId, cursorValue, limit) as EventRow[];
-  return rows.map(deserializeEventRow);
+    .all(...parameters, limit + 1) as EventRow[];
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const page: ChangedSincePage = { events: pageRows.map(deserializeEventRow) };
+  const last = pageRows.at(-1);
+  if (hasMore && last) {
+    page.nextCursor = encodeChangedSinceCursor(
+      mode === "sequence"
+        ? { mode, sequenceId: last.sequence_id, id: last.id }
+        : { mode, receivedAt: last.received_at, id: last.id },
+    );
+  }
+  return page;
 }
 export function getEventsByIds(
   db: Database.Database,

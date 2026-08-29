@@ -5,6 +5,8 @@ import {
   getAcknowledgedSequence,
   getEventResumePoint,
   ingestEventEnvelope,
+  MAX_EVENT_SEQUENCE_GAP,
+  MAX_PENDING_EVENT_RECEIPTS,
   pruneEventsByRetentionDays,
   pruneEventsOlderThan,
   shouldCaptureEvent,
@@ -12,12 +14,14 @@ import {
 } from "../src/intelligence/event-ledger.js";
 import {
   getChangedSince,
+  getChangedSincePage,
   getEventsByIds,
   getTimeline,
   searchEvents,
 } from "../src/intelligence/queries.js";
 import { buildContextPack } from "../src/intelligence/context-pack.js";
 import { summarizeEvents } from "../src/intelligence/summarization.js";
+import { PermissionDeniedError, setCapabilityGrant } from "../src/security/policy.js";
 
 const CONNECTION_ID = "world-alpha";
 
@@ -119,6 +123,38 @@ describe("event ledger and local intelligence", () => {
     expect(row.payload).toContain("[REDACTED]");
     expect(shouldCaptureEvent(envelope(4, "document.create.Actor", {}))).toBe(true);
     expect(shouldCaptureEvent(envelope(4, "content.private", {}))).toBe(false);
+  });
+
+  it("rejects sparse future gaps and a saturated pending receipt window", () => {
+    expect(() =>
+      ingestEventEnvelope(
+        db,
+        CONNECTION_ID,
+        envelope(MAX_EVENT_SEQUENCE_GAP + 1, "scene.update", {}, {
+          emittedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ),
+    ).toThrow("maximum future gap");
+    expect(
+      (
+        db
+          .prepare("SELECT count(*) AS count FROM event_receipts WHERE connection_id = ?")
+          .get(CONNECTION_ID) as { count: number }
+      ).count,
+    ).toBe(0);
+
+    const insert = db.prepare(
+      `INSERT INTO event_receipts (connection_id, sequence_id, received_at, captured)
+       VALUES (?, ?, ?, 1)`,
+    );
+    db.transaction(() => {
+      for (let index = 0; index < MAX_PENDING_EVENT_RECEIPTS; index += 1) {
+        insert.run(CONNECTION_ID, 10_000 + index, "2026-01-01T00:00:00.000Z");
+      }
+    })();
+    expect(() =>
+      ingestEventEnvelope(db, CONNECTION_ID, envelope(1, "scene.update", {})),
+    ).toThrow("pending event receipt window is full");
   });
 
   it("prunes events using explicit cutoffs and configured retention days", () => {
@@ -237,6 +273,40 @@ describe("event ledger and local intelligence", () => {
       }),
     ).toThrow("exactly one");
     expect(getEventsByIds(db, CONNECTION_ID, [])).toEqual([]);
+
+    const sameTimeConnection = "same-received-at";
+    for (let sequenceId = 1; sequenceId <= 3; sequenceId += 1) {
+      ingestEventEnvelope(
+        db,
+        sameTimeConnection,
+        envelope(sequenceId, "journal.update", { sequenceId }),
+        {},
+        () => new Date("2026-03-02T00:00:00.000Z"),
+      );
+    }
+    const firstPage = getChangedSincePage(db, {
+      connectionId: sameTimeConnection,
+      afterTimestamp: "2026-03-01T00:00:00.000Z",
+      limit: 1,
+    });
+    const secondPage = getChangedSincePage(db, {
+      connectionId: sameTimeConnection,
+      afterTimestamp: "2026-03-01T00:00:00.000Z",
+      cursor: firstPage.nextCursor as string,
+      limit: 1,
+    });
+    const thirdPage = getChangedSincePage(db, {
+      connectionId: sameTimeConnection,
+      afterTimestamp: "2026-03-01T00:00:00.000Z",
+      cursor: secondPage.nextCursor as string,
+      limit: 1,
+    });
+    expect(
+      [...firstPage.events, ...secondPage.events, ...thirdPage.events].map(
+        (event) => event.sequenceId,
+      ),
+    ).toEqual([1, 2, 3]);
+    expect(thirdPage.nextCursor).toBeUndefined();
   });
 
   it("builds a redacted context pack bounded by event count and serialized bytes", () => {
@@ -281,6 +351,27 @@ describe("event ledger and local intelligence", () => {
       db.prepare("SELECT id FROM events WHERE sequence_id = 1").get() as { id: number }
     ).id;
 
+    const deniedProvider = vi.fn(async () => ({ summary: "must not run" }));
+    await expect(
+      summarizeEvents(db, {
+        connectionId: CONNECTION_ID,
+        eventIds: [eventId],
+        provider: { name: "denied-test", model: "remote", summarize: deniedProvider },
+        foundryUserRole: "GAMEMASTER",
+        correlationId: "summary-denied",
+      }),
+    ).rejects.toBeInstanceOf(PermissionDeniedError);
+    expect(deniedProvider).not.toHaveBeenCalled();
+    setCapabilityGrant(
+      db,
+      {
+        connectionId: CONNECTION_ID,
+        foundryUserRole: "GAMEMASTER",
+        requestedCapability: "ai:network",
+      },
+      true,
+    );
+
     const success = await summarizeEvents(db, {
       connectionId: CONNECTION_ID,
       eventIds: [eventId],
@@ -289,6 +380,8 @@ describe("event ledger and local intelligence", () => {
         model: "small",
         summarize: async ({ events }) => ({ summary: events[0]?.category, apiKey: "unsafe" }),
       },
+      foundryUserRole: "GAMEMASTER",
+      correlationId: "summary-success",
       now: () => new Date("2026-05-01T00:00:00.000Z"),
     });
     expect(success).toMatchObject({
@@ -304,6 +397,8 @@ describe("event ledger and local intelligence", () => {
       connectionId: CONNECTION_ID,
       eventIds: [eventId],
       provider: { name: "remote-test", model: "large", summarize: throwingProvider },
+      foundryUserRole: "GAMEMASTER",
+      correlationId: "summary-failed-result",
       now: () => new Date("2026-05-01T01:00:00.000Z"),
     });
     expect(failure.status).toBe("failed");
@@ -324,6 +419,17 @@ describe("event ledger and local intelligence", () => {
     });
     expect(provenance[1]).toMatchObject({ provider: "remote-test", status: "failed" });
     expect(JSON.stringify(provenance)).not.toContain("supersecret");
+    expect(
+      db
+        .prepare(
+          "SELECT outcome, correlation_id FROM audit_log WHERE tool = ? ORDER BY id ASC",
+        )
+        .all("foundry.intelligence.summarize"),
+    ).toEqual([
+      { outcome: "denied", correlation_id: "summary-denied" },
+      { outcome: "success", correlation_id: "summary-success" },
+      { outcome: "success", correlation_id: "summary-failed-result" },
+    ]);
 
     expect(
       ingestEventEnvelope(db, CONNECTION_ID, envelope(2, "scene.update", { title: "Still live" })),

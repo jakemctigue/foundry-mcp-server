@@ -1,5 +1,9 @@
 import type Database from "better-sqlite3";
 import { redactSecrets, redactSecretText } from "../security/redaction.js";
+import {
+  runAuthorizedOperation,
+  type FoundryUserRole,
+} from "../security/policy.js";
 import type { StoredEvent } from "./event-ledger.js";
 import { getEventsByIds } from "./queries.js";
 
@@ -16,6 +20,8 @@ export interface SummarizeEventsOptions {
   connectionId: string;
   eventIds: readonly number[];
   provider: IntelligenceSummaryProvider;
+  foundryUserRole: FoundryUserRole;
+  correlationId: string;
   now?: () => Date;
 }
 
@@ -75,34 +81,53 @@ export async function summarizeEvents(
   db: Database.Database,
   options: SummarizeEventsOptions,
 ): Promise<SummarizeEventsResult> {
-  const timestamp = (options.now?.() ?? new Date()).toISOString();
+  const now = options.now?.() ?? new Date();
   const sourceEventIds = [...new Set(options.eventIds)];
-  try {
-    const events = getEventsByIds(db, options.connectionId, sourceEventIds);
-    const suggestion = redactSecrets(
-      await options.provider.summarize({ connectionId: options.connectionId, events }),
-    );
-    const provenanceId = insertProvenance(db, {
-      timestamp,
+  return runAuthorizedOperation(
+    db,
+    {
       connectionId: options.connectionId,
-      provider: options.provider.name,
-      model: options.provider.model,
-      sourceEventIds,
-      status: "success",
-      suggestion,
-    });
-    return { status: "success", provenanceId, suggestion, sourceEventIds };
-  } catch (error) {
-    const message = redactSecretText(error instanceof Error ? error.message : String(error));
-    const provenanceId = insertProvenance(db, {
-      timestamp,
-      connectionId: options.connectionId,
-      provider: options.provider.name,
-      model: options.provider.model,
-      sourceEventIds,
-      status: "failed",
-      errorMessage: message,
-    });
-    return { status: "failed", provenanceId, error: message, sourceEventIds };
-  }
+      foundryUserRole: options.foundryUserRole,
+      requestedCapability: "ai:network",
+      tool: "foundry.intelligence.summarize",
+      correlationId: options.correlationId,
+      auditDetails: {
+        provider: options.provider.name,
+        model: options.provider.model,
+        sourceEventIds,
+      },
+      now: () => now,
+    },
+    async () => {
+      const timestamp = now.toISOString();
+      try {
+        const events = getEventsByIds(db, options.connectionId, sourceEventIds);
+        const suggestion = redactSecrets(
+          await options.provider.summarize({ connectionId: options.connectionId, events }),
+        );
+        const provenanceId = insertProvenance(db, {
+          timestamp,
+          connectionId: options.connectionId,
+          provider: options.provider.name,
+          model: options.provider.model,
+          sourceEventIds,
+          status: "success",
+          suggestion,
+        });
+        return { status: "success", provenanceId, suggestion, sourceEventIds };
+      } catch (error) {
+        const message = redactSecretText(error instanceof Error ? error.message : String(error));
+        const provenanceId = insertProvenance(db, {
+          timestamp,
+          connectionId: options.connectionId,
+          provider: options.provider.name,
+          model: options.provider.model,
+          sourceEventIds,
+          status: "failed",
+          errorMessage: message,
+        });
+        return { status: "failed", provenanceId, error: message, sourceEventIds };
+      }
+    },
+  );
 }

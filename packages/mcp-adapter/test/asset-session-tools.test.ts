@@ -3,11 +3,16 @@ import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 
 import { createFoundryMcpServer } from "../src/server.js";
 import type { BridgeConnection } from "../src/bridge-connection.js";
+import type { MutationAuthorizer } from "../src/mutation-authorization.js";
+
+const allowMutations: MutationAuthorizer = {
+  run: async (_request, operation) => operation(),
+};
 
 async function setup(
   bridge: BridgeConnection,
 ): Promise<{ client: Client; close(): Promise<void> }> {
-  const server = createFoundryMcpServer({ bridge });
+  const server = createFoundryMcpServer({ bridge, mutationAuthorizer: allowMutations });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "asset-test-client", version: "0.0.1" });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -74,7 +79,11 @@ describe("asset and session MCP tool registration", () => {
     try {
       const generated = await context.client.callTool({
         name: "foundry.assets.images.generate",
-        arguments: { prompt: "A rune", destinationPath: "generated/token.png" },
+        arguments: {
+          connectionId: "world-a",
+          prompt: "A rune",
+          destinationPath: "generated/token.png",
+        },
       });
       expect(generated.isError).not.toBe(true);
       expect(generated.structuredContent).toMatchObject({ provider: "deterministic" });
@@ -82,6 +91,7 @@ describe("asset and session MCP tool registration", () => {
         method: "assets.images.generate",
         params: {
           provider: "deterministic",
+          connectionId: "world-a",
           sourceId: "data",
           onCollision: "error",
           options: {},

@@ -135,6 +135,18 @@ export interface AuthorizedOperationOptions extends PolicyRequest {
   correlationId: string;
   auditDetails?: unknown;
   now?: () => Date;
+  onAuditFailure?: (error: Error, committed: boolean) => void;
+}
+
+function reportAuditFailure(
+  options: AuthorizedOperationOptions,
+  error: unknown,
+  committed: boolean,
+): void {
+  options.onAuditFailure?.(
+    error instanceof Error ? error : new Error(String(error)),
+    committed,
+  );
 }
 
 function recordAudit(
@@ -180,36 +192,66 @@ export async function runAuthorizedOperation<T>(
   try {
     decision = evaluatePolicy(db, request);
   } catch (error) {
-    recordAudit(db, {
-      timestamp,
-      connectionId: options.connectionId,
-      tool: options.tool,
-      capability: options.requestedCapability,
-      outcome: "error",
-      correlationId: options.correlationId,
-      details: {
-        request: options.auditDetails,
-        error: redactSecretText(error instanceof Error ? error.message : String(error)),
-      },
-    });
+    try {
+      recordAudit(db, {
+        timestamp,
+        connectionId: options.connectionId,
+        tool: options.tool,
+        capability: options.requestedCapability,
+        outcome: "error",
+        correlationId: options.correlationId,
+        details: {
+          request: options.auditDetails,
+          error: redactSecretText(error instanceof Error ? error.message : String(error)),
+        },
+      });
+    } catch (auditError) {
+      reportAuditFailure(options, auditError, false);
+    }
     throw error;
   }
 
   if (!decision.allowed) {
-    recordAudit(db, {
-      timestamp,
-      connectionId: options.connectionId,
-      tool: options.tool,
-      capability: options.requestedCapability,
-      outcome: "denied",
-      correlationId: options.correlationId,
-      details: { request: options.auditDetails, reason: decision.reason },
-    });
+    try {
+      recordAudit(db, {
+        timestamp,
+        connectionId: options.connectionId,
+        tool: options.tool,
+        capability: options.requestedCapability,
+        outcome: "denied",
+        correlationId: options.correlationId,
+        details: { request: options.auditDetails, reason: decision.reason },
+      });
+    } catch (auditError) {
+      reportAuditFailure(options, auditError, false);
+    }
     throw new PermissionDeniedError(decision);
   }
 
+  let result: T;
   try {
-    const result = await operation();
+    result = await operation();
+  } catch (error) {
+    try {
+      recordAudit(db, {
+        timestamp,
+        connectionId: options.connectionId,
+        tool: options.tool,
+        capability: options.requestedCapability,
+        outcome: "error",
+        correlationId: options.correlationId,
+        details: {
+          request: options.auditDetails,
+          error: redactSecretText(error instanceof Error ? error.message : String(error)),
+        },
+      });
+    } catch (auditError) {
+      reportAuditFailure(options, auditError, false);
+    }
+    throw error;
+  }
+
+  try {
     recordAudit(db, {
       timestamp,
       connectionId: options.connectionId,
@@ -219,20 +261,11 @@ export async function runAuthorizedOperation<T>(
       correlationId: options.correlationId,
       details: { request: options.auditDetails },
     });
-    return result;
-  } catch (error) {
-    recordAudit(db, {
-      timestamp,
-      connectionId: options.connectionId,
-      tool: options.tool,
-      capability: options.requestedCapability,
-      outcome: "error",
-      correlationId: options.correlationId,
-      details: {
-        request: options.auditDetails,
-        error: redactSecretText(error instanceof Error ? error.message : String(error)),
-      },
-    });
-    throw error;
+  } catch (auditError) {
+    // The external side effect has committed. Reporting this as operation
+    // failure would invite unsafe retries; surface audit degradation out of
+    // band and return the committed result exactly once.
+    reportAuditFailure(options, auditError, true);
   }
+  return result;
 }

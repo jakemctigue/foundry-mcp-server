@@ -12,9 +12,19 @@ import {
 } from "@foundry-mcp/protocol";
 
 import type { BridgeConnection } from "../bridge-connection.js";
-import { forwardBridgeTool, type ToolServer } from "./bridge-tool.js";
+import type { MutationAuthorizer } from "../mutation-authorization.js";
+import { mutationContext } from "../mutation-authorization.js";
+import {
+  forwardAuthorizedBridgeTool,
+  forwardBridgeTool,
+  type ToolServer,
+} from "./bridge-tool.js";
 
-export function registerSessionTools(server: ToolServer, bridge: BridgeConnection): void {
+export function registerSessionTools(
+  server: ToolServer,
+  bridge: BridgeConnection,
+  authorizer?: MutationAuthorizer,
+): void {
   server.registerTool(
     "foundry.sessions.start",
     {
@@ -23,7 +33,15 @@ export function registerSessionTools(server: ToolServer, bridge: BridgeConnectio
         "Creates or reuses the configured Journal folder, then creates one JournalEntry and initial JournalEntryPage idempotently.",
       inputSchema: SessionsStartInput,
     },
-    (args) => forwardBridgeTool(bridge, "sessions.start", args, SessionsStartOutput),
+    (args) =>
+      forwardAuthorizedBridgeTool(
+        authorizer,
+        mutationContext("foundry.sessions.start", args, "sessions:start"),
+        bridge,
+        "sessions.start",
+        args,
+        SessionsStartOutput,
+      ),
   );
   server.registerTool(
     "foundry.sessions.append",
@@ -33,7 +51,15 @@ export function registerSessionTools(server: ToolServer, bridge: BridgeConnectio
         "Appends a sanitized, timestamped JournalEntryPage without replacing existing journal content. Idempotency keys prevent duplicate pages.",
       inputSchema: SessionsAppendInput,
     },
-    (args) => forwardBridgeTool(bridge, "sessions.append", args, SessionsAppendOutput),
+    (args) =>
+      forwardAuthorizedBridgeTool(
+        authorizer,
+        mutationContext("foundry.sessions.append", args, "sessions:append"),
+        bridge,
+        "sessions.append",
+        args,
+        SessionsAppendOutput,
+      ),
   );
   server.registerTool(
     "foundry.sessions.list",
@@ -63,7 +89,15 @@ export function registerSessionTools(server: ToolServer, bridge: BridgeConnectio
           "Updates module-owned status metadata idempotently while retaining all prior JournalEntryPage content.",
         inputSchema: SessionsStatusInput,
       },
-      (args) => forwardBridgeTool(bridge, `sessions.${operation}`, args, SessionsStatusOutput),
+      (args) =>
+        forwardAuthorizedBridgeTool(
+          authorizer,
+          mutationContext(`foundry.sessions.${operation}`, args, "sessions:append"),
+          bridge,
+          `sessions.${operation}`,
+          args,
+          SessionsStatusOutput,
+        ),
     );
   }
 }

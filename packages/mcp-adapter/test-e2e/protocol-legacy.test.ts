@@ -72,12 +72,29 @@ describe.each([...LEGACY_MCP_PROTOCOL_VERSIONS])("legacy MCP initialize %s", (pr
       expect(names).toEqual(
         expect.arrayContaining(["foundry.connections.list", "foundry.capabilities.get"]),
       );
+
+      const resourcesListed = waitForResponse(transport, 3);
+      await transport.send({
+        jsonrpc: "2.0",
+        id: 3,
+        method: "resources/list",
+        params: {},
+      });
+      const resourceResponse = await resourcesListed;
+      if (!("result" in resourceResponse))
+        throw new Error("resources/list did not return a result");
+      const resourceUris = (
+        resourceResponse.result as { resources: Array<{ uri: string }> }
+      ).resources.map(({ uri }) => uri);
+      expect(resourceUris).toEqual(
+        expect.arrayContaining(["foundry://connections", "foundry://intelligence/latest"]),
+      );
     } finally {
       await transport.close();
     }
 
     expect(await transport.waitForExit()).toEqual({ code: 0, signal: null });
-    expect(transport.stdoutLines.length).toBeGreaterThanOrEqual(2);
+    expect(transport.stdoutLines.length).toBeGreaterThanOrEqual(3);
     expect(transport.protocolErrors).toEqual([]);
     expect(transport.stderrText).toBe("");
     for (const line of transport.stdoutLines) {

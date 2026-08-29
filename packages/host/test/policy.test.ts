@@ -180,6 +180,40 @@ describe("permission policy and mutation audit", () => {
     expect(rows[0]?.details_json).not.toContain("provider-secret");
   });
 
+  it("returns a committed side effect when the subsequent success audit degrades", async () => {
+    const mutation = request({ requestedCapability: "assets:upload" });
+    setCapabilityGrant(db, mutation, true);
+    db.exec(`
+      CREATE TRIGGER fail_success_audit
+      BEFORE INSERT ON audit_log
+      WHEN NEW.outcome = 'success'
+      BEGIN
+        SELECT RAISE(FAIL, 'simulated audit storage failure');
+      END;
+    `);
+    const operation = vi.fn(() => ({ committed: true }));
+    const onAuditFailure = vi.fn();
+    await expect(
+      runAuthorizedOperation(
+        db,
+        {
+          ...mutation,
+          tool: "foundry.assets.images.upload",
+          correlationId: "committed-audit-degraded",
+          onAuditFailure,
+        },
+        operation,
+      ),
+    ).resolves.toEqual({ committed: true });
+    expect(operation).toHaveBeenCalledOnce();
+    expect(onAuditFailure).toHaveBeenCalledWith(expect.any(Error), true);
+    expect(
+      db
+        .prepare("SELECT count(*) AS count FROM audit_log WHERE correlation_id = ?")
+        .get("committed-audit-degraded"),
+    ).toEqual({ count: 0 });
+  });
+
   it("fails closed for runtime-unknown roles and capabilities", () => {
     expect(
       evaluatePolicy(db, request({ foundryUserRole: "OWNER" as PolicyRequest["foundryUserRole"] })),

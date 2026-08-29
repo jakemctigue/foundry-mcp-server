@@ -1,16 +1,9 @@
 import type Database from "better-sqlite3";
+import { EventEnvelopeSchema, type EventEnvelope } from "@foundry-mcp/protocol";
 import { DEFAULT_EVENT_CATEGORIES } from "../config.js";
 import { redactSecrets } from "../security/redaction.js";
 
-export interface EventEnvelope {
-  sequenceId: number;
-  category: string;
-  payload: unknown;
-  emittedAt: string;
-  sessionId?: string;
-  worldId?: string;
-  privateContent?: boolean;
-}
+export type { EventEnvelope } from "@foundry-mcp/protocol";
 
 export interface EventCaptureOptions {
   categories?: readonly string[];
@@ -36,6 +29,9 @@ export interface EventIngestResult {
   duplicate: boolean;
   filtered: boolean;
 }
+
+export const MAX_EVENT_SEQUENCE_GAP = 4_096;
+export const MAX_PENDING_EVENT_RECEIPTS = 4_096;
 
 interface EventRow {
   id: number;
@@ -146,20 +142,18 @@ export function ingestEventEnvelope(
   options: EventCaptureOptions = {},
   now: () => Date = () => new Date(),
 ): EventIngestResult {
+  const validatedEnvelope = EventEnvelopeSchema.parse(envelope);
   const normalizedConnectionId = requireIdentifier(connectionId, "connectionId");
-  const category = requireIdentifier(envelope.category, "category");
-  if (!Number.isSafeInteger(envelope.sequenceId) || envelope.sequenceId < 1) {
-    throw new Error("sequenceId must be a positive safe integer");
-  }
-  const emittedAt = normalizeTimestamp(envelope.emittedAt, "emittedAt");
+  const category = requireIdentifier(validatedEnvelope.category, "category");
+  const emittedAt = normalizeTimestamp(validatedEnvelope.emittedAt, "emittedAt");
   const receivedAt = now().toISOString();
-  const redactedPayload = redactSecrets(envelope.payload);
+  const redactedPayload = redactSecrets(validatedEnvelope.payload);
   const payload = JSON.stringify(redactedPayload);
-  const captured = shouldCaptureEvent({ ...envelope, category }, options);
+  const captured = shouldCaptureEvent({ ...validatedEnvelope, category }, options);
 
   const transaction = db.transaction((): EventIngestResult => {
     const acknowledgedSequenceId = getAcknowledgedSequence(db, normalizedConnectionId);
-    if (envelope.sequenceId <= acknowledgedSequenceId) {
+    if (validatedEnvelope.sequenceId <= acknowledgedSequenceId) {
       return {
         acknowledgedSequenceId,
         nextSequenceId: acknowledgedSequenceId + 1,
@@ -169,14 +163,20 @@ export function ingestEventEnvelope(
       };
     }
 
-    const receipt = db
+    if (validatedEnvelope.sequenceId > acknowledgedSequenceId + MAX_EVENT_SEQUENCE_GAP) {
+      throw new Error(
+        `sequenceId exceeds the maximum future gap of ${MAX_EVENT_SEQUENCE_GAP.toString()}`,
+      );
+    }
+
+    const existingReceipt = db
       .prepare(
-        `INSERT OR IGNORE INTO event_receipts
-          (connection_id, sequence_id, received_at, captured)
-         VALUES (?, ?, ?, ?)`,
+        "SELECT 1 AS present FROM event_receipts WHERE connection_id = ? AND sequence_id = ?",
       )
-      .run(normalizedConnectionId, envelope.sequenceId, receivedAt, captured ? 1 : 0);
-    if (receipt.changes === 0) {
+      .get(normalizedConnectionId, validatedEnvelope.sequenceId) as
+      | { present: number }
+      | undefined;
+    if (existingReceipt) {
       return {
         acknowledgedSequenceId,
         nextSequenceId: acknowledgedSequenceId + 1,
@@ -185,6 +185,23 @@ export function ingestEventEnvelope(
         filtered: false,
       };
     }
+    const pendingReceiptCount = (
+      db
+        .prepare("SELECT count(*) AS count FROM event_receipts WHERE connection_id = ?")
+        .get(normalizedConnectionId) as { count: number }
+    ).count;
+    if (pendingReceiptCount >= MAX_PENDING_EVENT_RECEIPTS) {
+      throw new Error(
+        `pending event receipt window is full (${MAX_PENDING_EVENT_RECEIPTS.toString()})`,
+      );
+    }
+
+    db.prepare(
+        `INSERT INTO event_receipts
+          (connection_id, sequence_id, received_at, captured)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(normalizedConnectionId, validatedEnvelope.sequenceId, receivedAt, captured ? 1 : 0);
 
     let stored = false;
     if (captured) {
@@ -196,35 +213,39 @@ export function ingestEventEnvelope(
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
-          envelope.sequenceId,
+          validatedEnvelope.sequenceId,
           category,
           payload,
           receivedAt,
           normalizedConnectionId,
-          envelope.sequenceId,
+          validatedEnvelope.sequenceId,
           category,
           emittedAt,
           receivedAt,
-          envelope.sessionId ?? null,
-          envelope.worldId ?? null,
+          validatedEnvelope.sessionId ?? null,
+          validatedEnvelope.worldId ?? null,
           searchableText(category, redactedPayload),
         );
       stored = inserted.changes === 1;
     }
 
-    const pending = db
-      .prepare(
-        `SELECT sequence_id FROM event_receipts
-         WHERE connection_id = ? AND sequence_id > ?
-         ORDER BY sequence_id ASC`,
-      )
-      .all(normalizedConnectionId, acknowledgedSequenceId) as Array<{ sequence_id: number }>;
     let advancedSequenceId = acknowledgedSequenceId;
-    for (const row of pending) {
-      if (row.sequence_id !== advancedSequenceId + 1) {
-        break;
+    if (validatedEnvelope.sequenceId === acknowledgedSequenceId + 1) {
+      const pending = db
+        .prepare(
+          `SELECT sequence_id FROM event_receipts
+           WHERE connection_id = ? AND sequence_id > ? AND sequence_id <= ?
+           ORDER BY sequence_id ASC`,
+        )
+        .all(
+          normalizedConnectionId,
+          acknowledgedSequenceId,
+          acknowledgedSequenceId + MAX_PENDING_EVENT_RECEIPTS,
+        ) as Array<{ sequence_id: number }>;
+      for (const row of pending) {
+        if (row.sequence_id !== advancedSequenceId + 1) break;
+        advancedSequenceId = row.sequence_id;
       }
-      advancedSequenceId = row.sequence_id;
     }
 
     db.prepare(

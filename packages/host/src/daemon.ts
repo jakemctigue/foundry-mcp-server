@@ -9,6 +9,13 @@ import { startPipeServer, type PipeServerHandle } from "./bridge/pipe-server.js"
 import { resolvePipePath, defaultUserIdentifier } from "./bridge/pipe-path.js";
 import { loadOrCreateBridgeAuthKey } from "./bridge/bridge-auth.js";
 import type Database from "better-sqlite3";
+import {
+  startHostCompanionServer,
+  type HostCompanionServer,
+} from "./bridge/companion-server.js";
+import { HostBridgeRouter } from "./bridge/router.js";
+import { createImageProviderRegistry } from "./providers/images.js";
+import { createSecretStorage } from "./secrets/storage.js";
 
 export interface Daemon {
   config: HostConfig;
@@ -17,25 +24,14 @@ export interface Daemon {
   pipe: PipeServerHandle;
   pipePath: string;
   protocolVersion: typeof BRIDGE_PROTOCOL_VERSION;
+  companion: HostCompanionServer;
+  companionEndpoint: string;
   shutdown: () => Promise<void>;
 }
 
 export interface StartDaemonOptions {
   cliConfig?: Partial<HostConfig>;
   appDataDir?: string;
-}
-
-function handleBridgeMessage(message: unknown, respond: (response: unknown) => void): void {
-  const request = message as { id?: string; method?: string };
-  if (request.method === "initialize") {
-    respond({ id: request.id, result: { protocolVersion: BRIDGE_PROTOCOL_VERSION } });
-    return;
-  }
-  if (request.method === "connections.list") {
-    respond({ id: request.id, result: { connections: [] } });
-    return;
-  }
-  respond({ id: request.id, result: null });
 }
 
 export async function startDaemon(options: StartDaemonOptions = {}): Promise<Daemon> {
@@ -58,12 +54,48 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
       : `${userIdentifier}:${config.pipeName}`;
   const pipePath = resolvePipePath(pipeIdentifier, appDataDir);
   const bridgeAuthKey = await loadOrCreateBridgeAuthKey(appDataDir, logger);
+  const companion = await startHostCompanionServer({
+    port: config.port,
+    allowedOrigins: config.allowedOrigins,
+    db,
+    capture: {
+      categories: config.eventCategories,
+      capturePrivateContent: config.capturePrivateContent,
+    },
+  });
+  const companionEndpoint = companion.address().endpoint;
+  let companionClosed = false;
+  const secretStorage = createSecretStorage({
+    dir: path.join(appDataDir, "secrets"),
+    logger,
+    allowDevelopmentFallback:
+      process.env["NODE_ENV"] === "development" || process.env["NODE_ENV"] === "test",
+  });
+  const imageProviders = await createImageProviderRegistry({
+    secretStorage,
+    openAi: { logger },
+  });
+  const router = new HostBridgeRouter(
+    db,
+    companion,
+    imageProviders,
+    undefined,
+    (error, committed) =>
+      logger.error("mutation audit write failed", {
+        committed,
+        errorType: error.name,
+      }),
+  );
   const pipe = await startPipeServer({
     pipePath,
     logger,
     authKey: bridgeAuthKey,
-    onMessage: handleBridgeMessage,
+    onMessage: (message, respond) => router.handle(message, respond),
   });
+  if (!pipe.ready) {
+    await companion.close();
+    companionClosed = true;
+  }
 
   return {
     config,
@@ -72,8 +104,14 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
     pipe,
     pipePath,
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
+    companion,
+    companionEndpoint,
     shutdown: async () => {
       await pipe.close();
+      if (!companionClosed) {
+        await companion.close();
+        companionClosed = true;
+      }
       db.close();
     },
   };

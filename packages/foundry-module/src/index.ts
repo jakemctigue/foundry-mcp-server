@@ -4,3 +4,6 @@ export * from "./documents.js";
 export * from "./sessions.js";
 export * from "./asset-runtime.js";
 export * from "./assets.js";
+export * from "./companion-handlers.js";
+export * from "./companion-client.js";
+export * from "./event-hooks.js";

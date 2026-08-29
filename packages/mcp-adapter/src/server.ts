@@ -10,8 +10,13 @@ import {
   type CapabilitiesGetOutput as CapabilitiesGetOutputData,
 } from "@foundry-mcp/protocol";
 import type { BridgeConnection } from "./bridge-connection.js";
+import type { MutationAuthorizer } from "./mutation-authorization.js";
+import { IntelligenceBridgeApi } from "./intelligence-api.js";
 import { registerAssetTools } from "./tools/assets.js";
+import { registerDocumentTools } from "./tools/documents.js";
+import { registerIntelligenceTools } from "./tools/intelligence.js";
 import { registerSessionTools } from "./tools/sessions.js";
+import { registerFoundryResources } from "./resources.js";
 
 // Accepts any object shape so the SDK never rejects the call before our
 // handler runs; we perform the "no unexpected arguments" check ourselves so
@@ -21,6 +26,7 @@ const PermissiveNoArgs = z.looseObject({});
 
 export interface CreateServerOptions {
   bridge: BridgeConnection;
+  mutationAuthorizer?: MutationAuthorizer;
 }
 
 function errorContent(
@@ -38,7 +44,7 @@ function errorContent(
 }
 
 export function createFoundryMcpServer(options: CreateServerOptions): McpServer {
-  const { bridge } = options;
+  const { bridge, mutationAuthorizer } = options;
 
   const server = new McpServer({
     name: "foundry-mcp",
@@ -94,6 +100,7 @@ export function createFoundryMcpServer(options: CreateServerOptions): McpServer 
           { name: "connections", version: "0.1.0", readOnly: true },
           { name: "assets", version: "0.1.0", readOnly: false },
           { name: "sessions", version: "0.1.0", readOnly: false },
+          { name: "intelligence", version: "0.1.0", readOnly: true },
         ],
       };
       const parsed = CapabilitiesGetOutput.parse(data);
@@ -109,8 +116,12 @@ export function createFoundryMcpServer(options: CreateServerOptions): McpServer 
     },
   );
 
-  registerAssetTools(server, bridge);
-  registerSessionTools(server, bridge);
+  const intelligence = new IntelligenceBridgeApi(bridge);
+  registerDocumentTools(server, bridge, mutationAuthorizer);
+  registerAssetTools(server, bridge, mutationAuthorizer);
+  registerSessionTools(server, bridge, mutationAuthorizer);
+  registerIntelligenceTools(server, intelligence);
+  registerFoundryResources(server, bridge, intelligence);
 
   return server;
 }

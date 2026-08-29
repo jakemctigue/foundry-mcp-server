@@ -12,9 +12,19 @@ import {
 } from "@foundry-mcp/protocol";
 
 import type { BridgeConnection } from "../bridge-connection.js";
-import { forwardBridgeTool, type ToolServer } from "./bridge-tool.js";
+import type { MutationAuthorizer } from "../mutation-authorization.js";
+import { mutationContext } from "../mutation-authorization.js";
+import {
+  forwardAuthorizedBridgeTool,
+  forwardBridgeTool,
+  type ToolServer,
+} from "./bridge-tool.js";
 
-export function registerAssetTools(server: ToolServer, bridge: BridgeConnection): void {
+export function registerAssetTools(
+  server: ToolServer,
+  bridge: BridgeConnection,
+  authorizer?: MutationAuthorizer,
+): void {
   server.registerTool(
     "foundry.assets.images.list",
     {
@@ -43,7 +53,15 @@ export function registerAssetTools(server: ToolServer, bridge: BridgeConnection)
         "Validates and uploads an image through an authorized writable Foundry FilePicker source with an explicit collision policy.",
       inputSchema: AssetsImagesUploadInput,
     },
-    (args) => forwardBridgeTool(bridge, "assets.images.upload", args, AssetsImagesUploadOutput),
+    (args) =>
+      forwardAuthorizedBridgeTool(
+        authorizer,
+        mutationContext("foundry.assets.images.upload", args, "assets:upload"),
+        bridge,
+        "assets.images.upload",
+        args,
+        AssetsImagesUploadOutput,
+      ),
   );
   server.registerTool(
     "foundry.assets.images.generate",
@@ -53,7 +71,15 @@ export function registerAssetTools(server: ToolServer, bridge: BridgeConnection)
         "Generates a bounded image with the explicitly reported provider and stores it through Foundry FilePicker. The deterministic provider is the local default; external providers never receive silent fallback.",
       inputSchema: AssetsImagesGenerateInput,
     },
-    (args) => forwardBridgeTool(bridge, "assets.images.generate", args, AssetsImagesGenerateOutput),
+    (args) =>
+      forwardAuthorizedBridgeTool(
+        authorizer,
+        mutationContext("foundry.assets.images.generate", args, "assets:upload"),
+        bridge,
+        "assets.images.generate",
+        args,
+        AssetsImagesGenerateOutput,
+      ),
   );
   server.registerTool(
     "foundry.assets.images.attach",
@@ -63,6 +89,14 @@ export function registerAssetTools(server: ToolServer, bridge: BridgeConnection)
         "Atomically uploads or references an image and updates an authorized Foundry Document field with one audit event.",
       inputSchema: AssetsImagesAttachInput,
     },
-    (args) => forwardBridgeTool(bridge, "assets.images.attach", args, AssetsImagesAttachOutput),
+    (args) =>
+      forwardAuthorizedBridgeTool(
+        authorizer,
+        mutationContext("foundry.assets.images.attach", args, "assets:attach"),
+        bridge,
+        "assets.images.attach",
+        args,
+        AssetsImagesAttachOutput,
+      ),
   );
 }

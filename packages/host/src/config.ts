@@ -6,6 +6,7 @@ export interface HostConfig {
   eventCategories: string[];
   capturePrivateContent: boolean;
   eventRetentionDays: number;
+  allowedOrigins: string[];
 }
 
 export const DEFAULT_EVENT_CATEGORIES = [
@@ -26,6 +27,7 @@ export const DEFAULT_CONFIG: HostConfig = {
   eventCategories: [...DEFAULT_EVENT_CATEGORIES],
   capturePrivateContent: false,
   eventRetentionDays: 30,
+  allowedOrigins: ["http://localhost:30000", "http://127.0.0.1:30000"],
 };
 
 export type ConfigFileSource = Partial<HostConfig>;
@@ -40,6 +42,7 @@ const ENV_KEY_MAP: Record<keyof HostConfig, string> = {
   eventCategories: "FOUNDRY_MCP_EVENT_CATEGORIES",
   capturePrivateContent: "FOUNDRY_MCP_CAPTURE_PRIVATE_CONTENT",
   eventRetentionDays: "FOUNDRY_MCP_EVENT_RETENTION_DAYS",
+  allowedOrigins: "FOUNDRY_MCP_ALLOWED_ORIGINS",
 };
 
 function parseEnvValue(key: keyof HostConfig, raw: string): HostConfig[keyof HostConfig] {
@@ -49,7 +52,7 @@ function parseEnvValue(key: keyof HostConfig, raw: string): HostConfig[keyof Hos
   if (key === "capturePrivateContent") {
     return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
   }
-  if (key === "eventCategories") {
+  if (key === "eventCategories" || key === "allowedOrigins") {
     return raw
       .split(",")
       .map((category) => category.trim())
@@ -90,5 +93,6 @@ export function resolveConfig(
   return {
     ...resolved,
     eventCategories: [...resolved.eventCategories],
+    allowedOrigins: [...resolved.allowedOrigins],
   };
 }
