@@ -203,4 +203,18 @@ describe.runIf(process.platform === "win32")("Windows setup scripts (process int
     expect(nextSecret).toBeTruthy();
     expect(nextSecret).not.toBe(displaySecret);
   }, 30000);
+
+  it("detects Windows without relying on the OS environment variable", () => {
+    const appData = tmpDir("pairing-no-os-env");
+    const previousOs = process.env["OS"];
+    try {
+      delete process.env["OS"];
+      const result = runScript("pair.ps1", ["-AppDataPath", appData]);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toMatch(/Pairing secret \(shown once/);
+    } finally {
+      if (previousOs === undefined) delete process.env["OS"];
+      else process.env["OS"] = previousOs;
+    }
+  }, 30000);
 });

@@ -8,7 +8,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if ($env:OS -ne 'Windows_NT') {
+$isWindowsPlatform = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+if (-not $isWindowsPlatform) {
     throw 'pair.ps1 requires Windows because pairing secrets are protected with current-user DPAPI.'
 }
 
