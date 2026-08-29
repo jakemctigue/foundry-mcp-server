@@ -12,12 +12,17 @@ import {
   FakeHooks,
   type Daemon,
 } from "@foundry-mcp/host";
-import type { JsonValue, RequestedCapability } from "@foundry-mcp/protocol";
+import {
+  inspectImageBytes,
+  type JsonValue,
+  type RequestedCapability,
+} from "@foundry-mcp/protocol";
 import { WebSocket } from "ws";
 import { describe, expect, it } from "vitest";
 
 import {
   CompanionBridgeClient,
+  BrowserFoundryAssetRuntime,
   FoundryAssetService,
   FoundryCompanionHandlers,
   FoundryDocumentService,
@@ -41,6 +46,59 @@ const ORIGIN = "http://127.0.0.1:30000";
 const CONNECTION_ID = "lifecycle-world:gm";
 const PAIRING_SECRET = Buffer.alloc(32, 0x5a);
 const PAIRING_SECRET_DISPLAY = base32Encode(PAIRING_SECRET);
+
+interface MockImageBitmap {
+  width: number;
+  height: number;
+  closed: boolean;
+  close(): void;
+}
+
+class MockBrowserImageDecoder {
+  readonly inputs: Blob[] = [];
+  readonly bitmaps: MockImageBitmap[] = [];
+  #nextFailure: Error | undefined;
+
+  failNext(error = new Error("injected browser decoder failure")): void {
+    this.#nextFailure = error;
+  }
+
+  readonly createImageBitmap = async (
+    input: unknown,
+  ): Promise<MockImageBitmap> => {
+    if (!(input instanceof Blob)) {
+      throw new TypeError("createImageBitmap requires a Blob");
+    }
+    this.inputs.push(input);
+    if (this.#nextFailure) {
+      const failure = this.#nextFailure;
+      this.#nextFailure = undefined;
+      throw failure;
+    }
+    const bytes = new Uint8Array(await input.arrayBuffer());
+    const inspected = inspectImageBytes(bytes, {
+      expectedMimeType: input.type,
+      requireDimensions: true,
+    });
+    if (
+      !inspected.ok ||
+      inspected.value.width === undefined ||
+      inspected.value.height === undefined
+    ) {
+      throw new Error("mock browser decoder rejected invalid image bytes");
+    }
+    const bitmap: MockImageBitmap = {
+      width: inspected.value.width,
+      height: inspected.value.height,
+      closed: false,
+      close() {
+        this.closed = true;
+      },
+    };
+    this.bitmaps.push(bitmap);
+    return bitmap;
+  };
+}
 
 class MemoryStorage implements CompanionStorage {
   readonly values = new Map<string, string>();
@@ -251,6 +309,11 @@ describe("MOCKED FOUNDRY v14 full lifecycle E2E", () => {
       const assetRuntime = createFakeAssetRuntime()
         .seed("data", "tokens/seeded.png", VALID_PNG, "image/png")
         .seed("public", "icons/core.png", VALID_PNG, "image/png");
+      const imageDecoder = new MockBrowserImageDecoder();
+      const browserAssetDecoder = new BrowserFoundryAssetRuntime({
+        global: { Blob, createImageBitmap: imageDecoder.createImageBitmap },
+      });
+      assetRuntime.decodeImage = browserAssetDecoder.decodeImage.bind(browserAssetDecoder);
       const documents = new FoundryDocumentService(runtime);
       const assets = new FoundryAssetService(assetRuntime, documents, runtime);
       const sessions = new FoundrySessionService(documents, {
@@ -436,6 +499,21 @@ describe("MOCKED FOUNDRY v14 full lifecycle E2E", () => {
             source: { kind: "base64", data: encodedPng, mimeType: "image/png" },
           }),
         ).toMatchObject({ assetPath: "tokens/uploaded.png", source: "data" });
+        expect(imageDecoder.inputs).toHaveLength(1);
+        expect(imageDecoder.inputs[0]).toBeInstanceOf(Blob);
+        expect(imageDecoder.bitmaps).toEqual([
+          expect.objectContaining({ closed: true }),
+        ]);
+
+        imageDecoder.failNext();
+        await expect(
+          callTool(client, "foundry.assets.images.upload", {
+            connectionId: CONNECTION_ID,
+            destinationPath: "tokens/decoder-failure.png",
+            source: { kind: "base64", data: encodedPng, mimeType: "image/png" },
+          }),
+        ).rejects.toThrow(/decode/i);
+        expect(assetRuntime.get("data", "tokens/decoder-failure.png")).toBeUndefined();
         expect(
           await callTool(client, "foundry.assets.images.generate", {
             connectionId: CONNECTION_ID,
@@ -446,12 +524,19 @@ describe("MOCKED FOUNDRY v14 full lifecycle E2E", () => {
           assetPath: "generated/clockwork.png",
           provider: "deterministic",
         });
+        expect(imageDecoder.inputs).toHaveLength(3);
+        expect(imageDecoder.inputs.every((input) => input instanceof Blob)).toBe(true);
+        expect(imageDecoder.bitmaps).toHaveLength(2);
+        expect(imageDecoder.bitmaps.every((bitmap) => bitmap.closed)).toBe(true);
+        const decodedBeforeReferenceAttach = imageDecoder.bitmaps.length;
         const attached = await callTool(client, "foundry.assets.images.attach", {
           connectionId: CONNECTION_ID,
           documentUuid: targetActor,
           asset: { kind: "reference", sourceId: "data", path: "generated/clockwork.png" },
         });
         expect(attached).toHaveProperty("assetPath", "generated/clockwork.png");
+        expect(imageDecoder.bitmaps).toHaveLength(decodedBeforeReferenceAttach);
+        expect(imageDecoder.bitmaps.every((bitmap) => bitmap.closed)).toBe(true);
         expect(
           await callTool(client, "foundry.documents.get", {
             connectionId: CONNECTION_ID,
