@@ -127,6 +127,10 @@ export class HostBridgeRouter {
           worldTitle: entry.worldTitle,
           status: entry.status,
           ...(entry.foundryVersion ? { foundryVersion: entry.foundryVersion } : {}),
+          currentUser: entry.currentUser,
+          system: entry.system,
+          activeModules: entry.activeModules,
+          moduleCapabilities: entry.moduleCapabilities,
           lastSeenAt: entry.lastSeenAt,
         })),
       };

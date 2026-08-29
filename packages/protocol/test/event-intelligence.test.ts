@@ -7,6 +7,7 @@ import {
   IntelligenceChangedSinceInput,
   IntelligenceContextInput,
   companionAuthPayload,
+  type CompanionHelloMessage,
 } from "../src/index.js";
 
 describe("event and intelligence protocol schemas", () => {
@@ -57,7 +58,7 @@ describe("event and intelligence protocol schemas", () => {
 
   it("validates challenge proofs and canonicalizes every asserted hello identity field", () => {
     const challenge = "A".repeat(43);
-    const hello = {
+    const hello: CompanionHelloMessage = {
       type: "hello" as const,
       protocolVersion: BRIDGE_PROTOCOL_VERSION,
       connectionId: "world-a:user-a",
@@ -65,6 +66,10 @@ describe("event and intelligence protocol schemas", () => {
       worldTitle: "Alpha",
       foundryVersion: "14.0",
       foundryUserRole: "GAMEMASTER" as const,
+      currentUser: { id: "user-a", name: "Game Master", role: "GAMEMASTER" as const },
+      system: { id: "dnd5e", version: "5.1.0" },
+      activeModules: [{ id: "foundry-mcp", version: "0.1.0" }],
+      moduleCapabilities: ["documents.read", "documents.write"],
     };
     expect(
       CompanionWireMessageSchema.safeParse({
@@ -91,7 +96,24 @@ describe("event and intelligence protocol schemas", () => {
     const alphaPayload = companionAuthPayload(challenge, "https://foundry.test", hello);
     const betaPayload = companionAuthPayload(challenge, "https://other-foundry.test", hello);
     expect(alphaPayload).toContain("world-a:user-a");
+    expect(alphaPayload).toContain("foundry-mcp-companion-auth-v3");
     expect(alphaPayload).not.toBe(betaPayload);
+    expect(
+      CompanionWireMessageSchema.safeParse({
+        type: "auth.proof",
+        hello: {
+          ...hello,
+          currentUser: { ...hello.currentUser, role: "ASSISTANT" },
+        },
+        proof: "B".repeat(43),
+      }).success,
+    ).toBe(false);
+    expect(companionAuthPayload(challenge, "https://foundry.test", hello)).not.toBe(
+      companionAuthPayload(challenge, "https://foundry.test", {
+        ...hello,
+        activeModules: [{ id: "foundry-mcp", version: "0.2.0" }],
+      }),
+    );
     expect(() =>
       companionAuthPayload("not-canonical-base64url", "https://foundry.test", hello),
     ).toThrow();

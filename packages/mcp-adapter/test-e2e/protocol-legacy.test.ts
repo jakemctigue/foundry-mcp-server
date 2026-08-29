@@ -86,9 +86,8 @@ describe.each([...LEGACY_MCP_PROTOCOL_VERSIONS])("legacy MCP initialize %s", (pr
       const resourceUris = (
         resourceResponse.result as { resources: Array<{ uri: string }> }
       ).resources.map(({ uri }) => uri);
-      expect(resourceUris).toEqual(
-        expect.arrayContaining(["foundry://connections", "foundry://intelligence/latest"]),
-      );
+      expect(resourceUris).toContain("foundry://connections");
+      expect(resourceUris).not.toContain("foundry://intelligence/latest");
     } finally {
       await transport.close();
     }

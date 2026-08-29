@@ -76,6 +76,18 @@ function companionHello(connectionId = "world-a"): CompanionHelloMessage {
     worldId: connectionId,
     worldTitle: "Test World",
     foundryUserRole: "GAMEMASTER",
+    currentUser: { id: "gm-a", name: "Game Master", role: "GAMEMASTER" },
+    system: { id: "dnd5e", version: "5.1.0" },
+    activeModules: [{ id: "foundry-mcp", version: "0.1.0" }],
+    moduleCapabilities: [
+      "documents.read",
+      "documents.write",
+      "assets.read",
+      "assets.write",
+      "sessions.read",
+      "sessions.write",
+      "events.publish",
+    ],
   };
 }
 

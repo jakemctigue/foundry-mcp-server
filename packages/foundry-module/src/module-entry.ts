@@ -1,6 +1,11 @@
 import { BrowserFoundryAssetRuntime } from "./asset-runtime.js";
 import { FoundryAssetService } from "./assets.js";
-import type { FoundryUserRole, JsonValue } from "@foundry-mcp/protocol";
+import type {
+  ActiveFoundryModule,
+  FoundryModuleCapability,
+  FoundryUserRole,
+  JsonValue,
+} from "@foundry-mcp/protocol";
 
 import {
   CompanionBridgeClient,
@@ -17,6 +22,16 @@ import { FoundrySessionService } from "./sessions.js";
 const MODULE_ID = "foundry-mcp";
 const ENDPOINT_SETTING = "bridgeEndpoint";
 const PAIRING_SECRET_SETTING = "pairingSecret";
+const MODULE_CAPABILITIES = [
+  "documents.read",
+  "documents.write",
+  "assets.read",
+  "assets.write",
+  "sessions.read",
+  "sessions.write",
+  "events.publish",
+] as const satisfies readonly FoundryModuleCapability[];
+const SAFE_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -36,6 +51,37 @@ function connectedUserRole(user: UnknownRecord): FoundryUserRole {
   if (role >= 3) return "ASSISTANT";
   if (role >= 2) return "TRUSTED";
   return "PLAYER";
+}
+
+function activeModuleVersions(value: unknown): ActiveFoundryModule[] {
+  const collection = record(value);
+  const values = collection.values;
+  let modules: unknown[];
+  if (typeof values === "function") {
+    try {
+      modules = Array.from(values.call(value) as Iterable<unknown>);
+    } catch {
+      modules = [];
+    }
+  } else {
+    modules = Object.values(collection);
+  }
+  return modules
+    .map(record)
+    .filter((module) => module.active === true)
+    .flatMap((module) => {
+      const id = stringValue(module.id, "");
+      if (!SAFE_IDENTIFIER.test(id) || id.length > 256) return [];
+      const version = stringValue(module.version, "");
+      return [
+        {
+          id,
+          ...(version.length > 0 && version.length <= 100 ? { version } : {}),
+        },
+      ];
+    })
+    .sort((left, right) => left.id.localeCompare(right.id))
+    .slice(0, 256);
 }
 
 function currentUserIsGameMaster(): boolean {
@@ -147,6 +193,8 @@ async function startCompanion(): Promise<void> {
   const handlers = new FoundryCompanionHandlers({ documents, assets, sessions });
   const worldId = stringValue(world.id, "unknown-world");
   const userId = stringValue(user.id, "unknown-user");
+  const userRole = connectedUserRole(user);
+  const system = record(game.system);
   const pageOrigin = stringValue(record(globals.location).origin, "");
   if (!pageOrigin) {
     throw new Error("Foundry MCP requires a browser page origin");
@@ -160,7 +208,18 @@ async function startCompanion(): Promise<void> {
     worldId,
     worldTitle: stringValue(world.title, worldId),
     foundryVersion: stringValue(record(game.release).version, "14"),
-    foundryUserRole: connectedUserRole(user),
+    foundryUserRole: userRole,
+    currentUser: {
+      id: userId,
+      name: stringValue(user.name, userId),
+      role: userRole,
+    },
+    system: {
+      id: stringValue(system.id, "unknown-system"),
+      version: stringValue(system.version, "unknown"),
+    },
+    activeModules: activeModuleVersions(game.modules),
+    moduleCapabilities: [...MODULE_CAPABILITIES],
   });
   const client = new CompanionBridgeClient({
     endpoint,

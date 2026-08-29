@@ -27,6 +27,18 @@ function hello(connectionId: string): CompanionHelloMessage {
     worldTitle: `${connectionId} World`,
     foundryVersion: "14.0",
     foundryUserRole: "GAMEMASTER",
+    currentUser: { id: "gm-a", name: "Game Master", role: "GAMEMASTER" },
+    system: { id: "dnd5e", version: "5.1.0" },
+    activeModules: [{ id: "foundry-mcp", version: "0.1.0" }],
+    moduleCapabilities: [
+      "documents.read",
+      "documents.write",
+      "assets.read",
+      "assets.write",
+      "sessions.read",
+      "sessions.write",
+      "events.publish",
+    ],
   };
 }
 
@@ -164,7 +176,21 @@ describe("real browser companion host (mocked Foundry WebSocket)", () => {
     await vi.waitFor(() => expect(server.listConnections()).toHaveLength(1));
     const router = new HostBridgeRouter(db, server);
     expect(await router.dispatch("connections.list", {})).toMatchObject({
-      connections: [{ connectionId: "world-a", worldTitle: "Alpha World" }],
+      connections: [
+        {
+          connectionId: "world-a",
+          worldTitle: "Alpha World",
+          currentUser: { id: "gm-a", name: "Game Master", role: "GAMEMASTER" },
+          system: { id: "dnd5e", version: "5.1.0" },
+          activeModules: [{ id: "foundry-mcp", version: "0.1.0" }],
+          moduleCapabilities: expect.arrayContaining([
+            "documents.read",
+            "assets.write",
+            "sessions.write",
+            "events.publish",
+          ]),
+        },
+      ],
     });
 
     const mutation = {
@@ -345,7 +371,12 @@ describe("real browser companion host (mocked Foundry WebSocket)", () => {
     cleanups.push(server.close);
     const socket = new WebSocket(server.address().endpoint, { origin: "http://foundry.test" });
     cleanups.push(() => socket.terminate());
-    const identity = { ...hello("assistant-world"), foundryUserRole: "ASSISTANT" as const };
+    const baseIdentity = hello("assistant-world");
+    const identity = {
+      ...baseIdentity,
+      foundryUserRole: "ASSISTANT" as const,
+      currentUser: { ...baseIdentity.currentUser, role: "ASSISTANT" as const },
+    };
     await authenticate(socket, identity);
     const request = vi.fn();
     socket.on("message", (data) => {

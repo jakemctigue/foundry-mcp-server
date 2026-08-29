@@ -16,6 +16,10 @@ const connection = {
   worldId: "alpha",
   worldTitle: "Alpha World",
   status: "connected" as const,
+  currentUser: { id: "gm-a", name: "Game Master", role: "GAMEMASTER" as const },
+  system: { id: "dnd5e", version: "5.1.0" },
+  activeModules: [{ id: "foundry-mcp", version: "0.1.0" }],
+  moduleCapabilities: ["documents.read", "sessions.read", "events.publish"] as const,
 };
 const document = {
   id: "a",
@@ -144,16 +148,132 @@ describe("document/intelligence tools and enumerable resources", () => {
         expect.arrayContaining([
           "foundry://connections",
           "foundry://world/world-a",
-          "foundry://document/Actor.a",
-          "foundry://session/session-a",
-          "foundry://intelligence/latest",
+          "foundry://document/world-a/Actor.a",
+          "foundry://session/world-a/session-a",
+          "foundry://intelligence/world-a/latest",
         ]),
       );
-      const read = await context.client.readResource({ uri: "foundry://document/Actor.a" });
+      const read = await context.client.readResource({
+        uri: "foundry://document/world-a/Actor.a",
+      });
       const content = read.contents[0];
       expect(content && "text" in content ? JSON.parse(content.text) : null).toMatchObject({
         uuid: "Actor.a",
         data: { name: "Hero" },
+      });
+    } finally {
+      await context.close();
+    }
+  });
+
+  it("keeps duplicate document and session ids deterministic across encoded world ids", async () => {
+    const connections = [
+      { ...connection, connectionId: "world/a", worldId: "alpha", worldTitle: "Alpha" },
+      { ...connection, connectionId: "world b", worldId: "beta", worldTitle: "Beta" },
+    ];
+    const duplicateDocument = { ...document, id: "same", uuid: "Actor.same/uuid" };
+    const duplicateSession = { ...session, sessionId: "session/same" };
+    const request = vi.fn(async (method: string, params: Record<string, unknown> = {}) => {
+      const connectionId = String(params.connectionId ?? "");
+      if (method === "connections.list") return { connections };
+      if (method === "documents.types") {
+        return {
+          types: [
+            {
+              type: "Actor",
+              embedded: false,
+              parentTypes: [],
+              readable: true,
+              creatable: true,
+              updatable: true,
+              subtypes: [],
+            },
+          ],
+        };
+      }
+      if (method === "documents.list") {
+        return {
+          items: [
+            {
+              id: duplicateDocument.id,
+              uuid: duplicateDocument.uuid,
+              type: duplicateDocument.type,
+              name: `${connectionId} hero`,
+              sourceHash: duplicateDocument.sourceHash,
+              sourceVersion: duplicateDocument.sourceVersion,
+            },
+          ],
+        };
+      }
+      if (method === "documents.get") {
+        return { ...duplicateDocument, name: `${connectionId} hero`, data: { connectionId } };
+      }
+      if (method === "sessions.list") {
+        return {
+          sessions: [{ ...duplicateSession, title: `${connectionId} session` }],
+        };
+      }
+      if (method === "sessions.get") {
+        return {
+          session: { ...duplicateSession, title: `${connectionId} session` },
+          pages: [],
+        };
+      }
+      if (method === "intelligence.timeline") return { events: [] };
+      return null;
+    });
+    const context = await setup({ request, close: () => Promise.resolve() });
+    try {
+      const uris = (await context.client.listResources()).resources.map(({ uri }) => uri);
+      expect(uris).toEqual(
+        expect.arrayContaining([
+          "foundry://world/world%2Fa",
+          "foundry://world/world%20b",
+          "foundry://document/world%2Fa/Actor.same%2Fuuid",
+          "foundry://document/world%20b/Actor.same%2Fuuid",
+          "foundry://session/world%2Fa/session%2Fsame",
+          "foundry://session/world%20b/session%2Fsame",
+          "foundry://intelligence/world%2Fa/latest",
+          "foundry://intelligence/world%20b/latest",
+        ]),
+      );
+      await expect(
+        context.client.readResource({ uri: "foundry://document/Actor.same%2Fuuid" }),
+      ).rejects.toThrow();
+
+      const alphaDocument = await context.client.readResource({
+        uri: "foundry://document/world%2Fa/Actor.same%2Fuuid",
+      });
+      const betaDocument = await context.client.readResource({
+        uri: "foundry://document/world%20b/Actor.same%2Fuuid",
+      });
+      const alphaText = alphaDocument.contents[0];
+      const betaText = betaDocument.contents[0];
+      expect(alphaText && "text" in alphaText ? JSON.parse(alphaText.text) : null).toMatchObject({
+        data: { connectionId: "world/a" },
+      });
+      expect(betaText && "text" in betaText ? JSON.parse(betaText.text) : null).toMatchObject({
+        data: { connectionId: "world b" },
+      });
+
+      await context.client.readResource({ uri: "foundry://session/world%2Fa/session%2Fsame" });
+      await context.client.readResource({ uri: "foundry://intelligence/world%20b/latest" });
+      expect(request).toHaveBeenCalledWith("documents.get", {
+        connectionId: "world/a",
+        uuid: "Actor.same/uuid",
+      });
+      expect(request).toHaveBeenCalledWith("documents.get", {
+        connectionId: "world b",
+        uuid: "Actor.same/uuid",
+      });
+      expect(request).toHaveBeenCalledWith("sessions.get", {
+        connectionId: "world/a",
+        sessionId: "session/same",
+        pageSize: 100,
+      });
+      expect(request).toHaveBeenCalledWith("intelligence.timeline", {
+        connectionId: "world b",
+        limit: 25,
       });
     } finally {
       await context.close();

@@ -124,6 +124,18 @@ describe("daemon to mocked browser companion end-to-end", () => {
       worldTitle: "Alpha World",
       foundryVersion: "13.351",
       foundryUserRole: "GAMEMASTER",
+      currentUser: { id: "gm-a", name: "Game Master", role: "GAMEMASTER" },
+      system: { id: "dnd5e", version: "5.1.0" },
+      activeModules: [{ id: "foundry-mcp", version: "0.1.0" }],
+      moduleCapabilities: [
+        "documents.read",
+        "documents.write",
+        "assets.read",
+        "assets.write",
+        "sessions.read",
+        "sessions.write",
+        "events.publish",
+      ],
     });
     await vi.waitFor(() => expect(daemon?.companion.listConnections()).toHaveLength(1));
 
@@ -143,7 +155,23 @@ describe("daemon to mocked browser companion end-to-end", () => {
       result: { protocolVersion: BRIDGE_PROTOCOL_VERSION },
     });
     await expect(request("connections", "connections.list")).resolves.toMatchObject({
-      result: { connections: [{ connectionId: "world-a", status: "connected" }] },
+      result: {
+        connections: [
+          {
+            connectionId: "world-a",
+            status: "connected",
+            currentUser: { id: "gm-a", name: "Game Master", role: "GAMEMASTER" },
+            system: { id: "dnd5e", version: "5.1.0" },
+            activeModules: [{ id: "foundry-mcp", version: "0.1.0" }],
+            moduleCapabilities: expect.arrayContaining([
+              "documents.read",
+              "assets.write",
+              "sessions.write",
+              "events.publish",
+            ]),
+          },
+        ],
+      },
     });
     await expect(
       request("types", "documents.types", { connectionId: "world-a" }),

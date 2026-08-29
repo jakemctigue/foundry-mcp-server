@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { JsonValueSchema } from "./document.js";
 import { FoundryUserRoleSchema } from "./authorization.js";
+import { FoundryDiscoveryMetadataSchema } from "./connection.js";
 import { BRIDGE_PROTOCOL_VERSION } from "./version.js";
 
 export const CompanionHelloMessageSchema = z
@@ -13,8 +14,18 @@ export const CompanionHelloMessageSchema = z
     worldTitle: z.string().trim().min(1).max(512),
     foundryVersion: z.string().trim().min(1).max(100).optional(),
     foundryUserRole: FoundryUserRoleSchema,
+    ...FoundryDiscoveryMetadataSchema.shape,
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.foundryUserRole !== value.currentUser.role) {
+      context.addIssue({
+        code: "custom",
+        path: ["currentUser", "role"],
+        message: "current user role must match the authenticated Foundry role",
+      });
+    }
+  });
 export type CompanionHelloMessage = z.infer<typeof CompanionHelloMessageSchema>;
 
 const CompanionAuthValueSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
@@ -74,7 +85,7 @@ export function companionAuthPayload(
   const parsedOrigin = CompanionOriginSchema.parse(origin);
   const parsedHello = CompanionHelloMessageSchema.parse(hello);
   return JSON.stringify([
-    "foundry-mcp-companion-auth-v2",
+    "foundry-mcp-companion-auth-v3",
     parsedChallenge,
     parsedOrigin,
     parsedHello.protocolVersion,
@@ -83,6 +94,10 @@ export function companionAuthPayload(
     parsedHello.worldTitle,
     parsedHello.foundryVersion ?? "",
     parsedHello.foundryUserRole,
+    [parsedHello.currentUser.id, parsedHello.currentUser.name, parsedHello.currentUser.role],
+    [parsedHello.system.id, parsedHello.system.version ?? ""],
+    parsedHello.activeModules.map(({ id, version }) => [id, version ?? ""]),
+    parsedHello.moduleCapabilities,
   ]);
 }
 

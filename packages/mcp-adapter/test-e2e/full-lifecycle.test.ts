@@ -169,6 +169,21 @@ function createBrowserCompanion(
       worldTitle: "Mocked Foundry Lifecycle",
       foundryVersion: "14.0.0",
       foundryUserRole: "GAMEMASTER",
+      currentUser: { id: "gm", name: "Lifecycle GM", role: "GAMEMASTER" },
+      system: { id: "dnd5e", version: "5.1.0" },
+      activeModules: [
+        { id: "foundry-mcp", version: "0.1.0" },
+        { id: "test-automation", version: "1.2.3" },
+      ],
+      moduleCapabilities: [
+        "documents.read",
+        "documents.write",
+        "assets.read",
+        "assets.write",
+        "sessions.read",
+        "sessions.write",
+        "events.publish",
+      ],
     }),
     pairingSecret: PAIRING_SECRET_DISPLAY,
   });
@@ -292,7 +307,24 @@ describe("MOCKED FOUNDRY v14 full lifecycle E2E", () => {
         await startHost();
         const client = required(mcp, "MCP client").client;
         expect(await callTool(client, "foundry.connections.list", {})).toMatchObject({
-          connections: [{ connectionId: CONNECTION_ID, worldId: "lifecycle-world" }],
+          connections: [
+            {
+              connectionId: CONNECTION_ID,
+              worldId: "lifecycle-world",
+              currentUser: { id: "gm", name: "Lifecycle GM", role: "GAMEMASTER" },
+              system: { id: "dnd5e", version: "5.1.0" },
+              activeModules: [
+                { id: "foundry-mcp", version: "0.1.0" },
+                { id: "test-automation", version: "1.2.3" },
+              ],
+              moduleCapabilities: expect.arrayContaining([
+                "documents.read",
+                "assets.write",
+                "sessions.write",
+                "events.publish",
+              ]),
+            },
+          ],
         });
 
         const types = (await callTool(client, "foundry.documents.types", {
@@ -485,6 +517,41 @@ describe("MOCKED FOUNDRY v14 full lifecycle E2E", () => {
             query: "clockwork",
           })).results,
         ).toHaveLength(2);
+
+        const encodedConnectionId = encodeURIComponent(CONNECTION_ID);
+        const encodedActorUuid = encodeURIComponent(targetActor);
+        const encodedSessionId = encodeURIComponent(sessionId);
+        const resourceUris = (await client.listResources()).resources.map(({ uri }) => uri);
+        expect(resourceUris).toEqual(
+          expect.arrayContaining([
+            `foundry://world/${encodedConnectionId}`,
+            `foundry://document/${encodedConnectionId}/${encodedActorUuid}`,
+            `foundry://session/${encodedConnectionId}/${encodedSessionId}`,
+            `foundry://intelligence/${encodedConnectionId}/latest`,
+          ]),
+        );
+        const documentResource = await client.readResource({
+          uri: `foundry://document/${encodedConnectionId}/${encodedActorUuid}`,
+        });
+        const sessionResource = await client.readResource({
+          uri: `foundry://session/${encodedConnectionId}/${encodedSessionId}`,
+        });
+        const intelligenceResource = await client.readResource({
+          uri: `foundry://intelligence/${encodedConnectionId}/latest`,
+        });
+        const parseResource = (resource: typeof documentResource): Record<string, unknown> => {
+          const content = resource.contents[0];
+          if (!content || !("text" in content)) throw new Error("expected JSON text resource");
+          return JSON.parse(content.text) as Record<string, unknown>;
+        };
+        expect(parseResource(documentResource)).toMatchObject({ uuid: targetActor });
+        expect(parseResource(sessionResource)).toMatchObject({
+          session: { sessionId },
+        });
+        expect(parseResource(intelligenceResource)).toMatchObject({
+          connection: { connectionId: CONNECTION_ID },
+          timeline: { events: expect.any(Array) },
+        });
 
         const replayRequestId = "lifecycle-idempotent-request";
         const replayInput = {

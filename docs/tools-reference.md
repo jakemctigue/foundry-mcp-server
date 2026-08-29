@@ -124,14 +124,19 @@ persistence.
 ## Enumerable resources
 
 Resources return `application/json` and reuse the same bridge services and validation as tools.
+Every world-scoped resource URI names its authenticated connection explicitly, so duplicate UUIDs
+or session IDs in two connected worlds cannot resolve ambiguously. Connection metadata includes the
+bounded current-user identity and role, game-system id/version, active module ids/versions, and the
+module capabilities advertised by the authenticated browser companion; pairing values and provider
+secrets are never part of this discovery surface.
 
 | Resource or template | Enumeration/read behavior | Example URI |
 | --- | --- | --- |
 | `foundry://connections` | One fixed resource containing known live connections. | `foundry://connections` |
 | `foundry://world/{connectionId}` | Enumerable for each live world; returns connection metadata and runtime Document types. | `foundry://world/world-a%3Agm` |
-| `foundry://document/{uuid}` | Enumerates up to 500 visible root Documents and reads one UUID. | `foundry://document/Actor.a1` |
-| `foundry://session/{uuid}` | Enumerates module-owned sessions and reads one complete paged session view. | `foundry://session/session-12` |
-| `foundry://intelligence/latest` | Fixed resource containing the latest bounded timeline for every live world. | `foundry://intelligence/latest` |
+| `foundry://document/{connectionId}/{uuid}` | Enumerates up to 500 visible root Documents and reads one UUID from the named connection. Both path segments are percent-encoded. | `foundry://document/world-a%3Agm/Actor.a1` |
+| `foundry://session/{connectionId}/{sessionId}` | Enumerates module-owned sessions and reads one complete paged session view from the named connection. Both path segments are percent-encoded. | `foundry://session/world-a%3Agm/session-12` |
+| `foundry://intelligence/{connectionId}/latest` | Enumerates one latest bounded timeline per live connection. The connection path segment is percent-encoded. | `foundry://intelligence/world-a%3Agm/latest` |
 
 ## Prompts
 
