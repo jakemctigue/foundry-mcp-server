@@ -1,9 +1,14 @@
 import {
+  CompanionAuthChallengeMessageSchema,
+  CompanionAuthReadyMessageSchema,
   CompanionRequestMessageSchema,
   CompanionWireMessageSchema,
   EventEnvelopeSchema,
   EventAckMessageSchema,
   EventResumeMessageSchema,
+  companionAuthPayload,
+  companionAuthReadyPayload,
+  type CompanionAuthProofMessage,
   type CompanionResponseMessage,
   type CompanionHelloMessage,
   type EventEnvelope,
@@ -33,6 +38,8 @@ export interface CompanionClientOptions {
   createSocket: (endpoint: string) => CompanionSocket;
   handleRequest: (method: string, params: Record<string, JsonValue>) => Promise<JsonValue>;
   hello?: CompanionHelloMessage;
+  /** Base32 value shown by the pairing command, or the equivalent raw 32 bytes. */
+  pairingSecret?: string | Uint8Array;
   storageKey?: string;
   maxPendingEvents?: number;
   maxCachedResponses?: number;
@@ -44,6 +51,95 @@ interface PersistedState {
   nextSequenceId: number;
   pendingEvents: EventPublishMessage[];
   responses: CompanionResponseMessage[];
+  inFlightMutations: Array<{ id: string; method: string }>;
+}
+
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+const BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const MUTATION_METHODS = new Set([
+  "documents.create",
+  "documents.update",
+  "assets.images.upload",
+  "assets.images.generate",
+  "assets.images.attach",
+  "sessions.start",
+  "sessions.append",
+  "sessions.end",
+  "sessions.reopen",
+]);
+
+interface SubtleCryptoLike {
+  importKey(
+    format: "raw",
+    keyData: Uint8Array,
+    algorithm: { name: "HMAC"; hash: "SHA-256" },
+    extractable: boolean,
+    keyUsages: readonly ["sign"],
+  ): Promise<unknown>;
+  sign(algorithm: "HMAC", key: unknown, data: Uint8Array): Promise<ArrayBuffer>;
+}
+
+function base32DecodeStrict(encoded: string): Uint8Array {
+  const normalized = encoded.trim().toUpperCase();
+  if (!/^[A-Z2-7]+$/.test(normalized)) throw new Error("pairing secret is not valid base32");
+  let bits = 0;
+  let value = 0;
+  const bytes: number[] = [];
+  for (const char of normalized) {
+    value = (value << 5) | BASE32_ALPHABET.indexOf(char);
+    bits += 5;
+    if (bits >= 8) {
+      bytes.push((value >>> (bits - 8)) & 0xff);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(bytes);
+}
+
+function pairingSecretBytes(value: string | Uint8Array | undefined): Uint8Array {
+  if (value === undefined) {
+    throw new Error("companion pairing secret is required before connecting");
+  }
+  const bytes = typeof value === "string" ? base32DecodeStrict(value) : new Uint8Array(value);
+  if (bytes.byteLength !== 32) throw new Error("companion pairing secret must be 32 bytes");
+  return bytes;
+}
+
+function base64UrlEncode(bytes: Uint8Array): string {
+  let output = "";
+  for (let index = 0; index < bytes.length; index += 3) {
+    const first = bytes[index] ?? 0;
+    const second = bytes[index + 1];
+    const third = bytes[index + 2];
+    output += BASE64URL_ALPHABET[first >>> 2] ?? "";
+    output += BASE64URL_ALPHABET[((first & 3) << 4) | ((second ?? 0) >>> 4)] ?? "";
+    if (second !== undefined) {
+      output += BASE64URL_ALPHABET[((second & 15) << 2) | ((third ?? 0) >>> 6)] ?? "";
+    }
+    if (third !== undefined) output += BASE64URL_ALPHABET[third & 63] ?? "";
+  }
+  return output;
+}
+
+function fixedStringEqual(left: string, right: string): boolean {
+  if (left.length !== right.length) return false;
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    difference |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
+async function signCompanionProof(secret: Uint8Array, payload: string): Promise<string> {
+  const subtle = (globalThis as unknown as { crypto?: { subtle?: SubtleCryptoLike } }).crypto
+    ?.subtle;
+  if (!subtle) throw new Error("Web Crypto HMAC is required for companion pairing");
+  const key = await subtle.importKey("raw", secret, { name: "HMAC", hash: "SHA-256" }, false, [
+    "sign",
+  ]);
+  return base64UrlEncode(
+    new Uint8Array(await subtle.sign("HMAC", key, new TextEncoder().encode(payload))),
+  );
 }
 
 function validateEndpoint(endpoint: string): string {
@@ -69,7 +165,7 @@ function validateOrigin(pageOrigin: string, allowedOrigins: readonly string[]): 
 }
 
 function emptyState(): PersistedState {
-  return { nextSequenceId: 1, pendingEvents: [], responses: [] };
+  return { nextSequenceId: 1, pendingEvents: [], responses: [], inFlightMutations: [] };
 }
 
 function parseState(raw: string | null, connectionId: string): PersistedState {
@@ -80,7 +176,9 @@ function parseState(raw: string | null, connectionId: string): PersistedState {
     if (!Number.isSafeInteger(nextSequenceId) || (nextSequenceId ?? 0) < 1) return emptyState();
     const pendingEvents = (parsed.pendingEvents ?? []).flatMap((message) => {
       const result = CompanionWireMessageSchema.safeParse(message);
-      return result.success && result.data.type === "event" && result.data.connectionId === connectionId
+      return result.success &&
+        result.data.type === "event" &&
+        result.data.connectionId === connectionId
         ? [result.data]
         : [];
     });
@@ -88,7 +186,28 @@ function parseState(raw: string | null, connectionId: string): PersistedState {
       const result = CompanionWireMessageSchema.safeParse(message);
       return result.success && result.data.type === "response" ? [result.data] : [];
     });
-    return { nextSequenceId: nextSequenceId as number, pendingEvents, responses };
+    const inFlightMutations = (parsed.inFlightMutations ?? []).flatMap((entry) => {
+      if (
+        entry &&
+        typeof entry === "object" &&
+        typeof (entry as { id?: unknown }).id === "string" &&
+        typeof (entry as { method?: unknown }).method === "string"
+      ) {
+        return [
+          {
+            id: (entry as { id: string }).id,
+            method: (entry as { method: string }).method,
+          },
+        ];
+      }
+      return [];
+    });
+    return {
+      nextSequenceId: nextSequenceId as number,
+      pendingEvents,
+      responses,
+      inFlightMutations,
+    };
   } catch {
     return emptyState();
   }
@@ -101,10 +220,14 @@ export class CompanionBridgeClient {
   readonly #maxPendingEvents: number;
   readonly #maxCachedResponses: number;
   readonly #schedule: (callback: () => void, delayMs: number) => unknown;
+  readonly #pairingSecret: Uint8Array;
   #state: PersistedState;
   #socket: CompanionSocket | undefined;
   #stopped = true;
   #resumed = false;
+  #authenticated = false;
+  #challenge: string | undefined;
+  #receiveQueue: Promise<void> = Promise.resolve();
   readonly #inFlightRequests = new Map<string, Promise<CompanionResponseMessage>>();
 
   constructor(readonly options: CompanionClientOptions) {
@@ -114,6 +237,8 @@ export class CompanionBridgeClient {
     this.#maxPendingEvents = options.maxPendingEvents ?? 500;
     this.#maxCachedResponses = options.maxCachedResponses ?? 500;
     this.#schedule = options.schedule ?? ((callback, delay) => setTimeout(callback, delay));
+    if (!options.hello) throw new Error("companion hello identity is required before connecting");
+    this.#pairingSecret = pairingSecretBytes(options.pairingSecret);
     this.#state = parseState(options.storage.getItem(this.#storageKey), options.connectionId);
   }
 
@@ -128,6 +253,8 @@ export class CompanionBridgeClient {
     this.#socket?.close(1000, "Foundry MCP companion stopped");
     this.#socket = undefined;
     this.#resumed = false;
+    this.#authenticated = false;
+    this.#challenge = undefined;
   }
 
   publish(event: Omit<EventEnvelope, "sequenceId">): EventEnvelope {
@@ -140,7 +267,9 @@ export class CompanionBridgeClient {
     this.#state.nextSequenceId += 1;
     this.#state.pendingEvents.push(message);
     if (this.#state.pendingEvents.length > this.#maxPendingEvents) {
-      throw new Error("event reconciliation window is full; refusing to drop unacknowledged events");
+      throw new Error(
+        "event reconciliation window is full; refusing to drop unacknowledged events",
+      );
     }
     this.#persist();
     if (this.#resumed) this.#send(message);
@@ -152,21 +281,33 @@ export class CompanionBridgeClient {
     const socket = this.options.createSocket(this.#endpoint);
     this.#socket = socket;
     this.#resumed = false;
-    socket.addEventListener("open", () => {
-      // The host sends its durable resume point. Pending events are not sent
-      // until that point is received, preventing reconnect races.
-      if (this.options.hello) socket.send(JSON.stringify(this.options.hello));
+    this.#authenticated = false;
+    this.#challenge = undefined;
+    socket.addEventListener("open", () => undefined);
+    socket.addEventListener("message", (event) => {
+      this.#receiveQueue = this.#receiveQueue
+        .then(() => this.#receive(socket, event.data))
+        .catch(() => {
+          if (this.#socket === socket) socket.close(1011, "companion message handling failed");
+        });
+      return this.#receiveQueue;
     });
-    socket.addEventListener("message", (event) => void this.#receive(event.data));
     socket.addEventListener("close", () => {
-      if (this.#socket === socket) this.#socket = undefined;
-      if (!this.#stopped) {
+      const wasCurrent = this.#socket === socket;
+      if (wasCurrent) {
+        this.#socket = undefined;
+        this.#authenticated = false;
+        this.#resumed = false;
+        this.#challenge = undefined;
+      }
+      if (wasCurrent && !this.#stopped) {
         this.#schedule(() => this.#connect(), this.options.reconnectDelayMs ?? 1_000);
       }
     });
   }
 
-  async #receive(raw: unknown): Promise<void> {
+  async #receive(socket: CompanionSocket, raw: unknown): Promise<void> {
+    if (this.#socket !== socket) return;
     let decoded: unknown;
     try {
       const text = typeof raw === "string" ? raw : String(raw);
@@ -180,13 +321,78 @@ export class CompanionBridgeClient {
       this.#socket?.close(1003, "invalid bridge message");
       return;
     }
+    if (CompanionAuthChallengeMessageSchema.safeParse(parsed.data).success) {
+      if (this.#authenticated) {
+        socket.close(1008, "duplicate companion authentication challenge");
+        return;
+      }
+      const challenge = CompanionAuthChallengeMessageSchema.parse(parsed.data);
+      const hello = this.options.hello;
+      if (!hello) {
+        socket.close(1008, "companion hello identity is unavailable");
+        return;
+      }
+      let proof: CompanionAuthProofMessage;
+      try {
+        proof = {
+          type: "auth.proof",
+          hello,
+          proof: await signCompanionProof(
+            this.#pairingSecret,
+            companionAuthPayload(challenge.challenge, hello),
+          ),
+        };
+      } catch {
+        socket.close(1011, "companion pairing proof is unavailable");
+        return;
+      }
+      this.#challenge = challenge.challenge;
+      if (this.#socket === socket && socket.readyState === 1) socket.send(JSON.stringify(proof));
+      return;
+    }
+    if (CompanionAuthReadyMessageSchema.safeParse(parsed.data).success) {
+      const ready = CompanionAuthReadyMessageSchema.parse(parsed.data);
+      const hello = this.options.hello;
+      const challenge = this.#challenge;
+      if (
+        !hello ||
+        !challenge ||
+        ready.connectionId !== this.options.connectionId ||
+        !fixedStringEqual(
+          ready.proof,
+          await signCompanionProof(
+            this.#pairingSecret,
+            companionAuthReadyPayload(challenge, hello),
+          ),
+        )
+      ) {
+        socket.close(1008, "companion host authentication failed");
+        return;
+      }
+      this.#authenticated = true;
+      this.#challenge = undefined;
+      return;
+    }
     if (EventResumeMessageSchema.safeParse(parsed.data).success) {
       const resume = EventResumeMessageSchema.parse(parsed.data);
+      if (!this.#authenticated) {
+        socket.close(1008, "authenticated companion ready proof required");
+        return;
+      }
       if (resume.connectionId !== this.options.connectionId) return;
+      this.#state.pendingEvents = this.#state.pendingEvents.filter(
+        (event) => event.envelope.sequenceId >= resume.nextSequenceId,
+      );
+      this.#state.nextSequenceId = Math.max(this.#state.nextSequenceId, resume.nextSequenceId);
+      this.#persist();
       this.#resumed = true;
       for (const event of this.#state.pendingEvents) {
         if (event.envelope.sequenceId >= resume.nextSequenceId) this.#send(event);
       }
+      return;
+    }
+    if (!this.#authenticated) {
+      socket.close(1008, "authenticated companion challenge required");
       return;
     }
     if (EventAckMessageSchema.safeParse(parsed.data).success) {
@@ -195,6 +401,7 @@ export class CompanionBridgeClient {
       this.#state.pendingEvents = this.#state.pendingEvents.filter(
         (event) => event.envelope.sequenceId > ack.acknowledgedSequenceId,
       );
+      this.#state.nextSequenceId = Math.max(this.#state.nextSequenceId, ack.nextSequenceId);
       this.#persist();
       return;
     }
@@ -210,6 +417,32 @@ export class CompanionBridgeClient {
       this.#send(await inFlight);
       return;
     }
+    const recoveredMutation = this.#state.inFlightMutations.find(
+      (entry) => entry.id === request.id,
+    );
+    if (recoveredMutation) {
+      const response: CompanionResponseMessage = {
+        type: "response",
+        id: request.id,
+        ok: false,
+        error: {
+          code: "INDETERMINATE_MUTATION",
+          message: `Mutation ${recoveredMutation.method} may have committed before restart; reconcile state before retrying`,
+        },
+      };
+      this.#state.inFlightMutations = this.#state.inFlightMutations.filter(
+        (entry) => entry.id !== request.id,
+      );
+      this.#cacheResponse(response);
+      this.#persist();
+      this.#send(response);
+      return;
+    }
+    const isMutation = MUTATION_METHODS.has(request.method);
+    if (isMutation) {
+      this.#state.inFlightMutations.push({ id: request.id, method: request.method });
+      this.#persist();
+    }
     const execution = this.#executeRequest(request);
     this.#inFlightRequests.set(request.id, execution);
     let response: CompanionResponseMessage;
@@ -218,10 +451,19 @@ export class CompanionBridgeClient {
     } finally {
       this.#inFlightRequests.delete(request.id);
     }
-    this.#state.responses.push(response);
-    this.#state.responses = this.#state.responses.slice(-this.#maxCachedResponses);
+    if (isMutation) {
+      this.#state.inFlightMutations = this.#state.inFlightMutations.filter(
+        (entry) => entry.id !== request.id,
+      );
+    }
+    this.#cacheResponse(response);
     this.#persist();
     this.#send(response);
+  }
+
+  #cacheResponse(response: CompanionResponseMessage): void {
+    this.#state.responses.push(response);
+    this.#state.responses = this.#state.responses.slice(-this.#maxCachedResponses);
   }
 
   async #executeRequest(

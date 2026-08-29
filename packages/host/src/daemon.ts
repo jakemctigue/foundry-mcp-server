@@ -9,10 +9,7 @@ import { startPipeServer, type PipeServerHandle } from "./bridge/pipe-server.js"
 import { resolvePipePath, defaultUserIdentifier } from "./bridge/pipe-path.js";
 import { loadOrCreateBridgeAuthKey } from "./bridge/bridge-auth.js";
 import type Database from "better-sqlite3";
-import {
-  startHostCompanionServer,
-  type HostCompanionServer,
-} from "./bridge/companion-server.js";
+import { startHostCompanionServer, type HostCompanionServer } from "./bridge/companion-server.js";
 import { HostBridgeRouter } from "./bridge/router.js";
 import { createImageProviderRegistry } from "./providers/images.js";
 import { createSecretStorage } from "./secrets/storage.js";
@@ -32,6 +29,8 @@ export interface Daemon {
 export interface StartDaemonOptions {
   cliConfig?: Partial<HostConfig>;
   appDataDir?: string;
+  /** Explicit test/embed override; production loads the DPAPI-protected pairing secret. */
+  companionPairingSecret?: Buffer;
 }
 
 export async function startDaemon(options: StartDaemonOptions = {}): Promise<Daemon> {
@@ -54,10 +53,23 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
       : `${userIdentifier}:${config.pipeName}`;
   const pipePath = resolvePipePath(pipeIdentifier, appDataDir);
   const bridgeAuthKey = await loadOrCreateBridgeAuthKey(appDataDir, logger);
+  const secretStorage = createSecretStorage({
+    dir: path.join(appDataDir, "secrets"),
+    logger,
+    allowDevelopmentFallback:
+      process.env["NODE_ENV"] === "development" || process.env["NODE_ENV"] === "test",
+  });
+  const companionPairingSecret =
+    options.companionPairingSecret ?? (await secretStorage.load("pairing"));
+  if (!companionPairingSecret) {
+    db.close();
+    throw new Error("companion pairing secret is missing; run the pairing workflow first");
+  }
   const companion = await startHostCompanionServer({
     port: config.port,
     allowedOrigins: config.allowedOrigins,
     db,
+    pairingSecret: companionPairingSecret,
     capture: {
       categories: config.eventCategories,
       capturePrivateContent: config.capturePrivateContent,
@@ -65,12 +77,6 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
   });
   const companionEndpoint = companion.address().endpoint;
   let companionClosed = false;
-  const secretStorage = createSecretStorage({
-    dir: path.join(appDataDir, "secrets"),
-    logger,
-    allowDevelopmentFallback:
-      process.env["NODE_ENV"] === "development" || process.env["NODE_ENV"] === "test",
-  });
   const imageProviders = await createImageProviderRegistry({
     secretStorage,
     openAi: { logger },

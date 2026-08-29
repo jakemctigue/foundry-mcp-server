@@ -2,12 +2,7 @@ import { describe, expect, it, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import {
-  connectPipeClient,
-  startDaemon,
-  type Daemon,
-  type PipeClient,
-} from "@foundry-mcp/host";
+import { connectPipeClient, startDaemon, type Daemon, type PipeClient } from "@foundry-mcp/host";
 import { BRIDGE_PROTOCOL_VERSION } from "@foundry-mcp/protocol";
 import {
   connectNegotiatedBridge,
@@ -34,6 +29,7 @@ describe("mcp-adapter <-> real host daemon", () => {
     daemon = await startDaemon({
       appDataDir,
       cliConfig: { dbPath: "test.db", pipeName: "foundry-mcp-daemon-integration" },
+      companionPairingSecret: Buffer.alloc(32, 0x5a),
     });
     expect(daemon.pipe.ready).toBe(true);
 
@@ -58,9 +54,9 @@ describe("mcp-adapter <-> real host daemon", () => {
       throw new Error("bridge authentication/version failure");
     });
 
-    await expect(
-      connectNegotiatedBridge("test-pipe", { connect, negotiate }),
-    ).rejects.toThrow("bridge authentication/version failure");
+    await expect(connectNegotiatedBridge("test-pipe", { connect, negotiate })).rejects.toThrow(
+      "bridge authentication/version failure",
+    );
     expect(connect).toHaveBeenCalledWith("test-pipe");
     expect(close).toHaveBeenCalledOnce();
   });
@@ -104,6 +100,7 @@ describe("mcp-adapter <-> real host daemon", () => {
     daemon = await startDaemon({
       appDataDir,
       cliConfig: { dbPath: "bad-hmac.db", pipeName: path.basename(appDataDir) },
+      companionPairingSecret: Buffer.alloc(32, 0x5a),
     });
     expect(daemon.pipe.ready).toBe(true);
 

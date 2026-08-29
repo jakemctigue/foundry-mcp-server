@@ -131,6 +131,7 @@ export class PermissionDeniedError extends Error {
   }
 }
 export interface AuthorizedOperationOptions extends PolicyRequest {
+  additionalCapabilities?: readonly RequestedCapability[];
   tool: string;
   correlationId: string;
   auditDetails?: unknown;
@@ -143,10 +144,7 @@ function reportAuditFailure(
   error: unknown,
   committed: boolean,
 ): void {
-  options.onAuditFailure?.(
-    error instanceof Error ? error : new Error(String(error)),
-    committed,
-  );
+  options.onAuditFailure?.(error instanceof Error ? error : new Error(String(error)), committed);
 }
 
 function recordAudit(
@@ -183,14 +181,19 @@ export async function runAuthorizedOperation<T>(
   operation: () => T | Promise<T>,
 ): Promise<T> {
   const timestamp = (options.now?.() ?? new Date()).toISOString();
-  const request: PolicyRequest = {
-    connectionId: options.connectionId,
-    foundryUserRole: options.foundryUserRole,
-    requestedCapability: options.requestedCapability,
-  };
-  let decision: PolicyDecision;
+  const capabilities = [
+    options.requestedCapability,
+    ...(options.additionalCapabilities ?? []),
+  ].filter((capability, index, values) => values.indexOf(capability) === index);
+  let decisions: PolicyDecision[];
   try {
-    decision = evaluatePolicy(db, request);
+    decisions = capabilities.map((requestedCapability) =>
+      evaluatePolicy(db, {
+        connectionId: options.connectionId,
+        foundryUserRole: options.foundryUserRole,
+        requestedCapability,
+      }),
+    );
   } catch (error) {
     try {
       recordAudit(db, {
@@ -211,7 +214,10 @@ export async function runAuthorizedOperation<T>(
     throw error;
   }
 
-  if (!decision.allowed) {
+  const denied = decisions.find(
+    (decision): decision is Extract<PolicyDecision, { allowed: false }> => !decision.allowed,
+  );
+  if (denied) {
     try {
       recordAudit(db, {
         timestamp,
@@ -220,12 +226,16 @@ export async function runAuthorizedOperation<T>(
         capability: options.requestedCapability,
         outcome: "denied",
         correlationId: options.correlationId,
-        details: { request: options.auditDetails, reason: decision.reason },
+        details: {
+          request: options.auditDetails,
+          reason: denied.reason,
+          requiredCapabilities: capabilities,
+        },
       });
     } catch (auditError) {
       reportAuditFailure(options, auditError, false);
     }
-    throw new PermissionDeniedError(decision);
+    throw new PermissionDeniedError(denied);
   }
 
   let result: T;

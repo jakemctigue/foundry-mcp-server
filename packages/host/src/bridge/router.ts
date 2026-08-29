@@ -167,9 +167,7 @@ export class HostBridgeRouter {
         maxEvents: input.maxEvents,
         maxBytes: input.maxBytes,
         ...(input.query === undefined ? {} : { query: input.query }),
-        ...(input.afterSequenceId === undefined
-          ? {}
-          : { afterSequenceId: input.afterSequenceId }),
+        ...(input.afterSequenceId === undefined ? {} : { afterSequenceId: input.afterSequenceId }),
         ...(input.afterTimestamp === undefined ? {} : { afterTimestamp: input.afterTimestamp }),
         ...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
         ...(input.worldId === undefined ? {} : { worldId: input.worldId }),
@@ -214,12 +212,18 @@ export class HostBridgeRouter {
     const tool = typeof authorization.tool === "string" ? authorization.tool : `foundry.${method}`;
     const correlationId =
       typeof authorization.correlationId === "string" ? authorization.correlationId : "missing";
+    const assetKind = record(operationParams["asset"])["kind"];
+    const additionalCapabilities: RequestedCapability[] =
+      method === "assets.images.attach" && (assetKind === "upload" || assetKind === "url")
+        ? ["assets:upload"]
+        : [];
     return runAuthorizedOperation(
       this.db,
       {
         connectionId,
         foundryUserRole: connection.foundryUserRole,
         requestedCapability: expectedCapability,
+        ...(additionalCapabilities.length > 0 ? { additionalCapabilities } : {}),
         tool,
         correlationId,
         auditDetails: operationParams,
@@ -228,9 +232,7 @@ export class HostBridgeRouter {
       async () => {
         let companionMethod = method;
         let companionParams = jsonRecord(operationParams);
-        let generation:
-          | { provider: string; model?: string }
-          | undefined;
+        let generation: { provider: string; model?: string } | undefined;
         if (method === "assets.images.attach") {
           const input = AssetsImagesAttachInput.parse(operationParams);
           if (input.asset.kind === "url") {

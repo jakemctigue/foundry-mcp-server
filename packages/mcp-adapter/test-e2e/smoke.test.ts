@@ -37,6 +37,7 @@ describe("end-to-end smoke: adapter boots, lists zero connections", () => {
     daemon = await startDaemon({
       appDataDir,
       cliConfig: { dbPath: "e2e.db", pipeName: "foundry-mcp-e2e-smoke" },
+      companionPairingSecret: Buffer.alloc(32, 0x5a),
     });
     expect(daemon.pipe.ready).toBe(true);
 

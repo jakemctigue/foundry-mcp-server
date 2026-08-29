@@ -2,12 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import {
-  resolveAppDataDir,
-  startDaemon,
-  type Daemon,
-  type PlatformEnv,
-} from "@foundry-mcp/host";
+import { resolveAppDataDir, startDaemon, type Daemon, type PlatformEnv } from "@foundry-mcp/host";
 import {
   parseJSONRPCMessage,
   serializeMessage,
@@ -77,6 +72,7 @@ export class CapturingChildStdioTransport implements Transport {
       this.daemon = await startDaemon({
         appDataDir,
         cliConfig: { dbPath: "child-e2e.db", pipeName },
+        companionPairingSecret: Buffer.alloc(32, 0x5a),
       });
 
       const child = spawn(process.execPath, [this.entry], {

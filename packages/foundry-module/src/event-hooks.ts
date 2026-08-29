@@ -51,8 +51,7 @@ function enabled(category: string, configured: readonly string[]): boolean {
 }
 
 function categoryFor(type: string, operation: string, privateContent: boolean): string {
-  if (type === "JournalEntry" || type === "JournalEntryPage")
-    return `journal.${operation}.${type}`;
+  if (type === "JournalEntry" || type === "JournalEntryPage") return `journal.${operation}.${type}`;
   if (type === "Scene") return `scene.${operation}`;
   if (type === "Combat") return `combat.${operation}`;
   if (type === "ChatMessage") {
@@ -61,13 +60,36 @@ function categoryFor(type: string, operation: string, privateContent: boolean): 
   return `document.${operation}.${type}`;
 }
 
+const OWNERSHIP_RESTRICTED_TYPES = new Set(["Actor", "Item", "JournalEntry", "JournalEntryPage"]);
+const PUBLIC_OBSERVER_PERMISSION = 2;
+
 function privateDocument(type: string, document: unknown): boolean {
   const item = record(document);
   if (type === "ChatMessage") {
     return item.blind === true || (Array.isArray(item.whisper) && item.whisper.length > 0);
   }
   const flags = record(record(item.flags).foundryMcp);
-  return flags.excludeFromIntelligence === true;
+  if (flags.excludeFromIntelligence === true) return true;
+  if (!OWNERSHIP_RESTRICTED_TYPES.has(type)) return false;
+  const parent = record(item.parent);
+  const ownership = record(
+    Object.keys(record(item.ownership)).length > 0 ? item.ownership : parent.ownership,
+  );
+  const defaultPermission = ownership.default;
+  return typeof defaultPermission !== "number" || defaultPermission < PUBLIC_OBSERVER_PERMISSION;
+}
+
+function publicMetadata(type: string, document: unknown, changes: unknown): JsonValue {
+  const item = record(document);
+  const metadata: Record<string, JsonValue> = { documentType: type };
+  for (const key of ["id", "uuid", "name"] as const) {
+    const value = item[key];
+    if (typeof value === "string" && value.length > 0) metadata[key] = value;
+  }
+  return {
+    document: metadata,
+    changedFields: Object.keys(record(changes)).slice(0, 100),
+  };
 }
 
 /** Emits real Foundry hooks through the shared ordered event publisher. */
@@ -80,8 +102,13 @@ export class FoundryEventHooks {
     readonly hooks: FoundryHooksApi,
     readonly options: FoundryEventHookOptions,
   ) {
-    this.#categories =
-      options.categories ?? ["document.*", "journal.*", "scene.*", "combat.*", "chat.*"];
+    this.#categories = options.categories ?? [
+      "document.*",
+      "journal.*",
+      "scene.*",
+      "combat.*",
+      "chat.*",
+    ];
     this.#now = options.now ?? (() => new Date());
     for (const type of [...new Set(options.documentTypes)]) {
       for (const operation of ["create", "update", "delete"] as const) {
@@ -93,7 +120,10 @@ export class FoundryEventHooks {
           if (privateContent && options.capturePrivateContent !== true) return;
           options.publish({
             category,
-            payload: jsonValue({ document, changes }),
+            payload:
+              options.capturePrivateContent === true
+                ? jsonValue({ document, changes })
+                : publicMetadata(type, document, changes),
             emittedAt: this.#now().toISOString(),
             ...(options.worldId ? { worldId: options.worldId } : {}),
             ...(privateContent ? { privateContent: true } : {}),

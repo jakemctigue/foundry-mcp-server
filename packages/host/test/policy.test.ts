@@ -180,6 +180,47 @@ describe("permission policy and mutation audit", () => {
     expect(rows[0]?.details_json).not.toContain("provider-secret");
   });
 
+  it("requires every capability in a compound mutation and still audits exactly once", async () => {
+    const attach = request({ requestedCapability: "assets:attach" });
+    const upload = request({ requestedCapability: "assets:upload" });
+    setCapabilityGrant(db, attach, true);
+    const operation = vi.fn(() => "attached");
+    await expect(
+      runAuthorizedOperation(
+        db,
+        {
+          ...attach,
+          additionalCapabilities: ["assets:upload"],
+          tool: "foundry.assets.images.attach",
+          correlationId: "compound-denied",
+        },
+        operation,
+      ),
+    ).rejects.toMatchObject({ missingCapability: "assets:upload" });
+    expect(operation).not.toHaveBeenCalled();
+    expect(
+      db.prepare("SELECT outcome FROM audit_log WHERE correlation_id = ?").all("compound-denied"),
+    ).toEqual([{ outcome: "denied" }]);
+
+    setCapabilityGrant(db, upload, true);
+    await expect(
+      runAuthorizedOperation(
+        db,
+        {
+          ...attach,
+          additionalCapabilities: ["assets:upload"],
+          tool: "foundry.assets.images.attach",
+          correlationId: "compound-success",
+        },
+        operation,
+      ),
+    ).resolves.toBe("attached");
+    expect(operation).toHaveBeenCalledOnce();
+    expect(
+      db.prepare("SELECT outcome FROM audit_log WHERE correlation_id = ?").all("compound-success"),
+    ).toEqual([{ outcome: "success" }]);
+  });
+
   it("returns a committed side effect when the subsequent success audit degrades", async () => {
     const mutation = request({ requestedCapability: "assets:upload" });
     setCapabilityGrant(db, mutation, true);
@@ -242,9 +283,7 @@ describe("permission policy and mutation audit", () => {
     ).rejects.toThrow("no such table");
     expect(operation).not.toHaveBeenCalled();
     expect(
-      db
-        .prepare("SELECT outcome FROM audit_log WHERE correlation_id = ?")
-        .get("policy-error-1"),
+      db.prepare("SELECT outcome FROM audit_log WHERE correlation_id = ?").get("policy-error-1"),
     ).toEqual({ outcome: "error" });
   });
 });

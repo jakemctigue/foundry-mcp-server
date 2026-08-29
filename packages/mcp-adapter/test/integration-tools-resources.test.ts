@@ -115,6 +115,21 @@ describe("document/intelligence tools and enumerable resources", () => {
           "foundry.intelligence.context",
         ]),
       );
+      const capabilities = await context.client.callTool({
+        name: "foundry.capabilities.get",
+        arguments: {},
+      });
+      const listedCapabilities = (
+        capabilities.structuredContent as {
+          capabilities: Array<{ name: string; readOnly: boolean }>;
+        }
+      ).capabilities;
+      expect(listedCapabilities.find(({ name }) => name === "documents")).toMatchObject({
+        readOnly: false,
+      });
+      expect(listedCapabilities.find(({ name }) => name === "connections")).toMatchObject({
+        readOnly: true,
+      });
       expect(
         (
           await context.client.callTool({

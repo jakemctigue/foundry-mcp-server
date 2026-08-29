@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  BRIDGE_PROTOCOL_VERSION,
   CompanionWireMessageSchema,
   EventEnvelopeSchema,
   IntelligenceChangedSinceInput,
   IntelligenceContextInput,
+  companionAuthPayload,
 } from "../src/index.js";
 
 describe("event and intelligence protocol schemas", () => {
@@ -53,6 +55,42 @@ describe("event and intelligence protocol schemas", () => {
     ).toBe(false);
   });
 
+  it("validates challenge proofs and canonicalizes every asserted hello identity field", () => {
+    const challenge = "A".repeat(43);
+    const hello = {
+      type: "hello" as const,
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      connectionId: "world-a:user-a",
+      worldId: "world-a",
+      worldTitle: "Alpha",
+      foundryVersion: "14.0",
+      foundryUserRole: "GAMEMASTER" as const,
+    };
+    expect(
+      CompanionWireMessageSchema.safeParse({
+        type: "auth.challenge",
+        protocolVersion: BRIDGE_PROTOCOL_VERSION,
+        challenge,
+      }).success,
+    ).toBe(true);
+    expect(
+      CompanionWireMessageSchema.safeParse({
+        type: "auth.proof",
+        hello,
+        proof: "B".repeat(43),
+      }).success,
+    ).toBe(true);
+    expect(
+      CompanionWireMessageSchema.safeParse({
+        type: "auth.ready",
+        connectionId: hello.connectionId,
+        proof: "C".repeat(43),
+      }).success,
+    ).toBe(true);
+    expect(companionAuthPayload(challenge, hello)).toContain("world-a:user-a");
+    expect(() => companionAuthPayload("not-canonical-base64url", hello)).toThrow();
+  });
+
   it("requires exactly one changed-since cursor and bounds context packs", () => {
     expect(
       IntelligenceChangedSinceInput.safeParse({
@@ -60,9 +98,9 @@ describe("event and intelligence protocol schemas", () => {
         afterSequenceId: 0,
       }).success,
     ).toBe(true);
-    expect(
-      IntelligenceChangedSinceInput.safeParse({ connectionId: "world-a" }).success,
-    ).toBe(false);
+    expect(IntelligenceChangedSinceInput.safeParse({ connectionId: "world-a" }).success).toBe(
+      false,
+    );
     expect(
       IntelligenceContextInput.safeParse({ connectionId: "world-a", maxEvents: 101 }).success,
     ).toBe(false);

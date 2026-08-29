@@ -96,7 +96,7 @@ export function createFoundryMcpServer(options: CreateServerOptions): McpServer 
         legacyMcpProtocolVersions: [...LEGACY_MCP_PROTOCOL_VERSIONS],
         bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
         capabilities: [
-          { name: "documents", version: "0.1.0", readOnly: true },
+          { name: "documents", version: "0.1.0", readOnly: false },
           { name: "connections", version: "0.1.0", readOnly: true },
           { name: "assets", version: "0.1.0", readOnly: false },
           { name: "sessions", version: "0.1.0", readOnly: false },

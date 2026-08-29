@@ -1,13 +1,59 @@
+import { createHmac } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
-import { BRIDGE_PROTOCOL_VERSION } from "@foundry-mcp/protocol";
+import {
+  BRIDGE_PROTOCOL_VERSION,
+  companionAuthPayload,
+  companionAuthReadyPayload,
+  type CompanionHelloMessage,
+} from "@foundry-mcp/protocol";
 
 import { connectPipeClient, type PipeClient } from "../src/bridge/pipe-client.js";
 import { startDaemon, type Daemon } from "../src/daemon.js";
 import { setCapabilityGrant } from "../src/security/policy.js";
+
+const PAIRING_SECRET = Buffer.alloc(32, 11);
+
+async function authenticate(socket: WebSocket, hello: CompanionHelloMessage): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let challenge: string | undefined;
+    let ready = false;
+    const onMessage = (data: WebSocket.RawData) => {
+      const message = JSON.parse(data.toString()) as Record<string, unknown>;
+      if (message["type"] === "auth.challenge" && typeof message["challenge"] === "string") {
+        challenge = message["challenge"];
+        socket.send(
+          JSON.stringify({
+            type: "auth.proof",
+            hello,
+            proof: createHmac("sha256", PAIRING_SECRET)
+              .update(companionAuthPayload(challenge, hello), "utf8")
+              .digest("base64url"),
+          }),
+        );
+        return;
+      }
+      if (message["type"] === "auth.ready" && typeof message["proof"] === "string") {
+        expect(message["proof"]).toBe(
+          createHmac("sha256", PAIRING_SECRET)
+            .update(companionAuthReadyPayload(challenge ?? "", hello), "utf8")
+            .digest("base64url"),
+        );
+        ready = true;
+        return;
+      }
+      if (message["type"] === "events.resume" && ready) {
+        socket.off("message", onMessage);
+        resolve();
+      }
+    };
+    socket.on("message", onMessage);
+    socket.once("error", reject);
+  });
+}
 
 describe("daemon to mocked browser companion end-to-end", () => {
   let daemon: Daemon | undefined;
@@ -26,6 +72,7 @@ describe("daemon to mocked browser companion end-to-end", () => {
     appDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "foundry-mcp-daemon-companion-"));
     daemon = await startDaemon({
       appDataDir,
+      companionPairingSecret: PAIRING_SECRET,
       cliConfig: {
         port: 0,
         pipeName: `e2e-${process.pid.toString()}-${Date.now().toString(36)}`,
@@ -55,33 +102,27 @@ describe("daemon to mocked browser companion end-to-end", () => {
                   retryable: false,
                 },
               }
-          : {
-              ok: true,
-              value: {
-                assetPath: "art/hero.png",
-                source: "data",
-                mimeType: "image/png",
-                size: 100,
-                collision: "created",
-              },
-            };
+            : {
+                ok: true,
+                value: {
+                  assetPath: "art/hero.png",
+                  source: "data",
+                  mimeType: "image/png",
+                  size: 100,
+                  collision: "created",
+                },
+              };
       socket?.send(JSON.stringify({ type: "response", id: message.id, ok: true, value }));
     });
-    await new Promise<void>((resolve, reject) => {
-      socket?.once("open", resolve);
-      socket?.once("error", reject);
+    await authenticate(socket, {
+      type: "hello",
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      connectionId: "world-a",
+      worldId: "alpha",
+      worldTitle: "Alpha World",
+      foundryVersion: "13.351",
+      foundryUserRole: "GAMEMASTER",
     });
-    socket.send(
-      JSON.stringify({
-        type: "hello",
-        protocolVersion: BRIDGE_PROTOCOL_VERSION,
-        connectionId: "world-a",
-        worldId: "alpha",
-        worldTitle: "Alpha World",
-        foundryVersion: "13.351",
-        foundryUserRole: "GAMEMASTER",
-      }),
-    );
     await vi.waitFor(() => expect(daemon?.companion.listConnections()).toHaveLength(1));
 
     pipe = await connectPipeClient(daemon.pipePath, { appDataDir });
@@ -256,11 +297,7 @@ describe("daemon to mocked browser companion end-to-end", () => {
       },
     });
     expect(companionRequests).toBe(4);
-    expect(
-      daemon.db
-        .prepare("SELECT outcome, tool, correlation_id FROM audit_log")
-        .all(),
-    ).toEqual([
+    expect(daemon.db.prepare("SELECT outcome, tool, correlation_id FROM audit_log").all()).toEqual([
       {
         outcome: "success",
         tool: "foundry.assets.images.upload",
