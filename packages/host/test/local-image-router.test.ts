@@ -3,12 +3,17 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BRIDGE_PROTOCOL_VERSION, type JsonValue } from "@foundry-mcp/protocol";
+import {
+  BRIDGE_PROTOCOL_VERSION,
+  type ImageGenerationProvider,
+  type JsonValue,
+} from "@foundry-mcp/protocol";
 
 import { createLocalImageLoader, type LocalImageLoader } from "../src/assets/local-file.js";
 import type { HostCompanionServer } from "../src/bridge/companion-server.js";
 import { HostBridgeRouter } from "../src/bridge/router.js";
 import { openDatabase, runMigrations } from "../src/db/index.js";
+import { ImageProviderRegistry } from "../src/providers/images.js";
 import { setCapabilityGrant, type RequestedCapability } from "../src/security/policy.js";
 
 const CONNECTION_ID = "local-assets:gm";
@@ -32,7 +37,10 @@ interface Harness {
   router: HostBridgeRouter;
 }
 
-function createHarness(localImageLoader?: LocalImageLoader): Harness {
+function createHarness(
+  localImageLoader?: LocalImageLoader,
+  imageProviders?: ImageProviderRegistry,
+): Harness {
   const db = openDatabase(":memory:");
   runMigrations(db);
   const request = vi.fn(async (): Promise<JsonValue> => ({
@@ -70,7 +78,14 @@ function createHarness(localImageLoader?: LocalImageLoader): Harness {
   return {
     db,
     request,
-    router: new HostBridgeRouter(db, companion, undefined, undefined, undefined, localImageLoader),
+    router: new HostBridgeRouter(
+      db,
+      companion,
+      imageProviders,
+      undefined,
+      undefined,
+      localImageLoader,
+    ),
   };
 }
 
@@ -89,7 +104,7 @@ function grant(db: Harness["db"], ...capabilities: RequestedCapability[]): void 
 }
 
 function mutation(
-  method: "assets.images.upload" | "assets.images.attach",
+  method: "assets.images.upload" | "assets.images.attach" | "assets.images.generate",
   requestedCapability: "assets:upload" | "assets:attach",
   params: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -139,8 +154,8 @@ describe("host-local image routing", () => {
     return directory;
   }
 
-  function harness(loader?: LocalImageLoader): Harness {
-    const value = createHarness(loader);
+  function harness(loader?: LocalImageLoader, imageProviders?: ImageProviderRegistry): Harness {
+    const value = createHarness(loader, imageProviders);
     databases.push(value.db);
     return value;
   }
@@ -368,6 +383,80 @@ describe("host-local image routing", () => {
     expect(loader).not.toHaveBeenCalled();
     expect(runtime.request).not.toHaveBeenCalled();
     expect(auditJson(runtime.db)).not.toContain("C:/sensitive/image.png");
+  });
+
+  it("requires ai:network before invoking a network image provider", async () => {
+    const generate = vi.fn<ImageGenerationProvider["generate"]>(async () => ({
+      bytes: PNG_BYTES,
+      mimeType: "image/png",
+      model: "network-test-v1",
+    }));
+    const providers = new ImageProviderRegistry().register({
+      id: "network-test",
+      requiresNetwork: true,
+      generate,
+    });
+    const runtime = harness(undefined, providers);
+    grant(runtime.db, "assets:upload");
+
+    const denied = await handleMutation(
+      runtime.router,
+      mutation("assets.images.generate", "assets:upload", {
+        prompt: "Do not send this prompt",
+        provider: "network-test",
+        options: {},
+        sourceId: "data",
+        destinationPath: "art/network.png",
+        onCollision: "error",
+      }),
+    );
+
+    expect(denied.result).toMatchObject({
+      ok: false,
+      error: {
+        code: "PERMISSION_DENIED",
+        details: { missingCapability: "ai:network", connectionId: CONNECTION_ID },
+      },
+    });
+    expect(generate).not.toHaveBeenCalled();
+    expect(runtime.request).not.toHaveBeenCalled();
+
+    grant(runtime.db, "ai:network");
+    const allowed = await handleMutation(
+      runtime.router,
+      mutation("assets.images.generate", "assets:upload", {
+        prompt: "An authorized network prompt",
+        provider: "network-test",
+        options: {},
+        sourceId: "data",
+        destinationPath: "art/network.png",
+        onCollision: "error",
+      }),
+    );
+    expect(allowed.result.ok).toBe(true);
+    expect(generate).toHaveBeenCalledOnce();
+    expect(runtime.request).toHaveBeenCalledOnce();
+  });
+
+  it("keeps deterministic local generation behind assets:upload without ai:network", async () => {
+    const runtime = harness();
+    grant(runtime.db, "assets:upload");
+
+    const response = await handleMutation(
+      runtime.router,
+      mutation("assets.images.generate", "assets:upload", {
+        prompt: "A deterministic local rune",
+        provider: "deterministic",
+        options: {},
+        sourceId: "data",
+        destinationPath: "art/local.png",
+        onCollision: "error",
+      }),
+    );
+
+    expect(response.result.ok).toBe(true);
+    expect(runtime.request).toHaveBeenCalledOnce();
+    expect(runtime.request.mock.calls[0]?.[1]).toBe("assets.images.upload");
   });
 
   it("passes cancellation into a pending local image read", async () => {

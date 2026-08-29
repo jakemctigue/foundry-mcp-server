@@ -1,9 +1,6 @@
 import type Database from "better-sqlite3";
 import { redactSecrets, redactSecretText } from "../security/redaction.js";
-import {
-  runAuthorizedOperation,
-  type FoundryUserRole,
-} from "../security/policy.js";
+import { runAuthorizedOperation, type FoundryUserRole } from "../security/policy.js";
 import type { StoredEvent } from "./event-ledger.js";
 import { getEventsByIds } from "./queries.js";
 
@@ -12,7 +9,15 @@ export interface IntelligenceSummaryProvider {
   model: string;
   summarize(input: {
     connectionId: string;
+    trust: "untrusted-foundry-content";
     events: readonly StoredEvent[];
+    constraints: Readonly<{
+      allowToolCalls: false;
+      allowMutations: false;
+      allowProviderRouting: false;
+      allowCapabilityChanges: false;
+      allowPolicyChanges: false;
+    }>;
   }): Promise<unknown>;
 }
 
@@ -30,6 +35,7 @@ export type SummarizeEventsResult =
       status: "success";
       provenanceId: number;
       suggestion: unknown;
+      suggestionTrust: "untrusted-provider-output";
       sourceEventIds: number[];
     }
   | {
@@ -101,9 +107,28 @@ export async function summarizeEvents(
     async () => {
       const timestamp = now.toISOString();
       try {
-        const events = getEventsByIds(db, options.connectionId, sourceEventIds);
+        const events = Object.freeze(
+          getEventsByIds(db, options.connectionId, sourceEventIds).map((event) =>
+            Object.freeze({
+              ...event,
+              payload: redactSecrets(event.payload),
+            }),
+          ),
+        );
+        const constraints = Object.freeze({
+          allowToolCalls: false as const,
+          allowMutations: false as const,
+          allowProviderRouting: false as const,
+          allowCapabilityChanges: false as const,
+          allowPolicyChanges: false as const,
+        });
         const suggestion = redactSecrets(
-          await options.provider.summarize({ connectionId: options.connectionId, events }),
+          await options.provider.summarize({
+            connectionId: options.connectionId,
+            trust: "untrusted-foundry-content",
+            events,
+            constraints,
+          }),
         );
         const provenanceId = insertProvenance(db, {
           timestamp,
@@ -114,7 +139,13 @@ export async function summarizeEvents(
           status: "success",
           suggestion,
         });
-        return { status: "success", provenanceId, suggestion, sourceEventIds };
+        return {
+          status: "success",
+          provenanceId,
+          suggestion,
+          suggestionTrust: "untrusted-provider-output",
+          sourceEventIds,
+        };
       } catch (error) {
         const message = redactSecretText(error instanceof Error ? error.message : String(error));
         const provenanceId = insertProvenance(db, {

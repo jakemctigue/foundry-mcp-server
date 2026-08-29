@@ -29,7 +29,7 @@ describe("MOCKED FOUNDRY v14 module entry settings", () => {
     await import("../src/module-entry.js");
     callbacks.get("init")?.();
 
-    expect(register).toHaveBeenCalledTimes(2);
+    expect(register).toHaveBeenCalledTimes(3);
     const pairing = register.mock.calls.find((call) => call[1] === "pairingSecret")?.[2] as {
       scope: string;
       config: boolean;
@@ -51,6 +51,24 @@ describe("MOCKED FOUNDRY v14 module entry settings", () => {
         ["aria-label", "Foundry MCP pairing secret"],
       ]),
     );
+    const assetSources = register.mock.calls.find(
+      (call) => call[1] === "assetSourceCapabilities",
+    )?.[2] as {
+      scope: string;
+      config: boolean;
+      requiresReload: boolean;
+      type: unknown;
+      default: string;
+      hint: string;
+    };
+    expect(assetSources).toMatchObject({
+      scope: "world",
+      config: true,
+      requiresReload: true,
+      type: String,
+      default: "{}",
+      hint: expect.stringContaining("Never place credentials"),
+    });
   });
 
   it("hides connection settings and never starts a paired companion for a non-GM", async () => {
@@ -77,13 +95,38 @@ describe("MOCKED FOUNDRY v14 module entry settings", () => {
     await import("../src/module-entry.js");
     callbacks.get("init")?.();
 
-    expect(register).toHaveBeenCalledTimes(2);
-    expect(register.mock.calls.map((call) => call[2]?.config)).toEqual([false, false]);
+    expect(register).toHaveBeenCalledTimes(3);
+    expect(register.mock.calls.map((call) => call[2]?.config)).toEqual([false, false, false]);
     callbacks.get("ready")?.();
     await Promise.resolve();
 
     expect(get).not.toHaveBeenCalled();
     expect(Socket).not.toHaveBeenCalled();
     expect(warn).toHaveBeenCalledWith("Foundry MCP only starts for an authenticated Game Master.");
+  });
+
+  it("ignores an invalid asset-source setting without exposing its contents", async () => {
+    const callbacks = new Map<string, () => void>();
+    const error = vi.fn();
+    const get = vi.fn((_moduleId: string, setting: string) =>
+      setting === "assetSourceCapabilities"
+        ? '{"s3":{"writable":true,"accessKey":"must-not-be-used"}}'
+        : "",
+    );
+    vi.stubGlobal("Hooks", {
+      once: (event: string, callback: () => void) => callbacks.set(event, callback),
+    });
+    vi.stubGlobal("game", {
+      user: { isGM: true },
+      settings: { register: vi.fn(), get },
+    });
+    vi.stubGlobal("ui", { notifications: { error } });
+
+    const moduleEntry = await import("../src/module-entry.js");
+    expect(moduleEntry.configuredAssetSourceCapabilities()).toEqual({});
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining("all non-core sources remain read-only"),
+    );
+    expect(error.mock.calls[0]?.[0]).not.toContain("must-not-be-used");
   });
 });

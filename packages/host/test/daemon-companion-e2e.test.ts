@@ -8,6 +8,7 @@ import {
   BRIDGE_PROTOCOL_VERSION,
   companionAuthPayload,
   companionAuthReadyPayload,
+  companionIdentityConfirmPayload,
   type CompanionHelloMessage,
 } from "@foundry-mcp/protocol";
 
@@ -45,6 +46,21 @@ async function authenticate(socket: WebSocket, hello: CompanionHelloMessage): Pr
             .update(companionAuthReadyPayload(challenge ?? "", origin ?? "", hello), "utf8")
             .digest("base64url"),
         );
+        if (typeof message["identityCredential"] === "string") {
+          const credential = Buffer.from(message["identityCredential"], "base64url");
+          socket.send(
+            JSON.stringify({
+              type: "auth.confirm",
+              connectionId: hello.connectionId,
+              proof: createHmac("sha256", credential)
+                .update(
+                  companionIdentityConfirmPayload(challenge ?? "", origin ?? "", hello),
+                  "utf8",
+                )
+                .digest("base64url"),
+            }),
+          );
+        }
         ready = true;
         return;
       }
@@ -269,6 +285,15 @@ describe("daemon to mocked browser companion end-to-end", () => {
         },
       },
     });
+    setCapabilityGrant(
+      daemon.db,
+      {
+        connectionId: "world-a",
+        foundryUserRole: "GAMEMASTER",
+        requestedCapability: "ai:network",
+      },
+      true,
+    );
     await expect(
       request("unavailable-provider", "mutation.execute", {
         method: "assets.images.generate",

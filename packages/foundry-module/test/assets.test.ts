@@ -91,7 +91,12 @@ describe("FoundryAssetService reference discovery", () => {
       name: "Nested art",
       type: "stormborn",
       img: "tokens/hero.webp?cache=1",
-      system: { portrait: { path: "art/portrait.png" }, notImage: "notes.txt" },
+      system: {
+        portrait: { path: "art/portrait.png" },
+        vector: "art/map.svg#layer-1",
+        nextGeneration: "art/portrait.avif",
+        notImage: "notes.txt",
+      },
     });
     const item = runtime.seedDocument(
       "Item",
@@ -106,7 +111,13 @@ describe("FoundryAssetService reference discovery", () => {
 
     expect(unwrap(await service.referencesFind({ uuids: [actor.uuid] })).references).toEqual([
       { uuid: actor.uuid, jsonPath: "/img", imagePath: "tokens/hero.webp?cache=1" },
+      {
+        uuid: actor.uuid,
+        jsonPath: "/system/nextGeneration",
+        imagePath: "art/portrait.avif",
+      },
       { uuid: actor.uuid, jsonPath: "/system/portrait/path", imagePath: "art/portrait.png" },
+      { uuid: actor.uuid, jsonPath: "/system/vector", imagePath: "art/map.svg#layer-1" },
       { uuid: item.uuid, jsonPath: "/system/cards/0", imagePath: "art/front.jpg" },
       { uuid: item.uuid, jsonPath: "/system/cards/1", imagePath: "art/back.jpeg" },
       {
@@ -145,6 +156,34 @@ describe("FoundryAssetService upload", () => {
     expect(
       await service.upload({ sourceId: "public", destinationPath: "art/file.png", source }),
     ).toMatchObject({ ok: false, error: { code: "PERMISSION_DENIED" } });
+    expect(assets.uploadCalls).toBe(0);
+  });
+
+  it("honors destination-aware writability before decoding or uploading", async () => {
+    const { assets, service } = createService();
+    const preflight = vi
+      .spyOn(assets, "getWriteCapability")
+      .mockImplementation(async (sourceId, destinationPath) =>
+        destinationPath.startsWith("worlds/allowed/")
+          ? { id: sourceId, writable: true }
+          : {
+              id: sourceId,
+              writable: false,
+              reason: "Destination is outside the configured writable world path",
+            },
+      );
+
+    expect(
+      await service.upload({
+        destinationPath: "worlds/denied/token.png",
+        source: uploadSource(VALID_PNG, "image/png"),
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { code: "PERMISSION_DENIED", message: expect.stringContaining("writable world path") },
+    });
+    expect(preflight).toHaveBeenCalledWith("data", "worlds/denied/token.png");
+    expect(assets.decodeCalls).toBe(0);
     expect(assets.uploadCalls).toBe(0);
   });
 

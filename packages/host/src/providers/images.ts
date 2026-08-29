@@ -99,6 +99,7 @@ function deterministicPng(prompt: string): Uint8Array {
 
 export class DeterministicImageProvider implements ImageGenerationProvider {
   readonly id = "deterministic";
+  readonly requiresNetwork = false;
 
   async generate(
     prompt: string,
@@ -191,6 +192,7 @@ function strictBase64(value: string, maxBytes: number): Uint8Array {
 
 export class OpenAiImagesProvider implements ImageGenerationProvider {
   readonly id = "openai";
+  readonly requiresNetwork = true;
   readonly #apiKey: string;
   readonly #model: string;
   readonly #endpoint: string;
@@ -325,6 +327,10 @@ export class ImageProviderRegistry {
       ...[...this.#providers.keys()].map((id) => ({ id, available: true })),
       ...[...this.#unavailable].map(([id, reason]) => ({ id, available: false, reason })),
     ].sort((left, right) => left.id.localeCompare(right.id));
+  }
+
+  requiresNetwork(providerId: string): boolean {
+    return this.#providers.get(providerId)?.requiresNetwork !== false;
   }
 
   async generate(

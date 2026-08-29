@@ -73,7 +73,7 @@ Expected manifest:
 
 ## 3. Pair this Windows user
 
-Pairing creates a 32-byte secret, stores the host copy under current-user DPAPI, and displays a Base32 value once for the module's password field. Preview mode creates no secret.
+Pairing creates a 32-byte secret, stores the host copy under current-user DPAPI, and displays a Base32 value once for the module's password field. Preview mode creates no secret. On the first authenticated bridge connection, the host also enrolls a browser-local, connection-scoped identity credential. Later reconnects must prove that identity before the host will reuse the connection or its grants.
 
 ```powershell
 $AdapterPath = (Resolve-Path -LiteralPath .\packages\mcp-adapter\dist\cli.js).Path
@@ -171,6 +171,8 @@ foundry-mcp capabilities grant --connection-id $ConnectionId --role GAMEMASTER -
 ```
 
 Use the same syntax with `revoke`. Valid roles are `PLAYER`, `TRUSTED`, `ASSISTANT`, and `GAMEMASTER`; the policy layer can still refuse a grant or operation above that role's ceiling. OpenAI generation additionally requires `ai:network`.
+
+Rotating the pairing secret or enrolling a new identity deliberately clears mutation grants for that connection. Re-run only the grants you still intend. If browser storage containing the connection credential is lost, rotate and re-pair instead of weakening identity checks.
 
 ## 8. Optional OpenAI Images provider
 

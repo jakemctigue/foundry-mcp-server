@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 
 import { createFoundryMcpServer } from "../src/server.js";
@@ -11,8 +11,9 @@ const allowMutations: MutationAuthorizer = {
 
 async function setup(
   bridge: BridgeConnection,
+  mutationAuthorizer: MutationAuthorizer = allowMutations,
 ): Promise<{ client: Client; close(): Promise<void> }> {
-  const server = createFoundryMcpServer({ bridge, mutationAuthorizer: allowMutations });
+  const server = createFoundryMcpServer({ bridge, mutationAuthorizer });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "asset-test-client", version: "0.0.1" });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -105,6 +106,74 @@ describe("asset and session MCP tool registration", () => {
           })
         ).structuredContent,
       ).toEqual({ sessions: [] });
+    } finally {
+      await context.close();
+    }
+  });
+
+  it("requires ai:network authorization before forwarding external image generation", async () => {
+    const request = vi.fn(async () => ({
+      assetPath: "generated/token.png",
+      source: "data",
+      mimeType: "image/png",
+      size: 100,
+      collision: "created" as const,
+      provider: "deterministic",
+    }));
+    const bridge: BridgeConnection = {
+      request,
+      close: () => Promise.resolve(),
+    };
+    const authorizations: Parameters<MutationAuthorizer["run"]>[0][] = [];
+    const authorizer: MutationAuthorizer = {
+      run: async (authorization, operation) => {
+        authorizations.push(authorization);
+        if (authorization.additionalCapabilities?.includes("ai:network")) {
+          throw {
+            message: "Permission denied: missing capability ai:network",
+            missingCapability: "ai:network",
+            connectionId: authorization.connectionId,
+          };
+        }
+        return operation();
+      },
+    };
+    const context = await setup(bridge, authorizer);
+    try {
+      const denied = await context.client.callTool({
+        name: "foundry.assets.images.generate",
+        arguments: {
+          connectionId: "world-a",
+          prompt: "A network rune",
+          provider: "openai",
+          destinationPath: "generated/network.png",
+        },
+      });
+      expect(denied.isError).toBe(true);
+      expect(denied.content).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ text: expect.stringContaining("ai:network") }),
+        ]),
+      );
+      expect(request).not.toHaveBeenCalled();
+      expect(authorizations[0]).toMatchObject({
+        requestedCapability: "assets:upload",
+        additionalCapabilities: ["ai:network"],
+      });
+
+      const local = await context.client.callTool({
+        name: "foundry.assets.images.generate",
+        arguments: {
+          connectionId: "world-a",
+          prompt: "A local rune",
+          provider: "deterministic",
+          destinationPath: "generated/local.png",
+        },
+      });
+      expect(local.isError).not.toBe(true);
+      expect(request).toHaveBeenCalledOnce();
+      expect(authorizations[1]).toMatchObject({ requestedCapability: "assets:upload" });
+      expect(authorizations[1]?.additionalCapabilities).toBeUndefined();
     } finally {
       await context.close();
     }

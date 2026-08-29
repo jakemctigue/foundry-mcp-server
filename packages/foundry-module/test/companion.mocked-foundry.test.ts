@@ -67,6 +67,7 @@ class MockSocket implements CompanionSocket {
 }
 
 const PAIRING_SECRET = new Uint8Array(32).fill(7);
+const IDENTITY_CREDENTIAL = Buffer.alloc(32, 9).toString("base64url");
 const AUTH_CHALLENGE = "A".repeat(43);
 const PAGE_ORIGIN = "https://foundry.test";
 
@@ -118,6 +119,7 @@ async function authenticate(socket: MockSocket, connectionId = "world-a"): Promi
     proof: createHmac("sha256", PAIRING_SECRET)
       .update(companionAuthReadyPayload(AUTH_CHALLENGE, PAGE_ORIGIN, hello), "utf8")
       .digest("base64url"),
+    identityCredential: IDENTITY_CREDENTIAL,
   });
   socket.sent.length = 0;
 }
@@ -729,6 +731,7 @@ describe("browser companion (mocked Foundry global)", () => {
       proof: createHmac("sha256", PAIRING_SECRET)
         .update(companionAuthReadyPayload(AUTH_CHALLENGE, PAGE_ORIGIN, hello), "utf8")
         .digest("base64url"),
+      identityCredential: IDENTITY_CREDENTIAL,
     });
     socket.emit("message", {
       type: "events.resume",
@@ -737,7 +740,10 @@ describe("browser companion (mocked Foundry global)", () => {
     });
 
     await vi.waitFor(() =>
-      expect(socket.sent).toMatchObject([{ type: "event", envelope: { sequenceId: 1 } }]),
+      expect(socket.sent).toMatchObject([
+        { type: "auth.confirm", connectionId: "world-a" },
+        { type: "event", envelope: { sequenceId: 1 } },
+      ]),
     );
     expect(socket.readyState).toBe(1);
   });

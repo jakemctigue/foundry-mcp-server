@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   BrowserFoundryAssetRuntime,
+  MAX_ASSET_SOURCE_CAPABILITIES_SETTING_LENGTH,
   MAX_RUNTIME_IMAGE_DIMENSION,
+  parseAssetSourceCapabilitiesSetting,
   type RuntimeImageDecodeLimits,
 } from "../src/asset-runtime.js";
 import { VALID_PNG } from "./fake-runtime/assets.js";
@@ -109,5 +111,162 @@ describe("BrowserFoundryAssetRuntime safe image decoding", () => {
       }),
     ).rejects.toThrow(/could not be decoded safely/);
     expect(closeHardLimit).toHaveBeenCalledOnce();
+  });
+});
+
+describe("BrowserFoundryAssetRuntime destination writability", () => {
+  function foundryGlobal() {
+    class FilePicker {
+      static S3_BUCKETS = ["campaign-bucket"];
+      static browse = vi.fn(async () => ({ dirs: [], files: [] }));
+      static upload = vi.fn(async () => ({ path: "stored.png" }));
+      sources = { data: {}, public: {}, s3: {} };
+    }
+    return {
+      FilePicker,
+      game: { ready: true, user: { isGM: true } },
+    };
+  }
+
+  it("probes a data destination and fails closed for unconfigured providers", async () => {
+    const global = foundryGlobal();
+    const runtime = new BrowserFoundryAssetRuntime({ global });
+
+    await expect(
+      runtime.getWriteCapability("data", "worlds/campaign/art/token.png"),
+    ).resolves.toEqual({ id: "data", writable: true });
+    await expect(runtime.getWriteCapability("public", "icons/token.svg")).resolves.toMatchObject({
+      writable: false,
+      reason: expect.stringContaining("read-only"),
+    });
+    await expect(runtime.getWriteCapability("s3", "art/token.png")).resolves.toMatchObject({
+      writable: false,
+      reason: expect.stringContaining("explicit provider"),
+    });
+  });
+
+  it("binds an explicitly configured provider to its bucket and writable path prefixes", async () => {
+    const global = foundryGlobal();
+    const runtime = new BrowserFoundryAssetRuntime({
+      global,
+      sourceCapabilities: {
+        s3: {
+          writable: true,
+          bucket: "campaign-bucket",
+          writablePathPrefixes: ["campaign/art"],
+        },
+      },
+    });
+
+    await expect(runtime.getWriteCapability("s3", "other/token.png")).resolves.toMatchObject({
+      writable: false,
+      reason: expect.stringContaining("outside"),
+    });
+    await expect(runtime.getWriteCapability("s3", "campaign/art/token.png")).resolves.toEqual({
+      id: "s3",
+      writable: true,
+    });
+    expect(global.FilePicker.browse).toHaveBeenCalledWith("s3", "campaign/art", {
+      bucket: "campaign-bucket",
+    });
+  });
+
+  it("fails closed when programmatic non-core configuration omits its path bound", async () => {
+    const global = foundryGlobal();
+    const runtime = new BrowserFoundryAssetRuntime({
+      global,
+      sourceCapabilities: {
+        s3: { writable: true, bucket: "campaign-bucket" },
+      },
+    });
+
+    await expect(runtime.listSources()).resolves.toContainEqual({
+      id: "s3",
+      writable: false,
+      reason: expect.stringContaining("writable path"),
+    });
+    await expect(runtime.getWriteCapability("s3", "campaign/art/token.png")).resolves.toEqual({
+      id: "s3",
+      writable: false,
+      reason: expect.stringContaining("writable path"),
+    });
+    expect(global.FilePicker.browse).not.toHaveBeenCalled();
+  });
+
+  it("does not claim a destination whose directory probe fails", async () => {
+    const global = foundryGlobal();
+    global.FilePicker.browse.mockRejectedValueOnce(new Error("not found"));
+    const runtime = new BrowserFoundryAssetRuntime({ global });
+
+    await expect(runtime.getWriteCapability("data", "missing/token.png")).resolves.toMatchObject({
+      writable: false,
+      reason: expect.stringContaining("could not be accessed"),
+    });
+  });
+});
+
+describe("Foundry module asset-source capability setting", () => {
+  it("accepts only bounded non-core capabilities and normalizes their values", () => {
+    const parsed = parseAssetSourceCapabilitiesSetting(`{
+      "s3": {
+        "writable": true,
+        "bucket": "campaign-bucket",
+        "writablePathPrefixes": [" campaign/art ", "campaign/art"]
+      },
+      "forge": {
+        "writable": false,
+        "reason": "Managed by the hosting provider"
+      }
+    }`);
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error(parsed.error);
+    expect({ ...parsed.value }).toEqual({
+      s3: {
+        writable: true,
+        bucket: "campaign-bucket",
+        writablePathPrefixes: ["campaign/art"],
+      },
+      forge: {
+        writable: false,
+        reason: "Managed by the hosting provider",
+      },
+    });
+  });
+
+  it("rejects credentials, core overrides, traversal, and incomplete writable providers", () => {
+    for (const [raw, error] of [
+      [
+        '{"s3":{"writable":true,"bucket":"campaign","writablePathPrefixes":["art"],"accessKey":"not-accepted"}}',
+        "credentials are not accepted",
+      ],
+      ['{"data":{"writable":false}}', "not allowed"],
+      [
+        '{"forge":{"writable":true,"writablePathPrefixes":["../outside"]}}',
+        "invalid relative Foundry path",
+      ],
+      ['{"forge":{"writable":true}}', "must authorize at least one path"],
+      ['{"s3":{"writable":false}}', "s3.bucket is required"],
+    ] as const) {
+      expect(parseAssetSourceCapabilitiesSetting(raw)).toEqual({
+        ok: false,
+        error: expect.stringContaining(error),
+      });
+    }
+  });
+
+  it("bounds the full JSON document and number of configured sources", () => {
+    expect(
+      parseAssetSourceCapabilitiesSetting(
+        "x".repeat(MAX_ASSET_SOURCE_CAPABILITIES_SETTING_LENGTH + 1),
+      ),
+    ).toEqual({ ok: false, error: expect.stringContaining("exceeds") });
+    const tooManySources = Object.fromEntries(
+      Array.from({ length: 17 }, (_, index) => [`source-${index}`, { writable: false }]),
+    );
+    expect(parseAssetSourceCapabilitiesSetting(JSON.stringify(tooManySources))).toEqual({
+      ok: false,
+      error: expect.stringContaining("more than 16"),
+    });
   });
 });

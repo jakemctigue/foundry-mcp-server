@@ -357,7 +357,8 @@ export class FoundrySessionService {
     const result = created.value.results[0];
     if (!result || result.status !== "created") {
       return failure(
-        result?.error ?? makeError("FOUNDRY_ERROR", "Foundry did not create the session journal"),
+        (result?.status === "error" ? result.error : undefined) ??
+          makeError("FOUNDRY_ERROR", "Foundry did not create the session journal"),
       );
     }
     const finalMetadata = { ...metadata, journalUuid: result.document.uuid };
@@ -471,7 +472,8 @@ export class FoundrySessionService {
     const result = created.value.results[0];
     if (!result || result.status !== "created")
       return failure(
-        result?.error ?? makeError("FOUNDRY_ERROR", "Foundry did not create the session page"),
+        (result?.status === "error" ? result.error : undefined) ??
+          makeError("FOUNDRY_ERROR", "Foundry did not create the session page"),
       );
     const finalPage = { ...pageMetadata, uuid: result.document.uuid };
     const pageUpdated = await this.documents.update(
@@ -869,7 +871,8 @@ export class FoundrySessionService {
     const result = created.value.results[0];
     if (!result || result.status !== "created")
       return failure(
-        result?.error ?? makeError("FOUNDRY_ERROR", "Foundry did not create the session folder"),
+        (result?.status === "error" ? result.error : undefined) ??
+          makeError("FOUNDRY_ERROR", "Foundry did not create the session folder"),
       );
     return { ok: true, value: { uuid: result.document.uuid } };
   }
@@ -959,7 +962,7 @@ export class FoundrySessionService {
     const result = created.value.results[0];
     if (!result || result.status !== "created")
       return failure(
-        result?.error ??
+        (result?.status === "error" ? result.error : undefined) ??
           makeError("FOUNDRY_ERROR", "Foundry did not create the initial session page"),
       );
     const page: SessionPage = { ...pendingPage, uuid: result.document.uuid };

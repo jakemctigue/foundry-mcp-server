@@ -57,6 +57,7 @@ describe("SQLite init and migrations", () => {
     expect(tables).toContain("reconciliation_jobs");
     expect(tables).toContain("reconciliation_tasks");
     expect(tables).toContain("intelligence_retention_state");
+    expect(tables).toContain("companion_identities");
 
     const eventColumns = db
       .prepare("PRAGMA table_info(events)")
@@ -124,7 +125,7 @@ describe("SQLite init and migrations", () => {
       '{"name":"Old note"}',
     );
 
-    expect(runMigrations(db).applied).toEqual([2, 3, 4, 5, 6]);
+    expect(runMigrations(db).applied).toEqual([2, 3, 4, 5, 6, 7]);
     const row = db
       .prepare(
         `SELECT connection_id, sequence_id, category, payload, received_at, search_text

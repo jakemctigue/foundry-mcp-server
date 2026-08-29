@@ -49,6 +49,7 @@ function documentView(input: {
   packId?: string;
   ownership?: number;
   private?: boolean;
+  excludeFromIntelligence?: boolean;
 }): DocumentView {
   return {
     id: input.uuid.split(".").at(-1) ?? input.uuid,
@@ -65,8 +66,11 @@ function documentView(input: {
       marker: input.marker,
       ...(input.subtype ? { type: input.subtype } : {}),
       ...(input.private ? { private: true, password: "must-not-be-indexed" } : {}),
+      ...(input.excludeFromIntelligence
+        ? { flags: { foundryMcp: { excludeFromIntelligence: true } } }
+        : {}),
     },
-    ownershipSummary: { default: input.ownership ?? 1 },
+    ownershipSummary: { default: input.ownership ?? 2 },
     schemaVersion: "14",
   };
 }
@@ -117,6 +121,14 @@ class FakeReconciliationBridge implements ReconciliationBridge {
       marker: "private-journal",
       ownership: 0,
       private: true,
+    }),
+    documentView({
+      uuid: "JournalEntry.excluded",
+      type: "JournalEntry",
+      name: "Explicitly Excluded Notes",
+      marker: "flagged-private-must-not-leak",
+      ownership: 2,
+      excludeFromIntelligence: true,
     }),
   ];
   readonly embedded = [
@@ -270,6 +282,13 @@ describe("background intelligence reconciliation", () => {
 
   it("indexes pre-pair world, dynamic subtype, embedded, and compendium state without private leaks", async () => {
     const bridge = new FakeReconciliationBridge();
+    const hero = bridge.roots.find(({ uuid }) => uuid === "Actor.hero");
+    if (!hero) throw new Error("missing fake hero");
+    hero.data = {
+      ...hero.data,
+      biography:
+        '<p>Visible history</p><section class="secret"><p>hidden-ritual</p></section><p>Visible ending</p>',
+    };
     const status = await new IntelligenceReconciler(db, bridge).reconcile(CONNECTION_ID, "initial");
 
     expect(status.lastError).toBeUndefined();
@@ -290,7 +309,7 @@ describe("background intelligence reconciliation", () => {
       gap: false,
       truncated: false,
       indexedObjects: 6,
-      privateFilteredObjects: 1,
+      privateFilteredObjects: 2,
     });
     expect(
       bridge.calls.some(
@@ -310,6 +329,18 @@ describe("background intelligence reconciliation", () => {
     expect(
       searchIntelligence(db, { connectionId: CONNECTION_ID, query: "private-journal" }),
     ).toEqual([]);
+    expect(
+      searchIntelligence(db, {
+        connectionId: CONNECTION_ID,
+        query: "flagged-private-must-not-leak",
+      }),
+    ).toEqual([]);
+    expect(searchIntelligence(db, { connectionId: CONNECTION_ID, query: "hidden-ritual" })).toEqual(
+      [],
+    );
+    expect(
+      searchIntelligence(db, { connectionId: CONNECTION_ID, query: "Visible history" }).length,
+    ).toBeGreaterThan(0);
     expect(
       searchIntelligence(db, {
         connectionId: CONNECTION_ID,

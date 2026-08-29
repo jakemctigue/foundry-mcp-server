@@ -1,4 +1,8 @@
-import { BrowserFoundryAssetRuntime } from "./asset-runtime.js";
+import {
+  BrowserFoundryAssetRuntime,
+  parseAssetSourceCapabilitiesSetting,
+  type BrowserFoundryAssetSourceCapabilities,
+} from "./asset-runtime.js";
 import { FoundryAssetService } from "./assets.js";
 import type {
   ActiveFoundryModule,
@@ -22,6 +26,7 @@ import { FoundrySessionService } from "./sessions.js";
 const MODULE_ID = "foundry-mcp";
 const ENDPOINT_SETTING = "bridgeEndpoint";
 const PAIRING_SECRET_SETTING = "pairingSecret";
+const ASSET_SOURCE_CAPABILITIES_SETTING = "assetSourceCapabilities";
 const MODULE_CAPABILITIES = [
   "documents.read",
   "documents.write",
@@ -144,6 +149,15 @@ function registerSettings(): void {
     input: passwordSettingInput,
     default: "",
   });
+  register.call(settings, MODULE_ID, ASSET_SOURCE_CAPABILITIES_SETTING, {
+    name: "Foundry MCP non-core asset sources",
+    hint: "Strict JSON keyed by FilePicker source ID. Configure writable, optional bucket, writablePathPrefixes, and reason only. Never place credentials, tokens, keys, or endpoint URLs here.",
+    scope: "world",
+    config: visibleToCurrentUser,
+    requiresReload: true,
+    type: String,
+    default: "{}",
+  });
 }
 
 function configuredEndpoint(): string {
@@ -160,6 +174,22 @@ function configuredPairingSecret(): string {
   return typeof get === "function"
     ? stringValue(get.call(settings, MODULE_ID, PAIRING_SECRET_SETTING), "")
     : "";
+}
+
+export function configuredAssetSourceCapabilities(): BrowserFoundryAssetSourceCapabilities {
+  const settings = record(record(record(globalThis).game).settings);
+  const get = settings.get;
+  const raw =
+    typeof get === "function"
+      ? get.call(settings, MODULE_ID, ASSET_SOURCE_CAPABILITIES_SETTING)
+      : "{}";
+  const parsed = parseAssetSourceCapabilitiesSetting(raw);
+  if (parsed.ok) return parsed.value;
+  notify(
+    "error",
+    `Foundry MCP ignored the non-core asset-source setting; all non-core sources remain read-only: ${parsed.error}`,
+  );
+  return {};
 }
 
 async function startCompanion(): Promise<void> {
@@ -185,7 +215,10 @@ async function startCompanion(): Promise<void> {
   const runtime = new BrowserFoundryRuntime(globals);
   const documents = new FoundryDocumentService(runtime);
   const assets = new FoundryAssetService(
-    new BrowserFoundryAssetRuntime(globals),
+    new BrowserFoundryAssetRuntime({
+      global: globals,
+      sourceCapabilities: configuredAssetSourceCapabilities(),
+    }),
     documents,
     runtime,
   );

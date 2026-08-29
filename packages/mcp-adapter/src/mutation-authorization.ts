@@ -3,6 +3,7 @@ import type { RequestedCapability } from "@foundry-mcp/protocol";
 export interface MutationAuthorizationRequest {
   connectionId: string;
   requestedCapability: Exclude<RequestedCapability, "read">;
+  additionalCapabilities?: readonly Exclude<RequestedCapability, "read">[];
   tool: string;
   correlationId: string;
   auditDetails?: unknown;
@@ -18,6 +19,7 @@ export function mutationContext(
   args: Record<string, unknown>,
   requestedCapability: MutationAuthorizationRequest["requestedCapability"],
   correlationId?: string,
+  additionalCapabilities: readonly Exclude<RequestedCapability, "read">[] = [],
 ): MutationAuthorizationRequest | undefined {
   const connectionId = args["connectionId"];
   if (typeof connectionId !== "string" || connectionId.length === 0) return undefined;
@@ -25,6 +27,7 @@ export function mutationContext(
   return {
     connectionId,
     requestedCapability,
+    ...(additionalCapabilities.length > 0 ? { additionalCapabilities } : {}),
     tool,
     correlationId:
       correlationId ?? `mcp-${Date.now().toString(36)}-${correlationCounter.toString(36)}`,

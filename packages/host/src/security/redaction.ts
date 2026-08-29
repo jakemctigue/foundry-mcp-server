@@ -1,5 +1,6 @@
 const REDACTED = "[REDACTED]";
 const TRUNCATED = "[TRUNCATED]";
+const REDACTED_FOUNDRY_SECRET = "[REDACTED FOUNDRY SECRET]";
 
 const SECRET_KEYS = new Set([
   "apikey",
@@ -41,8 +42,44 @@ export function isSecretField(key: string): boolean {
   );
 }
 
+/**
+ * Removes Foundry's native HTML secret blocks before text can enter search,
+ * context packs, or a provider request. Malformed/unclosed secret blocks are
+ * redacted through the end of the string (fail closed).
+ */
+export function redactFoundrySecretBlocks(value: string): string {
+  const openingTag = /<([a-z][\w:-]*)\b[^>]*>/gi;
+  let cursor = 0;
+  let output = "";
+  for (let match = openingTag.exec(value); match; match = openingTag.exec(value)) {
+    const tag = match[1];
+    if (!tag) continue;
+    const classAttribute = match[0].match(/\bclass\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
+    const classes = (classAttribute?.[1] ?? classAttribute?.[2] ?? "").split(/\s+/).filter(Boolean);
+    if (!classes.includes("secret")) continue;
+
+    output += value.slice(cursor, match.index);
+    const tagToken = new RegExp(`<\\/?${tag}\\b[^>]*>`, "gi");
+    tagToken.lastIndex = openingTag.lastIndex;
+    let depth = 1;
+    let end = value.length;
+    for (let token = tagToken.exec(value); token; token = tagToken.exec(value)) {
+      if (/^<\//.test(token[0])) depth -= 1;
+      else if (!/\/>$/.test(token[0])) depth += 1;
+      if (depth === 0) {
+        end = tagToken.lastIndex;
+        break;
+      }
+    }
+    output += REDACTED_FOUNDRY_SECRET;
+    cursor = end;
+    openingTag.lastIndex = end;
+  }
+  return cursor === 0 ? value : output + value.slice(cursor);
+}
+
 export function redactSecretText(value: string): string {
-  return value
+  return redactFoundrySecretBlocks(value)
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/gi, `Bearer ${REDACTED}`)
     .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, REDACTED)
     .replace(
@@ -64,17 +101,17 @@ export function redactSecrets(value: unknown, options: RedactionOptions = {}): u
     if (typeof current === "string") {
       return redactSecretText(current);
     }
-    if (
-      current === null ||
-      typeof current === "number" ||
-      typeof current === "boolean"
-    ) {
+    if (current === null || typeof current === "number" || typeof current === "boolean") {
       return current;
     }
     if (typeof current === "bigint") {
       return current.toString();
     }
-    if (typeof current === "undefined" || typeof current === "function" || typeof current === "symbol") {
+    if (
+      typeof current === "undefined" ||
+      typeof current === "function" ||
+      typeof current === "symbol"
+    ) {
       return null;
     }
     if (depth >= maxDepth) {

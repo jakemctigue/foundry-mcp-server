@@ -201,4 +201,26 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    id: 7,
+    name: "companion-identity-bindings",
+    sql: `
+      CREATE TABLE IF NOT EXISTS companion_identities (
+        connection_id TEXT PRIMARY KEY,
+        world_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        foundry_user_role TEXT NOT NULL CHECK (
+          foundry_user_role IN ('PLAYER', 'TRUSTED', 'ASSISTANT', 'GAMEMASTER')
+        ),
+        pairing_key_id TEXT NOT NULL,
+        credential_ciphertext TEXT NOT NULL,
+        confirmed INTEGER NOT NULL DEFAULT 0 CHECK (confirmed IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (world_id, user_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_companion_identities_world_user
+        ON companion_identities (world_id, user_id);
+    `,
+  },
 ];

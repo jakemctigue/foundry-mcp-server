@@ -5,6 +5,8 @@ import {
   BRIDGE_PROTOCOL_VERSION,
   companionAuthPayload,
   companionAuthReadyPayload,
+  companionIdentityAuthPayload,
+  companionIdentityConfirmPayload,
   type CompanionHelloMessage,
 } from "@foundry-mcp/protocol";
 
@@ -18,6 +20,7 @@ import { openDatabase, runMigrations } from "../src/db/index.js";
 import { setCapabilityGrant } from "../src/security/policy.js";
 
 const PAIRING_SECRET = Buffer.alloc(32, 7);
+const identityCredentials = new Map<string, Buffer>();
 
 function hello(connectionId: string): CompanionHelloMessage {
   return {
@@ -61,6 +64,19 @@ async function authenticate(socket: WebSocket, identity: CompanionHelloMessage):
             proof: createHmac("sha256", PAIRING_SECRET)
               .update(companionAuthPayload(message["challenge"], origin, identity), "utf8")
               .digest("base64url"),
+            ...(identityCredentials.has(identity.connectionId)
+              ? {
+                  identityProof: createHmac(
+                    "sha256",
+                    identityCredentials.get(identity.connectionId) as Buffer,
+                  )
+                    .update(
+                      companionIdentityAuthPayload(message["challenge"], origin, identity),
+                      "utf8",
+                    )
+                    .digest("base64url"),
+                }
+              : {}),
           }),
         );
         return;
@@ -72,12 +88,72 @@ async function authenticate(socket: WebSocket, identity: CompanionHelloMessage):
             .update(companionAuthReadyPayload(challenge ?? "", origin ?? "", identity), "utf8")
             .digest("base64url"),
         );
+        if (typeof message["identityCredential"] === "string") {
+          const credential = Buffer.from(message["identityCredential"], "base64url");
+          identityCredentials.set(identity.connectionId, credential);
+          socket.send(
+            JSON.stringify({
+              type: "auth.confirm",
+              connectionId: identity.connectionId,
+              proof: createHmac("sha256", credential)
+                .update(
+                  companionIdentityConfirmPayload(challenge ?? "", origin ?? "", identity),
+                  "utf8",
+                )
+                .digest("base64url"),
+            }),
+          );
+        } else {
+          expect(identityCredentials.has(identity.connectionId)).toBe(true);
+        }
         ready = true;
         return;
       }
       if (message["type"] === "events.resume" && ready) {
         socket.off("message", onMessage);
         resolve();
+      }
+    };
+    socket.on("message", onMessage);
+    socket.once("error", reject);
+  });
+}
+
+async function receiveUnconfirmedCredential(
+  socket: WebSocket,
+  identity: CompanionHelloMessage,
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    let challenge = "";
+    let origin = "";
+    const onMessage = (data: WebSocket.RawData) => {
+      const message = JSON.parse(data.toString()) as Record<string, unknown>;
+      if (message["type"] === "auth.challenge" && typeof message["challenge"] === "string") {
+        challenge = message["challenge"];
+        origin = message["origin"] as string;
+        socket.send(
+          JSON.stringify({
+            type: "auth.proof",
+            hello: identity,
+            proof: createHmac("sha256", PAIRING_SECRET)
+              .update(companionAuthPayload(challenge, origin, identity), "utf8")
+              .digest("base64url"),
+          }),
+        );
+        return;
+      }
+      if (
+        message["type"] === "auth.ready" &&
+        typeof message["proof"] === "string" &&
+        typeof message["identityCredential"] === "string"
+      ) {
+        expect(message["proof"]).toBe(
+          createHmac("sha256", PAIRING_SECRET)
+            .update(companionAuthReadyPayload(challenge, origin, identity), "utf8")
+            .digest("base64url"),
+        );
+        socket.off("message", onMessage);
+        resolve(message["identityCredential"]);
       }
     };
     socket.on("message", onMessage);
@@ -962,6 +1038,222 @@ describe("real browser companion host (mocked Foundry WebSocket)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("marks an offline mutation as indeterminate after reconnect dispatch and no cancel ack", async () => {
+    const db = openDatabase(":memory:");
+    runMigrations(db);
+    cleanups.push(() => {
+      db.close();
+    });
+    const server = await startHostCompanionServer({
+      db,
+      allowedOrigins: ["http://foundry.test"],
+      requestTimeoutMs: 60_000,
+      pairingSecret: PAIRING_SECRET,
+    });
+    cleanups.push(server.close);
+    const controller = new AbortController();
+
+    vi.useFakeTimers();
+    try {
+      const mutation = server.request(
+        "world-reconnect",
+        "documents.create",
+        { documentType: "Actor", data: { name: "Possibly created" } },
+        "offline-reconnect-mutation",
+        { signal: controller.signal, correlationId: "offline-reconnect-mutation" },
+      );
+      const socket = new WebSocket(server.address().endpoint, { origin: "http://foundry.test" });
+      cleanups.push(() => socket.terminate());
+      const received = waitForRequest(socket);
+      await authenticate(socket, hello("world-reconnect"));
+      await received;
+      controller.abort();
+      const rejection = expect(mutation).rejects.toMatchObject({
+        envelope: {
+          code: "INDETERMINATE_MUTATION",
+          retryable: false,
+          details: { indeterminate: true, reconciliationRequired: true },
+        },
+      });
+      await vi.advanceTimersByTimeAsync(1_001);
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reissues a pending identity credential after lost auth.ready and confirms without grants", async () => {
+    const db = openDatabase(":memory:");
+    runMigrations(db);
+    cleanups.push(() => {
+      db.close();
+    });
+    const server = await startHostCompanionServer({
+      db,
+      allowedOrigins: ["http://foundry.test"],
+      pairingSecret: PAIRING_SECRET,
+    });
+    cleanups.push(server.close);
+    const identity = hello("pending-enrollment-world");
+    identityCredentials.delete(identity.connectionId);
+    setCapabilityGrant(
+      db,
+      {
+        connectionId: identity.connectionId,
+        foundryUserRole: "GAMEMASTER",
+        requestedCapability: "documents:create",
+      },
+      true,
+    );
+
+    const first = new WebSocket(server.address().endpoint, { origin: "http://foundry.test" });
+    cleanups.push(() => first.terminate());
+    const firstCredential = await receiveUnconfirmedCredential(first, identity);
+    expect(server.listConnections()).toEqual([]);
+    expect(
+      db
+        .prepare("SELECT confirmed FROM companion_identities WHERE connection_id = ?")
+        .get(identity.connectionId),
+    ).toEqual({ confirmed: 0 });
+    setCapabilityGrant(
+      db,
+      {
+        connectionId: identity.connectionId,
+        foundryUserRole: "GAMEMASTER",
+        requestedCapability: "documents:create",
+      },
+      true,
+    );
+    const firstClosed = waitForClose(first);
+    first.terminate();
+    await firstClosed;
+
+    const second = new WebSocket(server.address().endpoint, { origin: "http://foundry.test" });
+    cleanups.push(() => second.terminate());
+    await authenticate(second, identity);
+    expect(identityCredentials.get(identity.connectionId)?.toString("base64url")).toBe(
+      firstCredential,
+    );
+    expect(
+      db
+        .prepare("SELECT confirmed FROM companion_identities WHERE connection_id = ?")
+        .get(identity.connectionId),
+    ).toEqual({ confirmed: 1 });
+    expect(
+      db
+        .prepare("SELECT allowed FROM capability_grants WHERE connection_id = ?")
+        .all(identity.connectionId),
+    ).toEqual([]);
+    expect(server.listConnections()).toMatchObject([
+      { connectionId: identity.connectionId, worldId: identity.worldId },
+    ]);
+  });
+
+  it("rejects a paired client impersonating a bound connection without inheriting its grant", async () => {
+    const db = openDatabase(":memory:");
+    runMigrations(db);
+    cleanups.push(() => {
+      db.close();
+    });
+    const server = await startHostCompanionServer({
+      db,
+      allowedOrigins: ["http://foundry.test"],
+      pairingSecret: PAIRING_SECRET,
+    });
+    cleanups.push(server.close);
+    const legitimateIdentity = hello("bound-world");
+    const legitimate = new WebSocket(server.address().endpoint, { origin: "http://foundry.test" });
+    cleanups.push(() => legitimate.terminate());
+    await authenticate(legitimate, legitimateIdentity);
+    setCapabilityGrant(
+      db,
+      {
+        connectionId: legitimateIdentity.connectionId,
+        foundryUserRole: "GAMEMASTER",
+        requestedCapability: "documents:create",
+      },
+      true,
+    );
+
+    const forgedIdentity: CompanionHelloMessage = {
+      ...legitimateIdentity,
+      worldId: "forged-world",
+      currentUser: { id: "forged-gm", name: "Forged GM", role: "GAMEMASTER" },
+    };
+    const attacker = new WebSocket(server.address().endpoint, { origin: "http://foundry.test" });
+    cleanups.push(() => attacker.terminate());
+    const closed = waitForClose(attacker);
+    attacker.on("message", (data) => {
+      const challenge = JSON.parse(data.toString()) as Record<string, unknown>;
+      if (challenge["type"] !== "auth.challenge") return;
+      attacker.send(
+        JSON.stringify({
+          type: "auth.proof",
+          hello: forgedIdentity,
+          proof: createHmac("sha256", PAIRING_SECRET)
+            .update(
+              companionAuthPayload(
+                challenge["challenge"] as string,
+                challenge["origin"] as string,
+                forgedIdentity,
+              ),
+              "utf8",
+            )
+            .digest("base64url"),
+        }),
+      );
+    });
+    await expect(closed).resolves.toMatchObject({ code: 1008 });
+    expect(server.listConnections()).toMatchObject([
+      { connectionId: "bound-world", worldId: "bound-world", currentUser: { id: "gm-a" } },
+    ]);
+    expect(
+      db
+        .prepare("SELECT allowed FROM capability_grants WHERE connection_id = ? AND capability = ?")
+        .get("bound-world", "documents:create"),
+    ).toEqual({ allowed: 1 });
+  });
+
+  it("marks a dispatched mutation indeterminate when the companion server shuts down", async () => {
+    const db = openDatabase(":memory:");
+    runMigrations(db);
+    cleanups.push(() => {
+      db.close();
+    });
+    const server = await startHostCompanionServer({
+      db,
+      allowedOrigins: ["http://foundry.test"],
+      pairingSecret: PAIRING_SECRET,
+    });
+    cleanups.push(server.close);
+    const socket = new WebSocket(server.address().endpoint, { origin: "http://foundry.test" });
+    cleanups.push(() => socket.terminate());
+    await authenticate(socket, hello("shutdown-mutation-world"));
+    const received = waitForRequest(socket);
+    const mutation = server.request(
+      "shutdown-mutation-world",
+      "documents.create",
+      { documentType: "Actor", data: { name: "Possibly created" } },
+      "shutdown-mutation",
+      { correlationId: "shutdown-mutation" },
+    );
+    await received;
+    const rejection = expect(mutation).rejects.toMatchObject({
+      envelope: {
+        code: "INDETERMINATE_MUTATION",
+        retryable: false,
+        details: {
+          correlationId: "shutdown-mutation",
+          indeterminate: true,
+          reconciliationRequired: true,
+        },
+      },
+    });
+
+    await server.close();
+    await rejection;
   });
 
   it("rejects requests synchronously once close begins and makes close idempotent", async () => {

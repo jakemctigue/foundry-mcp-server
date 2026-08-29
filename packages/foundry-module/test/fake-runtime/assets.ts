@@ -60,7 +60,25 @@ export class FakeFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
   }
 
   async listSources(): Promise<AssetSourceCapability[]> {
-    return [...this.#sources.values()].map(({ files: _files, ...capability }) => capability);
+    return [...this.#sources.values()].map((source) => ({
+      id: source.id,
+      writable: source.writable,
+      ...(source.reason ? { reason: source.reason } : {}),
+    }));
+  }
+
+  async getWriteCapability(
+    sourceId: string,
+    _destinationPath: string,
+  ): Promise<AssetSourceCapability> {
+    const source = this.#sources.get(sourceId);
+    if (!source)
+      return { id: sourceId, writable: false, reason: `Unknown fake asset source ${sourceId}` };
+    return {
+      id: source.id,
+      writable: source.writable,
+      ...(source.reason ? { reason: source.reason } : {}),
+    };
   }
 
   async browse(

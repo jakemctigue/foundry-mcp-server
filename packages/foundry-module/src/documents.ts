@@ -33,9 +33,11 @@ import {
 
 import type {
   FoundryRuntimeAdapter,
+  RuntimeCompendium,
   RuntimeCompendiumIndexEntry,
   RuntimeDocument,
   RuntimeDocumentRegistration,
+  RuntimeDocumentValidation,
 } from "./runtime.js";
 
 export type DocumentOperationOptions = OperationExecutionOptions;
@@ -511,6 +513,14 @@ function errorResult<T>(error: unknown): OperationResult<T> {
   return { ok: false, error: toErrorEnvelope(error) };
 }
 
+interface ValidatedCreate {
+  ok: true;
+  item: DocumentCreateItem;
+  parent?: RuntimeDocument;
+  pack?: RuntimeCompendium;
+  schemaValidation: RuntimeDocumentValidation;
+}
+
 export class FoundryDocumentService {
   constructor(
     readonly runtime: FoundryRuntimeAdapter,
@@ -624,9 +634,10 @@ export class FoundryDocumentService {
       const parsed = this.#parse(DocumentsCreateInput, input);
       this.#guard(options);
       const atomic = "items" in parsed ? parsed.atomic : false;
+      const dryRun = parsed.dryRun;
       const snapshotState = this.runtime.snapshotState?.bind(this.runtime);
       const restoreState = this.runtime.restoreState?.bind(this.runtime);
-      if (atomic && (!snapshotState || !restoreState)) {
+      if (atomic && !dryRun && (!snapshotState || !restoreState)) {
         operationError(
           "UNSUPPORTED_TYPE",
           "Atomic batch creation requires runtime snapshot and restore capability",
@@ -640,9 +651,24 @@ export class FoundryDocumentService {
                 type: parsed.type,
                 data: parsed.data,
                 ...(parsed.parentUuid ? { parentUuid: parsed.parentUuid } : {}),
+                ...(parsed.packId ? { packId: parsed.packId } : {}),
               },
             ];
-      const validations = await Promise.all(items.map((item) => this.#validateCreate(item)));
+      const validations = await Promise.all(
+        items.map((item) => this.#validateCreate(item, dryRun)),
+      );
+      if (dryRun) {
+        const results: DocumentCreateResult[] = validations.map((validation, index) =>
+          validation.ok
+            ? {
+                index,
+                status: "validated",
+                validation: this.#createValidation(validation),
+              }
+            : { index, status: "error", error: validation.error },
+        );
+        return { atomic, committed: false, dryRun: true, results };
+      }
       if (atomic && validations.some((validation) => !validation.ok)) {
         const results: DocumentCreateResult[] = validations.map((validation, index) =>
           validation.ok
@@ -656,7 +682,7 @@ export class FoundryDocumentService {
               }
             : { index, status: "error", error: validation.error },
         );
-        return { atomic: true, committed: false, results };
+        return { atomic: true, committed: false, dryRun: false, results };
       }
 
       const snapshot = atomic ? await snapshotState?.() : undefined;
@@ -668,11 +694,13 @@ export class FoundryDocumentService {
           continue;
         }
         try {
-          const document = await this.runtime.createDocument(
-            validation.item.type,
-            validation.item.data,
-            validation.parent,
-          );
+          const document = validation.pack
+            ? await validation.pack.createDocument(validation.item.data)
+            : await this.runtime.createDocument(
+                validation.item.type,
+                validation.item.data,
+                validation.parent,
+              );
           options?.markCommitted?.(`created document batch item ${index.toString()}`);
           results.push({ index, status: "created", document: this.#view(document) });
         } catch (error) {
@@ -694,6 +722,7 @@ export class FoundryDocumentService {
           return {
             atomic: true,
             committed: false,
+            dryRun: false,
             results: results.map((result) =>
               result.status === "created"
                 ? {
@@ -709,7 +738,12 @@ export class FoundryDocumentService {
           };
         }
       }
-      return { atomic, committed: results.every((result) => result.status === "created"), results };
+      return {
+        atomic,
+        committed: results.every((result) => result.status === "created"),
+        dryRun: false,
+        results,
+      };
     });
   }
 
@@ -730,10 +764,7 @@ export class FoundryDocumentService {
           permission.reason ?? "The connected user cannot update this Document",
         );
       if (document.pack) {
-        const pack = await this.runtime.getCompendium(document.pack);
-        if (!pack || !pack.accessible || pack.locked) {
-          operationError("PERMISSION_DENIED", "The containing compendium is not writable");
-        }
+        await this.#writablePack(document.pack);
       }
       const before = cloneJsonObject(document.toObject());
       const actualHash = sourceHash(before);
@@ -757,7 +788,33 @@ export class FoundryDocumentService {
             actual: actualVersion,
           });
         }
-      } else {
+      }
+      if (parsed.dryRun) {
+        const runtimeValidation = await this.#validateUpdateSchema(document, parsed.data);
+        const view = this.#view(document);
+        return {
+          uuid: view.uuid,
+          sourceHash: view.sourceHash,
+          sourceVersion: view.sourceVersion,
+          forced: parsed.forceOverwrite,
+          dryRun: true,
+          committed: false,
+          validation: {
+            valid: true,
+            operation: "update",
+            target: document.pack ? "compendium" : document.parent ? "embedded" : "world",
+            type: document.documentName,
+            ...(document.subtype ? { subtype: document.subtype } : {}),
+            ...(document.parent ? { parentUuid: document.parent.uuid } : {}),
+            ...(document.pack ? { packId: document.pack } : {}),
+            permissionValidated: true,
+            schemaValidated: runtimeValidation.schemaValidated,
+            warnings: this.#boundedWarnings(runtimeValidation.warnings),
+          },
+          document: view,
+        };
+      }
+      if (parsed.forceOverwrite) {
         await this.runtime.audit({ action: "document.update", uuid: document.uuid, forced: true });
       }
       const updated = await this.runtime.updateDocument(document, parsed.data);
@@ -768,6 +825,8 @@ export class FoundryDocumentService {
         sourceHash: view.sourceHash,
         sourceVersion: view.sourceVersion,
         forced: parsed.forceOverwrite,
+        dryRun: false,
+        committed: true,
         document: view,
       };
     });
@@ -847,6 +906,8 @@ export class FoundryDocumentService {
           type: pack.type,
           documentCount: pack.documentCount,
           locked: pack.locked,
+          writable: pack.writable,
+          ...(pack.writeReason ? { writeReason: pack.writeReason } : {}),
         }))
         .sort((left, right) => compareText(left.id, right.id));
       return { packs };
@@ -1178,10 +1239,8 @@ export class FoundryDocumentService {
 
   async #validateCreate(
     item: DocumentCreateItem,
-  ): Promise<
-    | { ok: true; item: DocumentCreateItem; parent?: RuntimeDocument }
-    | { ok: false; error: ErrorEnvelope }
-  > {
+    validateSchema: boolean,
+  ): Promise<ValidatedCreate | { ok: false; error: ErrorEnvelope }> {
     try {
       const registration = await this.#registration(item.type);
       const subtype = typeof item.data.type === "string" ? item.data.type : undefined;
@@ -1210,10 +1269,114 @@ export class FoundryDocumentService {
       const permission = this.runtime.canCreate(item.type, subtype, parent);
       if (!permission.allowed)
         operationError("PERMISSION_DENIED", permission.reason ?? `${item.type} is not creatable`);
-      return { ok: true, item, ...(parent ? { parent } : {}) };
+      let pack: RuntimeCompendium | undefined;
+      if (item.packId) {
+        pack = await this.#writablePack(item.packId);
+        if (pack.type !== item.type) {
+          operationError(
+            "UNSUPPORTED_TYPE",
+            `Compendium ${pack.id} stores ${pack.type}, not ${item.type}`,
+          );
+        }
+      }
+      if (parent?.pack) await this.#writablePack(parent.pack);
+      const schemaValidation = validateSchema
+        ? await this.#validateCreateSchema(item, parent, pack)
+        : { schemaValidated: false, warnings: [] };
+      return {
+        ok: true,
+        item,
+        ...(parent ? { parent } : {}),
+        ...(pack ? { pack } : {}),
+        schemaValidation,
+      };
     } catch (error) {
       return { ok: false, error: toErrorEnvelope(error) };
     }
+  }
+
+  async #writablePack(packId: string): Promise<RuntimeCompendium> {
+    const pack = await this.runtime.getCompendium(packId);
+    if (!pack) operationError("NOT_FOUND", `Compendium ${packId} was not found`);
+    if (!pack.accessible)
+      operationError("PERMISSION_DENIED", `Compendium ${packId} is not accessible`, { packId });
+    if (pack.locked)
+      operationError("PERMISSION_DENIED", `Compendium ${packId} is locked`, {
+        packId,
+        locked: true,
+      });
+    if (!pack.writable)
+      operationError(
+        "PERMISSION_DENIED",
+        pack.writeReason ?? `Compendium ${packId} is not writable`,
+        { packId, locked: false },
+      );
+    return pack;
+  }
+
+  async #validateCreateSchema(
+    item: DocumentCreateItem,
+    parent: RuntimeDocument | undefined,
+    pack: RuntimeCompendium | undefined,
+  ): Promise<RuntimeDocumentValidation> {
+    if (!this.runtime.validateDocumentCreate) {
+      return {
+        schemaValidated: false,
+        warnings: ["The Foundry runtime exposes no side-effect-free create schema validator"],
+      };
+    }
+    try {
+      return await this.runtime.validateDocumentCreate(item.type, item.data, parent, pack);
+    } catch (error) {
+      operationError("INVALID_DATA", "Foundry create schema validation failed", {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  async #validateUpdateSchema(
+    document: RuntimeDocument,
+    data: JsonObject,
+  ): Promise<RuntimeDocumentValidation> {
+    if (!this.runtime.validateDocumentUpdate) {
+      return {
+        schemaValidated: false,
+        warnings: ["The Foundry runtime exposes no side-effect-free update schema validator"],
+      };
+    }
+    try {
+      return await this.runtime.validateDocumentUpdate(document, data);
+    } catch (error) {
+      operationError("INVALID_DATA", "Foundry update schema validation failed", {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  #createValidation(
+    validation: ValidatedCreate,
+  ): Extract<DocumentCreateResult, { status: "validated" }>["validation"] {
+    const subtype =
+      typeof validation.item.data.type === "string" ? validation.item.data.type : undefined;
+    return {
+      valid: true,
+      operation: "create",
+      target: validation.pack ? "compendium" : validation.parent ? "embedded" : "world",
+      type: validation.item.type,
+      ...(subtype ? { subtype } : {}),
+      ...(validation.parent ? { parentUuid: validation.parent.uuid } : {}),
+      ...(validation.pack ? { packId: validation.pack.id } : {}),
+      permissionValidated: true,
+      schemaValidated: validation.schemaValidation.schemaValidated,
+      warnings: this.#boundedWarnings(validation.schemaValidation.warnings),
+    };
+  }
+
+  #boundedWarnings(warnings: readonly string[]): string[] {
+    return warnings
+      .filter((warning) => warning.trim().length > 0)
+      .slice(0, 20)
+      .map((warning) => warning.trim().slice(0, 500));
   }
 
   #redact(data: JsonObject, paths: readonly string[], uuid: string, reported: string[]): void {

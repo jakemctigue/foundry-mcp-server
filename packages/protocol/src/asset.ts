@@ -7,7 +7,30 @@ import {
   MAX_PAGE_SIZE,
 } from "./document.js";
 
-export const DEFAULT_IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp"] as const;
+/**
+ * Extensions Foundry may expose as image assets. This list is intentionally broader than the
+ * formats accepted by the upload decoder: enumeration must not hide an existing image merely
+ * because this server will not rewrite that format safely.
+ */
+export const DEFAULT_IMAGE_EXTENSIONS = [
+  ".png",
+  ".apng",
+  ".jpg",
+  ".jpeg",
+  ".jfif",
+  ".gif",
+  ".webp",
+  ".avif",
+  ".bmp",
+  ".dib",
+  ".heic",
+  ".heif",
+  ".ico",
+  ".jxl",
+  ".svg",
+  ".tif",
+  ".tiff",
+] as const;
 export const MAX_ASSET_DEPTH = 16;
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 export const MAX_IMAGE_PIXELS = 40_000_000;
@@ -203,6 +226,12 @@ export interface GeneratedImage {
 
 export interface ImageGenerationProvider {
   readonly id: string;
+  /**
+   * Explicitly false only for providers guaranteed to stay on this machine.
+   * Hosts must conservatively treat an omitted value as requiring network
+   * authorization before invoking the provider.
+   */
+  readonly requiresNetwork?: boolean;
   generate(
     prompt: string,
     options?: ImageGenerationOptions,

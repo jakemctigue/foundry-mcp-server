@@ -21,7 +21,7 @@ describe("protocol revisions", () => {
   });
 
   it("keeps the private bridge revision independent from MCP", () => {
-    expect(BRIDGE_PROTOCOL_VERSION).toBe("4");
+    expect(BRIDGE_PROTOCOL_VERSION).toBe("5");
     expect(BRIDGE_PROTOCOL_VERSION).not.toBe(MCP_PROTOCOL_VERSION);
     expect(LEGACY_MCP_PROTOCOL_VERSIONS).not.toContain(BRIDGE_PROTOCOL_VERSION);
   });

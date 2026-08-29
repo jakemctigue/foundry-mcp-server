@@ -9,6 +9,8 @@ import {
   EventResumeMessageSchema,
   companionAuthPayload,
   companionAuthReadyPayload,
+  companionIdentityAuthPayload,
+  companionIdentityConfirmPayload,
   MAX_OPERATION_DURATION_MS,
   MAX_OPERATION_PROGRESS_UPDATES,
   makeError,
@@ -64,6 +66,7 @@ interface PersistedState {
   responses: CompanionResponseMessage[];
   responseIdentities: RequestIdentity[];
   inFlightMutations: PersistedMutation[];
+  identityCredential?: string;
 }
 
 interface RequestIdentity {
@@ -161,6 +164,20 @@ function base64UrlEncode(bytes: Uint8Array): string {
     if (third !== undefined) output += BASE64URL_ALPHABET[third & 63] ?? "";
   }
   return output;
+}
+
+function base64UrlDecodeStrict(value: string, expectedBytes: number): Uint8Array | undefined {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return undefined;
+  try {
+    const base64 = value.replaceAll("-", "+").replaceAll("_", "/");
+    const padded = `${base64}${"=".repeat((4 - (base64.length % 4)) % 4)}`;
+    const binary = globalThis.atob(padded);
+    const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    if (bytes.byteLength !== expectedBytes || base64UrlEncode(bytes) !== value) return undefined;
+    return bytes;
+  } catch {
+    return undefined;
+  }
 }
 
 function fixedStringEqual(left: string, right: string): boolean {
@@ -357,6 +374,10 @@ function parseState(raw: string | null, connectionId: string): PersistedState {
       responses,
       responseIdentities,
       inFlightMutations,
+      ...(typeof parsed.identityCredential === "string" &&
+      base64UrlDecodeStrict(parsed.identityCredential, 32)
+        ? { identityCredential: parsed.identityCredential }
+        : {}),
     };
   } catch {
     return emptyState();
@@ -490,13 +511,22 @@ export class CompanionBridgeClient {
       }
       let proof: CompanionAuthProofMessage;
       try {
+        const payload = companionAuthPayload(challenge.challenge, challenge.origin, hello);
+        const identityCredential = this.#state.identityCredential
+          ? base64UrlDecodeStrict(this.#state.identityCredential, 32)
+          : undefined;
         proof = {
           type: "auth.proof",
           hello,
-          proof: await signCompanionProof(
-            this.#pairingSecret,
-            companionAuthPayload(challenge.challenge, challenge.origin, hello),
-          ),
+          proof: await signCompanionProof(this.#pairingSecret, payload),
+          ...(identityCredential
+            ? {
+                identityProof: await signCompanionProof(
+                  identityCredential,
+                  companionIdentityAuthPayload(challenge.challenge, challenge.origin, hello),
+                ),
+              }
+            : {}),
         };
       } catch {
         socket.close(1011, "companion pairing proof is unavailable");
@@ -523,6 +553,28 @@ export class CompanionBridgeClient {
         )
       ) {
         socket.close(1008, "companion host authentication failed");
+        return;
+      }
+      if (ready.identityCredential) {
+        const identityCredential = base64UrlDecodeStrict(ready.identityCredential, 32);
+        if (!identityCredential) {
+          socket.close(1008, "companion host returned an invalid identity credential");
+          return;
+        }
+        this.#state.identityCredential = ready.identityCredential;
+        this.#persist();
+        const confirmation = {
+          type: "auth.confirm" as const,
+          connectionId: this.options.connectionId,
+          proof: await signCompanionProof(
+            identityCredential,
+            companionIdentityConfirmPayload(challenge, this.#pageOrigin, hello),
+          ),
+        };
+        if (this.#socket !== socket || socket.readyState !== 1) return;
+        socket.send(JSON.stringify(confirmation));
+      } else if (!this.#state.identityCredential) {
+        socket.close(1008, "companion host did not complete identity enrollment");
         return;
       }
       this.#authenticated = true;

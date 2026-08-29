@@ -21,7 +21,8 @@ const DEFAULT_DOCUMENT_BUDGET = 500;
 const PAGE_SIZE = 50;
 const MAX_TASKS = 2_000;
 const MAX_SNAPSHOT_BYTES = 256 * 1_024;
-const PUBLIC_OWNERSHIP_LEVEL = 1;
+// Foundry's OBSERVER permission is the first level that exposes full document content.
+const PUBLIC_OWNERSHIP_LEVEL = 2;
 
 type ReconcileReason = "initial" | "reconnect" | "periodic" | "manual";
 type TaskKind = "root" | "embedded" | "compendium";
@@ -109,7 +110,13 @@ function privacyFlag(data: UnknownRecord): boolean {
   const whisper = data["whisper"];
   if (Array.isArray(whisper) && whisper.length > 0) return true;
   const flags = record(data["flags"]);
-  return record(flags["foundry-mcp"])["private"] === true;
+  const foundryMcp = record(flags["foundryMcp"]);
+  const legacyFoundryMcp = record(flags["foundry-mcp"]);
+  return (
+    foundryMcp["excludeFromIntelligence"] === true ||
+    foundryMcp["private"] === true ||
+    legacyFoundryMcp["private"] === true
+  );
 }
 
 function isPrivateDocument(document: DocumentView): boolean {

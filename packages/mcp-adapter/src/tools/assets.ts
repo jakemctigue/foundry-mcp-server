@@ -103,6 +103,7 @@ export function registerAssetTools(
           args,
           "assets:upload",
           options.correlationId,
+          args.provider === "deterministic" ? [] : ["ai:network"],
         ),
         bridge,
         "assets.images.generate",

@@ -4,6 +4,7 @@ import {
   AssetsImagesAttachInput,
   AssetsImagesListInput,
   AssetsImagesUploadInput,
+  DEFAULT_IMAGE_EXTENSIONS,
   inspectImageBytes,
 } from "../src/asset.js";
 
@@ -19,6 +20,9 @@ describe("asset protocol", () => {
       pageSize: 50,
       maxDepth: 4,
     });
+    expect(DEFAULT_IMAGE_EXTENSIONS).toEqual(
+      expect.arrayContaining([".png", ".svg", ".avif", ".heic", ".jxl"]),
+    );
   });
 
   it("accepts each upload source and collision policy", () => {

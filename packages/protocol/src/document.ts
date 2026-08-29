@@ -131,16 +131,42 @@ export const DocumentCreateItem = z
     type: z.string().min(1),
     data: JsonObjectSchema,
     parentUuid: z.string().min(1).optional(),
+    packId: z.string().min(1).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((input, context) => {
+    if (input.parentUuid && input.packId) {
+      context.addIssue({
+        code: "custom",
+        message: "parentUuid and packId are mutually exclusive create targets",
+        path: ["packId"],
+      });
+    }
+  });
 export type DocumentCreateItem = z.infer<typeof DocumentCreateItem>;
 
-const SingleDocumentCreateInput = ConnectionSelector.merge(DocumentCreateItem).extend({
+const SingleDocumentCreateInput = ConnectionSelector.extend({
+  type: z.string().min(1),
+  data: JsonObjectSchema,
+  parentUuid: z.string().min(1).optional(),
+  packId: z.string().min(1).optional(),
   atomic: z.literal(false).optional(),
-});
+  dryRun: z.boolean().default(false),
+})
+  .strict()
+  .superRefine((input, context) => {
+    if (input.parentUuid && input.packId) {
+      context.addIssue({
+        code: "custom",
+        message: "parentUuid and packId are mutually exclusive create targets",
+        path: ["packId"],
+      });
+    }
+  });
 const BatchDocumentCreateInput = ConnectionSelector.extend({
   items: z.array(DocumentCreateItem).min(1).max(MAX_BATCH_SIZE),
   atomic: z.boolean().default(false),
+  dryRun: z.boolean().default(false),
 }).strict();
 
 export const DocumentsCreateInput = z.union([SingleDocumentCreateInput, BatchDocumentCreateInput]);
@@ -162,12 +188,31 @@ export const DocumentCreateResult = z.discriminatedUnion("status", [
     status: z.literal("rolled_back"),
     error: ErrorEnvelope,
   }),
+  z.object({
+    index: z.number().int().nonnegative(),
+    status: z.literal("validated"),
+    validation: z
+      .object({
+        valid: z.literal(true),
+        operation: z.literal("create"),
+        target: z.enum(["world", "embedded", "compendium"]),
+        type: z.string().min(1),
+        subtype: z.string().min(1).optional(),
+        parentUuid: z.string().min(1).optional(),
+        packId: z.string().min(1).optional(),
+        permissionValidated: z.literal(true),
+        schemaValidated: z.boolean(),
+        warnings: z.array(z.string().min(1).max(500)).max(20),
+      })
+      .strict(),
+  }),
 ]);
 export type DocumentCreateResult = z.infer<typeof DocumentCreateResult>;
 
 export const DocumentsCreateOutput = z.object({
   atomic: z.boolean(),
   committed: z.boolean(),
+  dryRun: z.boolean().default(false),
   results: z.array(DocumentCreateResult),
 });
 export type DocumentsCreateOutput = z.infer<typeof DocumentsCreateOutput>;
@@ -178,6 +223,7 @@ export const DocumentsUpdateInput = ConnectionSelector.extend({
   expectedVersion: z.union([z.string(), z.number()]).optional(),
   expectedHash: z.string().min(1).optional(),
   forceOverwrite: z.boolean().default(false),
+  dryRun: z.boolean().default(false),
 })
   .strict()
   .superRefine((input, context) => {
@@ -200,6 +246,23 @@ export const DocumentsUpdateOutput = z.object({
   sourceHash: z.string().min(1),
   sourceVersion: z.union([z.string(), z.number()]),
   forced: z.boolean(),
+  dryRun: z.boolean().default(false),
+  committed: z.boolean().default(true),
+  validation: z
+    .object({
+      valid: z.literal(true),
+      operation: z.literal("update"),
+      target: z.enum(["world", "embedded", "compendium"]),
+      type: z.string().min(1),
+      subtype: z.string().min(1).optional(),
+      parentUuid: z.string().min(1).optional(),
+      packId: z.string().min(1).optional(),
+      permissionValidated: z.literal(true),
+      schemaValidated: z.boolean(),
+      warnings: z.array(z.string().min(1).max(500)).max(20),
+    })
+    .strict()
+    .optional(),
   document: DocumentView,
 });
 export type DocumentsUpdateOutput = z.infer<typeof DocumentsUpdateOutput>;
@@ -236,6 +299,9 @@ export const CompendiumSummary = z.object({
   type: z.string().min(1),
   documentCount: z.number().int().nonnegative(),
   locked: z.boolean(),
+  // Default closed for rolling upgrades from bridge producers that predate writable packs.
+  writable: z.boolean().default(false),
+  writeReason: z.string().min(1).max(500).optional(),
 });
 export type CompendiumSummary = z.infer<typeof CompendiumSummary>;
 

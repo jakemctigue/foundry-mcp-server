@@ -51,9 +51,17 @@ export interface RuntimeCompendium {
   type: string;
   locked: boolean;
   accessible: boolean;
+  writable: boolean;
+  writeReason: string | undefined;
   documentCount: number;
   getIndex(): Promise<RuntimeCompendiumIndexEntry[]>;
   getDocuments(): Promise<RuntimeDocument[]>;
+  createDocument(data: JsonObject): Promise<RuntimeDocument>;
+}
+
+export interface RuntimeDocumentValidation {
+  schemaValidated: boolean;
+  warnings: string[];
 }
 
 export interface RuntimeAuditEvent {
@@ -75,6 +83,16 @@ export interface FoundryRuntimeAdapter {
     data: JsonObject,
     parent?: RuntimeDocument,
   ): Promise<RuntimeDocument>;
+  validateDocumentCreate?(
+    type: string,
+    data: JsonObject,
+    parent?: RuntimeDocument,
+    pack?: RuntimeCompendium,
+  ): Promise<RuntimeDocumentValidation>;
+  validateDocumentUpdate?(
+    document: RuntimeDocument,
+    data: JsonObject,
+  ): Promise<RuntimeDocumentValidation>;
   updateDocument(document: RuntimeDocument, data: JsonObject): Promise<RuntimeDocument>;
   deleteDocument(document: RuntimeDocument): Promise<void>;
   canRead(document: RuntimeDocument): boolean;
@@ -153,7 +171,8 @@ function wrapDocument(raw: unknown): RuntimeDocument {
   const parentRaw = item.parent;
   const pack = stringValue(item.pack);
   const type = documentType(raw);
-  const uuid = stringValue(item.uuid) ?? (pack ? `Compendium.${pack}.${id}` : `${type}.${id}`);
+  const uuid =
+    stringValue(item.uuid) ?? (pack ? `Compendium.${pack}.${type}.${id}` : `${type}.${id}`);
   const subtype = stringValue(item.type);
   const stats = record(item._stats);
   const revision =
@@ -369,6 +388,63 @@ export class BrowserFoundryRuntime implements FoundryRuntimeAdapter {
     return wrapDocument(created);
   }
 
+  async validateDocumentCreate(
+    type: string,
+    data: JsonObject,
+    parent?: RuntimeDocument,
+    pack?: RuntimeCompendium,
+  ): Promise<RuntimeDocumentValidation> {
+    const documentClass = record(record(this.#globals.CONFIG)[type]).documentClass;
+    if (typeof documentClass !== "function") {
+      return {
+        schemaValidated: false,
+        warnings: ["Foundry did not expose a side-effect-free constructor for schema validation"],
+      };
+    }
+    let candidate: unknown;
+    try {
+      candidate = Reflect.construct(documentClass, [
+        data,
+        {
+          ...(parent ? { parent: parent.raw } : {}),
+          ...(pack ? { pack: pack.id } : {}),
+          strict: true,
+        },
+      ]);
+    } catch (error) {
+      throw new Error(
+        `Foundry schema rejected ${type}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+    return this.#validateCandidate(candidate, type);
+  }
+
+  async validateDocumentUpdate(
+    document: RuntimeDocument,
+    data: JsonObject,
+  ): Promise<RuntimeDocumentValidation> {
+    const clone = record(document.raw).clone;
+    if (typeof clone !== "function") {
+      return {
+        schemaValidated: false,
+        warnings: ["Foundry did not expose a side-effect-free clone validator for this Document"],
+      };
+    }
+    let candidate: unknown;
+    try {
+      candidate = await clone.call(document.raw, data, { save: false, keepId: true });
+    } catch (error) {
+      throw new Error(
+        `Foundry schema rejected ${document.documentName} update: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        { cause: error },
+      );
+    }
+    return this.#validateCandidate(candidate, document.documentName);
+  }
+
   async updateDocument(document: RuntimeDocument, data: JsonObject): Promise<RuntimeDocument> {
     const updated = await call(document.raw, "update", data, { render: false });
     return wrapDocument(updated ?? document.raw);
@@ -457,6 +533,36 @@ export class BrowserFoundryRuntime implements FoundryRuntimeAdapter {
     const type = stringValue(item.documentName) ?? stringValue(metadata.type) ?? "Document";
     const locked = booleanValue(item.locked, booleanValue(metadata.locked, false));
     const accessible = booleanValue(item.visible, true);
+    const game = record(this.#globals.game);
+    const user = game.user;
+    const documentClass =
+      item.documentClass ?? record(record(this.#globals.CONFIG)[type]).documentClass;
+    let writable = accessible && !locked && record(user).isGM === true;
+    let writeReason = !accessible
+      ? "The compendium is not accessible"
+      : locked
+        ? "The compendium is locked"
+        : record(user).isGM !== true
+          ? "Generic compendium mutations require a connected GM"
+          : undefined;
+    const canUserCreate = record(documentClass).canUserCreate;
+    if (writable && typeof canUserCreate === "function") {
+      try {
+        writable = canUserCreate.call(documentClass, user) === true;
+      } catch {
+        writable = false;
+      }
+      if (!writable) writeReason = "The connected user cannot create Documents in this compendium";
+    }
+    const canUserModify = item.canUserModify;
+    if (writable && typeof canUserModify === "function") {
+      try {
+        writable = canUserModify.call(raw, user, "update") === true;
+      } catch {
+        writable = false;
+      }
+      if (!writable) writeReason = "The connected user cannot modify this compendium";
+    }
     const count = typeof item.size === "number" ? item.size : values(item.index).length;
     return {
       id,
@@ -464,26 +570,74 @@ export class BrowserFoundryRuntime implements FoundryRuntimeAdapter {
       type,
       locked,
       accessible,
+      writable,
+      writeReason,
       documentCount: count,
       getIndex: async () => {
         const index = await call(raw, "getIndex");
-        return values(index).map((entry) => {
-          const data = record(entry);
-          const entryId = stringValue(data._id) ?? stringValue(data.id) ?? "unknown";
-          const name = stringValue(data.name);
-          const subtype = stringValue(data.type);
-          const img = stringValue(data.img);
-          return {
-            id: entryId,
-            uuid: `Compendium.${id}.${entryId}`,
-            type,
-            ...(name ? { name } : {}),
-            ...(subtype ? { subtype } : {}),
-            ...(img ? { img } : {}),
-          };
-        });
+        return Promise.all(
+          values(index).map(async (entry) => {
+            const data = record(entry);
+            const entryId = stringValue(data._id) ?? stringValue(data.id) ?? "unknown";
+            const name = stringValue(data.name);
+            const subtype = stringValue(data.type);
+            const img = stringValue(data.img);
+            let uuid = stringValue(data.uuid);
+            const getUuid = item.getUuid;
+            if (!uuid && typeof getUuid === "function") {
+              try {
+                uuid = stringValue(await getUuid.call(raw, entryId));
+              } catch {
+                // A public helper failure must not erase an otherwise addressable index entry.
+              }
+            }
+            return {
+              id: entryId,
+              uuid: uuid ?? `Compendium.${id}.${type}.${entryId}`,
+              type,
+              ...(name ? { name } : {}),
+              ...(subtype ? { subtype } : {}),
+              ...(img ? { img } : {}),
+            };
+          }),
+        );
       },
       getDocuments: async () => values(await call(raw, "getDocuments")).map(wrapDocument),
+      createDocument: async (data) => {
+        if (!writable) throw new Error(writeReason ?? "The compendium is not writable");
+        const created = await call(documentClass, "create", data, {
+          pack: id,
+          renderSheet: false,
+        });
+        if (!created)
+          throw new Error(`Foundry did not return the created ${type} compendium entry`);
+        return wrapDocument(created);
+      },
     };
+  }
+
+  async #validateCandidate(candidate: unknown, type: string): Promise<RuntimeDocumentValidation> {
+    const validate = record(candidate).validate;
+    if (typeof validate !== "function") {
+      return {
+        schemaValidated: false,
+        warnings: ["Foundry constructed the Document but exposed no side-effect-free validator"],
+      };
+    }
+    try {
+      const valid = await validate.call(candidate, {
+        clean: true,
+        fallback: false,
+        joint: true,
+        strict: true,
+      });
+      if (valid === false) throw new Error("validation returned false");
+    } catch (error) {
+      throw new Error(
+        `Foundry schema rejected ${type}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+    return { schemaValidated: true, warnings: [] };
   }
 }

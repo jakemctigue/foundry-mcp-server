@@ -6,6 +6,7 @@ import type {
   RuntimeCompendiumIndexEntry,
   RuntimeDocument,
   RuntimeDocumentRegistration,
+  RuntimeDocumentValidation,
   RuntimeSubtypeRegistration,
 } from "../../src/runtime.js";
 
@@ -121,7 +122,7 @@ export class FakeDocument implements RuntimeDocument {
 
   get uuid(): string {
     if (this.parent) return `${this.parent.uuid}.${this.documentName}.${this.id}`;
-    if (this.pack) return `Compendium.${this.pack}.${this.id}`;
+    if (this.pack) return `Compendium.${this.pack}.${this.documentName}.${this.id}`;
     return `${this.documentName}.${this.id}`;
   }
 
@@ -135,14 +136,17 @@ export class FakeDocument implements RuntimeDocument {
 }
 
 class FakeCompendium implements RuntimeCompendium {
-  readonly #documents: FakeDocument[];
+  #documents: FakeDocument[];
 
   constructor(
+    readonly runtime: FakeFoundryRuntime,
     readonly id: string,
     readonly label: string,
     readonly type: string,
     readonly locked: boolean,
     readonly accessible: boolean,
+    readonly configuredWritable: boolean,
+    readonly configuredWriteReason: string | undefined,
     documents: FakeDocument[],
   ) {
     this.#documents = documents;
@@ -150,6 +154,18 @@ class FakeCompendium implements RuntimeCompendium {
 
   get documentCount(): number {
     return this.#documents.length;
+  }
+
+  get writable(): boolean {
+    return this.accessible && !this.locked && this.configuredWritable;
+  }
+
+  get writeReason(): string | undefined {
+    if (!this.accessible) return "The compendium is not accessible";
+    if (this.locked) return "The compendium is locked";
+    if (!this.configuredWritable)
+      return this.configuredWriteReason ?? "The compendium denies document creation";
+    return undefined;
   }
 
   async getIndex(): Promise<RuntimeCompendiumIndexEntry[]> {
@@ -165,6 +181,17 @@ class FakeCompendium implements RuntimeCompendium {
 
   async getDocuments(): Promise<RuntimeDocument[]> {
     return [...this.#documents];
+  }
+
+  async createDocument(data: JsonObject): Promise<RuntimeDocument> {
+    if (!this.writable) throw new Error(this.writeReason ?? "The compendium is not writable");
+    const document = this.runtime.seedDocument(this.type, data, { pack: this.id });
+    this.#documents.push(document);
+    return document;
+  }
+
+  replaceDocuments(documents: FakeDocument[]): void {
+    this.#documents = documents;
   }
 }
 
@@ -276,6 +303,8 @@ export class FakeFoundryRuntime implements FoundryRuntimeAdapter {
     type: string;
     locked?: boolean;
     accessible?: boolean;
+    writable?: boolean;
+    writeReason?: string;
     documents: JsonObject[];
   }): this {
     const documents = options.documents.map((data) =>
@@ -284,11 +313,14 @@ export class FakeFoundryRuntime implements FoundryRuntimeAdapter {
     this.#packs.set(
       options.id,
       new FakeCompendium(
+        this,
         options.id,
         options.label,
         options.type,
         options.locked ?? false,
         options.accessible ?? true,
+        options.writable ?? true,
+        options.writeReason,
         documents,
       ),
     );
@@ -381,6 +413,24 @@ export class FakeFoundryRuntime implements FoundryRuntimeAdapter {
     this.#createCalls += 1;
     if (this.#failCreateCall === this.#createCalls) throw new Error("Injected create failure");
     return this.seedDocument(type, data, { ...(parent ? { parentUuid: parent.uuid } : {}) });
+  }
+
+  async validateDocumentCreate(
+    _type: string,
+    data: JsonObject,
+    _parent?: RuntimeDocument,
+    _pack?: RuntimeCompendium,
+  ): Promise<RuntimeDocumentValidation> {
+    this.#validateData(data);
+    return { schemaValidated: true, warnings: [] };
+  }
+
+  async validateDocumentUpdate(
+    document: RuntimeDocument,
+    data: JsonObject,
+  ): Promise<RuntimeDocumentValidation> {
+    this.#validateData(deepMerge(clone(document.toObject() as JsonObject), data));
+    return { schemaValidated: true, warnings: [] };
   }
 
   async updateDocument(document: RuntimeDocument, data: JsonObject): Promise<RuntimeDocument> {
@@ -504,7 +554,18 @@ export class FakeFoundryRuntime implements FoundryRuntimeAdapter {
         revision: document.revision,
       });
     }
+    for (const [packId, pack] of this.#packs) {
+      pack.replaceDocuments(
+        [...this.#documents.values()].filter((document) => document.pack === packId),
+      );
+    }
     this.auditEvents.splice(state.auditLength);
+  }
+
+  #validateData(data: JsonObject): void {
+    if (typeof data.name !== "string" || data.name.trim().length === 0) {
+      throw new Error("Fake Foundry schema requires a non-empty Document name");
+    }
   }
 }
 

@@ -306,6 +306,332 @@ describe("FoundryDocumentService generic create and update", () => {
     ).toHaveLength(2);
   });
 
+  it("creates every runtime Actor and Item subtype directly in writable compendiums", async () => {
+    const runtime = createRichFakeRuntime()
+      .addCompendium({
+        id: "world.actors",
+        label: "Writable Actors",
+        type: "Actor",
+        documents: [],
+      })
+      .addCompendium({
+        id: "world.items",
+        label: "Writable Items",
+        type: "Item",
+        documents: [],
+      })
+      .addCompendium({
+        id: "world.locked",
+        label: "Locked Actors",
+        type: "Actor",
+        locked: true,
+        documents: [],
+      })
+      .addCompendium({
+        id: "world.denied",
+        label: "Denied Items",
+        type: "Item",
+        writable: false,
+        writeReason: "The test user cannot write this pack",
+        documents: [],
+      });
+    const service = new FoundryDocumentService(runtime);
+    const types = unwrap(await service.types()).types;
+    const createdUuids: string[] = [];
+
+    for (const type of ["Actor", "Item"] as const) {
+      const packId = type === "Actor" ? "world.actors" : "world.items";
+      const discovered = types.find((entry) => entry.type === type);
+      expect(discovered?.subtypes.length).toBeGreaterThan(0);
+      for (const subtype of discovered?.subtypes ?? []) {
+        const output = unwrap(
+          await service.create({
+            type,
+            packId,
+            data: {
+              name: `${type} ${subtype.subtype}`,
+              type: subtype.subtype,
+              system: { runtimeField: { preserved: subtype.subtype } },
+            },
+          }),
+        );
+        const result = output.results[0];
+        expect(result?.status).toBe("created");
+        if (result?.status === "created") {
+          expect(result.document.pack?.id).toBe(packId);
+          createdUuids.push(result.document.uuid);
+        }
+      }
+    }
+
+    const packs = unwrap(await service.compendiumsList()).packs;
+    expect(packs.find((pack) => pack.id === "world.actors")).toMatchObject({
+      documentCount: 2,
+      writable: true,
+    });
+    expect(packs.find((pack) => pack.id === "world.items")).toMatchObject({
+      documentCount: 2,
+      writable: true,
+    });
+    expect(packs.find((pack) => pack.id === "world.locked")).toMatchObject({
+      locked: true,
+      writable: false,
+      writeReason: expect.stringContaining("locked"),
+    });
+    expect(packs.find((pack) => pack.id === "world.denied")).toMatchObject({
+      writable: false,
+      writeReason: "The test user cannot write this pack",
+    });
+
+    const actorIndex = unwrap(
+      await service.compendiumDocumentsList({ packId: "world.actors", hydrate: false }),
+    );
+    expect(actorIndex.items).toHaveLength(2);
+    expect(actorIndex.items.every((item) => !("data" in item))).toBe(true);
+    const hydratedItems = unwrap(
+      await service.compendiumDocumentsList({ packId: "world.items", hydrate: true }),
+    );
+    expect(hydratedItems.items).toHaveLength(2);
+    expect(hydratedItems.items[0]).toHaveProperty("data.system.runtimeField.preserved");
+    for (const uuid of createdUuids) {
+      expect(unwrap(await service.get({ uuid })).data.system).toHaveProperty("runtimeField");
+    }
+
+    for (const [packId, type] of [
+      ["world.locked", "Actor"],
+      ["world.denied", "Item"],
+    ] as const) {
+      expect(
+        await service.create({
+          type,
+          packId,
+          data: {
+            name: "Must not be created",
+            type: type === "Actor" ? "stormborn" : "rune",
+          },
+        }),
+      ).toMatchObject({
+        ok: true,
+        value: {
+          committed: false,
+          results: [
+            {
+              status: "error",
+              error: { code: "PERMISSION_DENIED", details: { packId } },
+            },
+          ],
+        },
+      });
+      expect(
+        unwrap(await service.compendiumDocumentsList({ packId, hydrate: true })).items,
+      ).toHaveLength(0);
+    }
+    expect(
+      await service.create({
+        type: "Item",
+        packId: "world.actors",
+        data: { name: "Wrong pack", type: "rune" },
+      }),
+    ).toMatchObject({
+      ok: true,
+      value: { results: [{ status: "error", error: { code: "UNSUPPORTED_TYPE" } }] },
+    });
+  });
+
+  it("validates world, embedded, compendium, and update dry-runs without side effects", async () => {
+    const runtime = createRichFakeRuntime().addCompendium({
+      id: "world.actors",
+      label: "Writable Actors",
+      type: "Actor",
+      documents: [],
+    });
+    const actor = runtime.seedDocument("Actor", {
+      name: "Existing",
+      type: "stormborn",
+      system: { preserved: true },
+    });
+    const pack = await runtime.getCompendium("world.actors");
+    if (!pack) throw new Error("Expected writable fake compendium");
+    const createWorld = vi.spyOn(runtime, "createDocument");
+    const createPacked = vi.spyOn(pack, "createDocument");
+    const update = vi.spyOn(runtime, "updateDocument");
+    const snapshot = vi.spyOn(runtime, "snapshotState");
+    const markCommitted = vi.fn();
+    const service = new FoundryDocumentService(runtime);
+
+    const create = unwrap(
+      await service.create(
+        {
+          atomic: true,
+          dryRun: true,
+          items: [
+            { type: "Actor", data: { name: "World", type: "clockwork" } },
+            {
+              type: "Item",
+              parentUuid: actor.uuid,
+              data: { name: "Embedded", type: "rune" },
+            },
+            {
+              type: "Actor",
+              packId: "world.actors",
+              data: { name: "Packed", type: "stormborn" },
+            },
+          ],
+        },
+        { markCommitted },
+      ),
+    );
+    expect(create).toMatchObject({ atomic: true, dryRun: true, committed: false });
+    expect(
+      create.results.map((result) =>
+        result.status === "validated"
+          ? {
+              status: result.status,
+              target: result.validation.target,
+              schemaValidated: result.validation.schemaValidated,
+            }
+          : { status: result.status },
+      ),
+    ).toEqual([
+      { status: "validated", target: "world", schemaValidated: true },
+      { status: "validated", target: "embedded", schemaValidated: true },
+      { status: "validated", target: "compendium", schemaValidated: true },
+    ]);
+    expect(createWorld).not.toHaveBeenCalled();
+    expect(createPacked).not.toHaveBeenCalled();
+    expect(snapshot).not.toHaveBeenCalled();
+    expect(markCommitted).not.toHaveBeenCalled();
+    expect(unwrap(await service.list({ type: "Actor" })).items).toHaveLength(1);
+    expect(
+      unwrap(
+        await service.embeddedList({ parentUuid: actor.uuid, embeddedType: "Item", maxDepth: 1 }),
+      ).items,
+    ).toHaveLength(0);
+    expect(
+      unwrap(await service.compendiumDocumentsList({ packId: "world.actors", hydrate: true }))
+        .items,
+    ).toHaveLength(0);
+
+    expect(
+      unwrap(
+        await service.create({
+          type: "Actor",
+          data: { name: "", type: "stormborn" },
+          dryRun: true,
+        }),
+      ),
+    ).toMatchObject({
+      dryRun: true,
+      committed: false,
+      results: [{ status: "error", error: { code: "INVALID_DATA" } }],
+    });
+    expect(createWorld).not.toHaveBeenCalled();
+
+    const before = unwrap(await service.get({ uuid: actor.uuid }));
+    const auditCount = runtime.auditEvents.length;
+    const updateDryRun = unwrap(
+      await service.update(
+        {
+          uuid: actor.uuid,
+          data: { name: "Would change" },
+          expectedHash: before.sourceHash,
+          dryRun: true,
+        },
+        { markCommitted },
+      ),
+    );
+    expect(updateDryRun).toMatchObject({
+      uuid: actor.uuid,
+      dryRun: true,
+      committed: false,
+      document: { name: "Existing" },
+      validation: {
+        valid: true,
+        operation: "update",
+        target: "world",
+        schemaValidated: true,
+      },
+    });
+    expect(update).not.toHaveBeenCalled();
+    expect(markCommitted).not.toHaveBeenCalled();
+    expect(runtime.auditEvents).toHaveLength(auditCount);
+    expect(unwrap(await service.get({ uuid: actor.uuid })).data).toEqual(before.data);
+    expect(
+      await service.update({
+        uuid: actor.uuid,
+        data: { name: "" },
+        expectedHash: before.sourceHash,
+        dryRun: true,
+      }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+    expect(update).not.toHaveBeenCalled();
+    expect(unwrap(await service.get({ uuid: actor.uuid })).data).toEqual(before.data);
+  });
+
+  it("uses Foundry's runtime document class for direct compendium creates", async () => {
+    const rawCreated = {
+      id: "packed-a",
+      uuid: "Compendium.world.actors.Actor.packed-a",
+      documentName: "Actor",
+      type: "stellar",
+      pack: "world.actors",
+      ownership: { default: 0 },
+      toObject: () => ({ _id: "packed-a", name: "Packed", type: "stellar" }),
+      testUserPermission: () => true,
+      canUserModify: () => true,
+    };
+    const create = vi.fn(async () => rawCreated);
+    const documentClass = {
+      documentName: "Actor",
+      metadata: { name: "Actor", collection: "actors", schemaVersion: "14" },
+      canUserCreate: () => true,
+      create,
+    };
+    const pack = {
+      collection: "world.actors",
+      documentName: "Actor",
+      documentClass,
+      metadata: { label: "Actors", type: "Actor" },
+      locked: false,
+      visible: true,
+      size: 0,
+      index: [],
+      canUserModify: () => true,
+      getIndex: async () => [],
+      getDocuments: async () => [rawCreated],
+    };
+    const runtime = new BrowserFoundryRuntime({
+      game: {
+        ready: true,
+        user: { isGM: true },
+        documentTypes: { Actor: ["stellar"] },
+        collections: new Map([["Actor", { documentName: "Actor", documentClass, contents: [] }]]),
+        packs: new Map([["world.actors", pack]]),
+      },
+      CONFIG: { Actor: { documentClass } },
+      foundry: { utils: { parseUuid: (uuid: string) => ({ uuid }) } },
+      fromUuid: async (uuid: string) => (uuid === rawCreated.uuid ? rawCreated : null),
+    });
+    const service = new FoundryDocumentService(runtime);
+    const output = unwrap(
+      await service.create({
+        type: "Actor",
+        packId: "world.actors",
+        data: { name: "Packed", type: "stellar" },
+      }),
+    );
+    expect(output.results[0]).toMatchObject({
+      status: "created",
+      document: { uuid: rawCreated.uuid, packId: "world.actors" },
+    });
+    expect(create).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledWith(
+      { name: "Packed", type: "stellar" },
+      { pack: "world.actors", renderSheet: false },
+    );
+    expect(unwrap(await service.get({ uuid: rawCreated.uuid })).name).toBe("Packed");
+  });
+
   it("reports partial batch results explicitly and rolls back an atomic runtime failure", async () => {
     const runtime = createRichFakeRuntime();
     const service = new FoundryDocumentService(runtime);
@@ -357,9 +683,7 @@ describe("FoundryDocumentService generic create and update", () => {
         ready: true,
         user: { isGM: true },
         documentTypes: { Actor: ["stellar"] },
-        collections: new Map([
-          ["Actor", { documentName: "Actor", documentClass, contents: [] }],
-        ]),
+        collections: new Map([["Actor", { documentName: "Actor", documentClass, contents: [] }]]),
         packs: new Map(),
       },
       CONFIG: { Actor: { documentClass } },
@@ -568,11 +892,7 @@ describe("FoundryDocumentService embedded and compendium enumeration", () => {
       });
     const service = new FoundryDocumentService(runtime);
     const packs = unwrap(await service.compendiumsList()).packs;
-    expect(packs.map((pack) => pack.id)).toEqual([
-      "world.actors",
-      "world.items",
-      "world.locked",
-    ]);
+    expect(packs.map((pack) => pack.id)).toEqual(["world.actors", "world.items", "world.locked"]);
     expect(packs.map((pack) => pack.documentCount)).toEqual([2, 2, 1]);
 
     const index = unwrap(
@@ -616,10 +936,118 @@ describe("FoundryDocumentService embedded and compendium enumeration", () => {
     expect(
       await service.create({
         type: "Actor",
-        parentUuid: "Compendium.world.locked.actor-0001",
+        parentUuid: "Compendium.world.locked.Actor.actor-0001",
         data: { name: "No write", type: "stormborn" },
       }),
     ).toMatchObject({ ok: true, value: { results: [{ status: "error" }] } });
+  });
+
+  it("keeps resolvable Foundry v14 compendium index UUIDs across every fallback", async () => {
+    const indexedUuid = "Compendium.world.indexed.Actor.indexed";
+    const helperUuid = "Compendium.world.helper.Actor.helper";
+    const constructedUuid = "Compendium.world.constructed.Actor.constructed";
+    const rawDocuments = new Map(
+      [
+        ["indexed", indexedUuid, "Indexed Actor", "world.indexed"],
+        ["helper", helperUuid, "Helper Actor", "world.helper"],
+        ["constructed", constructedUuid, "Constructed Actor", "world.constructed"],
+      ].map(([id, uuid, name, pack]) => [
+        uuid,
+        {
+          id,
+          uuid,
+          documentName: "Actor",
+          type: "npc",
+          pack,
+          ownership: { default: 0 },
+          toObject: () => ({ _id: id, name, type: "npc" }),
+          testUserPermission: () => true,
+          canUserModify: () => true,
+        },
+      ]),
+    );
+    const documentClass = {
+      documentName: "Actor",
+      metadata: { name: "Actor", collection: "actors", schemaVersion: "14" },
+      canUserCreate: () => true,
+    };
+    const indexedGetUuid = vi.fn(() => "Compendium.wrong.Actor.wrong");
+    const helperGetUuid = vi.fn((id: string) => `Compendium.world.helper.Actor.${id}`);
+    const makePack = (
+      collection: string,
+      entry: Record<string, unknown>,
+      getUuid?: (id: string) => string,
+    ) => ({
+      collection,
+      documentName: "Actor",
+      documentClass,
+      metadata: { label: collection, type: "Actor" },
+      locked: false,
+      visible: true,
+      size: 1,
+      index: [entry],
+      canUserModify: () => true,
+      getIndex: async () => [entry],
+      getDocuments: async () => [],
+      ...(getUuid ? { getUuid } : {}),
+    });
+    const runtime = new BrowserFoundryRuntime({
+      game: {
+        ready: true,
+        user: { isGM: true },
+        documentTypes: { Actor: ["npc"] },
+        collections: new Map([["Actor", { documentName: "Actor", documentClass, contents: [] }]]),
+        packs: new Map([
+          [
+            "world.indexed",
+            makePack(
+              "world.indexed",
+              { _id: "indexed", uuid: indexedUuid, name: "Indexed Actor", type: "npc" },
+              indexedGetUuid,
+            ),
+          ],
+          [
+            "world.helper",
+            makePack(
+              "world.helper",
+              { _id: "helper", name: "Helper Actor", type: "npc" },
+              helperGetUuid,
+            ),
+          ],
+          [
+            "world.constructed",
+            makePack("world.constructed", {
+              _id: "constructed",
+              name: "Constructed Actor",
+              type: "npc",
+            }),
+          ],
+        ]),
+      },
+      CONFIG: { Actor: { documentClass } },
+      foundry: { utils: { parseUuid: (uuid: string) => ({ uuid }) } },
+      fromUuid: async (uuid: string) => rawDocuments.get(uuid) ?? null,
+    });
+    const service = new FoundryDocumentService(runtime);
+
+    for (const [packId, expectedUuid, expectedName] of [
+      ["world.indexed", indexedUuid, "Indexed Actor"],
+      ["world.helper", helperUuid, "Helper Actor"],
+      ["world.constructed", constructedUuid, "Constructed Actor"],
+    ] as const) {
+      const index = unwrap(await service.compendiumDocumentsList({ packId, hydrate: false }));
+      expect(index.items).toEqual([
+        expect.objectContaining({ uuid: expectedUuid, type: "Actor", name: expectedName }),
+      ]);
+      expect(unwrap(await service.get({ uuid: index.items[0]?.uuid ?? "" }))).toMatchObject({
+        uuid: expectedUuid,
+        type: "Actor",
+        name: expectedName,
+      });
+    }
+    expect(indexedGetUuid).not.toHaveBeenCalled();
+    expect(helperGetUuid).toHaveBeenCalledOnce();
+    expect(helperGetUuid).toHaveBeenCalledWith("helper");
   });
 });
 

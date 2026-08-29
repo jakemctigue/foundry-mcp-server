@@ -63,6 +63,7 @@ export const CompanionAuthProofMessageSchema = z
     type: z.literal("auth.proof"),
     hello: CompanionHelloMessageSchema,
     proof: CompanionAuthValueSchema,
+    identityProof: CompanionAuthValueSchema.optional(),
   })
   .strict();
 export type CompanionAuthProofMessage = z.infer<typeof CompanionAuthProofMessageSchema>;
@@ -72,9 +73,19 @@ export const CompanionAuthReadyMessageSchema = z
     type: z.literal("auth.ready"),
     connectionId: z.string().trim().min(1).max(512),
     proof: CompanionAuthValueSchema,
+    identityCredential: CompanionAuthValueSchema.optional(),
   })
   .strict();
 export type CompanionAuthReadyMessage = z.infer<typeof CompanionAuthReadyMessageSchema>;
+
+export const CompanionAuthConfirmMessageSchema = z
+  .object({
+    type: z.literal("auth.confirm"),
+    connectionId: z.string().trim().min(1).max(512),
+    proof: CompanionAuthValueSchema,
+  })
+  .strict();
+export type CompanionAuthConfirmMessage = z.infer<typeof CompanionAuthConfirmMessageSchema>;
 
 /** Stable, domain-separated payload authenticated by the companion pairing secret. */
 export function companionAuthPayload(
@@ -109,6 +120,24 @@ export function companionAuthReadyPayload(
   hello: CompanionHelloMessage,
 ): string {
   return `${companionAuthPayload(challenge, origin, hello)}\nserver-ready`;
+}
+
+/** Proof made with the connection-scoped credential issued during enrollment. */
+export function companionIdentityAuthPayload(
+  challenge: string,
+  origin: string,
+  hello: CompanionHelloMessage,
+): string {
+  return `${companionAuthPayload(challenge, origin, hello)}\nclient-identity-v1`;
+}
+
+/** Confirmation sent after a newly issued identity credential is durably stored. */
+export function companionIdentityConfirmPayload(
+  challenge: string,
+  origin: string,
+  hello: CompanionHelloMessage,
+): string {
+  return `${companionAuthPayload(challenge, origin, hello)}\nclient-identity-confirm-v1`;
 }
 
 export const EventEnvelopeSchema = z
@@ -213,6 +242,7 @@ export const CompanionWireMessageSchema = z.discriminatedUnion("type", [
   CompanionAuthChallengeMessageSchema,
   CompanionAuthProofMessageSchema,
   CompanionAuthReadyMessageSchema,
+  CompanionAuthConfirmMessageSchema,
   CompanionHelloMessageSchema,
   EventResumeMessageSchema,
   EventPublishMessageSchema,

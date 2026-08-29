@@ -305,6 +305,7 @@ export class FoundryAssetService {
         operationError("NOT_FOUND", `Asset source ${parsed.data.source} was not found`);
       const deduplicated = new Map<string, AssetsImagesListOutput["items"][number]>();
       const truncationReasons = new Set<string>();
+      const writeCapabilities = new Map<string, AssetSourceCapability>();
       for (const source of selectedSources) {
         const queue: Array<{ path: string; depth: number }> = [{ path: pathPrefix, depth: 0 }];
         const visited = new Set<string>();
@@ -334,13 +335,23 @@ export class FoundryAssetService {
             // FilePicker source order is authoritative: the first source exposing a path wins.
             if (!extensions.includes(extensionOf(entryPath)) || deduplicated.has(entryPath))
               continue;
+            const slash = entryPath.lastIndexOf("/");
+            const directory = slash < 0 ? "" : entryPath.slice(0, slash);
+            const cacheKey = `${source.id}:${directory}`;
+            let writeCapability = writeCapabilities.get(cacheKey);
+            if (!writeCapability) {
+              writeCapability = await this.#writeCapability(source.id, entryPath, source);
+              writeCapabilities.set(cacheKey, writeCapability);
+            }
             deduplicated.set(entryPath, {
               path: entryPath,
               source: source.id,
               ...(entry.size !== undefined ? { size: entry.size } : {}),
               ...(entry.mimeType ? { mimeType: entry.mimeType } : {}),
-              writable: source.writable,
-              ...(!source.writable && source.reason ? { writeReason: source.reason } : {}),
+              writable: writeCapability.writable,
+              ...(!writeCapability.writable && writeCapability.reason
+                ? { writeReason: writeCapability.reason }
+                : {}),
             });
           }
         }
@@ -660,12 +671,12 @@ export class FoundryAssetService {
     this.#guard(operation);
     const target = validateAssetPath(destinationPath);
     const extension = extensionOf(target);
-    if (!DEFAULT_IMAGE_EXTENSIONS.includes(extension as (typeof DEFAULT_IMAGE_EXTENSIONS)[number]))
+    if (![".png", ".jpg", ".jpeg", ".gif", ".webp"].includes(extension))
       operationError(
         "INVALID_DATA",
-        `Destination extension ${extension || "(none)"} is unsupported`,
+        `Destination extension ${extension || "(none)"} is unsupported for safe upload`,
       );
-    const capability = await this.#writableSource(sourceId);
+    const capability = await this.#writableDestination(sourceId, target);
     let targetPath = target;
     const exists = await this.assets.exists(sourceId, targetPath);
     let collision: PreparedUpload["collision"] = "created";
@@ -770,12 +781,31 @@ export class FoundryAssetService {
     };
   }
 
-  async #writableSource(sourceId: string): Promise<AssetSourceCapability> {
-    const source = (await this.assets.listSources()).find((candidate) => candidate.id === sourceId);
+  async #writeCapability(
+    sourceId: string,
+    destinationPath: string,
+    knownSource?: AssetSourceCapability,
+  ): Promise<AssetSourceCapability> {
+    const source =
+      knownSource ??
+      (await this.assets.listSources()).find((candidate) => candidate.id === sourceId);
     if (!source) operationError("NOT_FOUND", `Asset source ${sourceId} was not found`);
-    if (!source.writable)
-      operationError("PERMISSION_DENIED", source.reason ?? `Asset source ${sourceId} is read-only`);
-    return source;
+    return typeof this.assets.getWriteCapability === "function"
+      ? this.assets.getWriteCapability(sourceId, destinationPath)
+      : source;
+  }
+
+  async #writableDestination(
+    sourceId: string,
+    destinationPath: string,
+  ): Promise<AssetSourceCapability> {
+    const capability = await this.#writeCapability(sourceId, destinationPath);
+    if (!capability.writable)
+      operationError(
+        "PERMISSION_DENIED",
+        capability.reason ?? `Asset destination ${sourceId}:${destinationPath} is read-only`,
+      );
+    return capability;
   }
 
   async #commitUpload(

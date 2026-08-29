@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   DocumentSourceHash,
   CompendiumDocumentsListOutput,
+  CompendiumsListOutput,
   DocumentsCreateInput,
   DocumentsListInput,
   DocumentsSnapshotInput,
@@ -44,6 +45,37 @@ describe("generic document protocol schemas", () => {
     ).toBe(true);
   });
 
+  it("accepts explicit compendium create targets and rejects ambiguous targets", () => {
+    const single = DocumentsCreateInput.parse({
+      type: "Actor",
+      packId: "world.actors",
+      data: { name: "Packed Actor", type: "system-actor" },
+      dryRun: true,
+    });
+    expect(single).toMatchObject({ packId: "world.actors", dryRun: true });
+    expect(
+      DocumentsCreateInput.safeParse({
+        type: "Item",
+        parentUuid: "Actor.a",
+        packId: "world.items",
+        data: { name: "Ambiguous" },
+      }).success,
+    ).toBe(false);
+    expect(
+      DocumentsCreateInput.safeParse({
+        items: [
+          {
+            type: "Item",
+            parentUuid: "Actor.a",
+            packId: "world.items",
+            data: { name: "Ambiguous" },
+          },
+        ],
+        dryRun: true,
+      }).success,
+    ).toBe(false);
+  });
+
   it("requires an optimistic precondition unless overwrite is explicitly forced", () => {
     expect(
       DocumentsUpdateInput.safeParse({ uuid: "Actor.a", data: { name: "Changed" } }).success,
@@ -62,6 +94,36 @@ describe("generic document protocol schemas", () => {
         forceOverwrite: true,
       }).success,
     ).toBe(true);
+    expect(
+      DocumentsUpdateInput.safeParse({
+        uuid: "Actor.a",
+        data: { name: "Changed" },
+        dryRun: true,
+      }).success,
+    ).toBe(false);
+    expect(
+      DocumentsUpdateInput.parse({
+        uuid: "Actor.a",
+        data: { name: "Changed" },
+        expectedHash: "hash",
+        dryRun: true,
+      }).dryRun,
+    ).toBe(true);
+  });
+
+  it("decodes pre-writable-capability compendium summaries as fail-closed", () => {
+    const output = CompendiumsListOutput.parse({
+      packs: [
+        {
+          id: "world.actors",
+          label: "Actors",
+          type: "Actor",
+          documentCount: 1,
+          locked: false,
+        },
+      ],
+    });
+    expect(output.packs[0]?.writable).toBe(false);
   });
 
   it("bounds snapshot depth, bytes, and items", () => {

@@ -7,6 +7,7 @@ import WebSocket from "ws";
 import {
   BRIDGE_PROTOCOL_VERSION,
   companionAuthPayload,
+  companionIdentityConfirmPayload,
   type CompanionHelloMessage,
 } from "@foundry-mcp/protocol";
 import { startDaemon, type Daemon } from "../src/daemon.js";
@@ -19,18 +20,31 @@ function readStatus(statusPath: string): Record<string, unknown> {
 
 async function authenticate(socket: WebSocket, hello: CompanionHelloMessage): Promise<void> {
   await new Promise<void>((resolve, reject) => {
+    let challenge = "";
+    let origin = "";
     const onMessage = (raw: WebSocket.RawData): void => {
       const message = JSON.parse(raw.toString()) as Record<string, unknown>;
       if (message["type"] === "auth.challenge" && typeof message["challenge"] === "string") {
+        challenge = message["challenge"];
+        origin = message["origin"] as string;
         socket.send(
           JSON.stringify({
             type: "auth.proof",
             hello,
             proof: createHmac("sha256", PAIRING_SECRET)
-              .update(
-                companionAuthPayload(message["challenge"], message["origin"] as string, hello),
-                "utf8",
-              )
+              .update(companionAuthPayload(challenge, origin, hello), "utf8")
+              .digest("base64url"),
+          }),
+        );
+      }
+      if (message["type"] === "auth.ready" && typeof message["identityCredential"] === "string") {
+        const credential = Buffer.from(message["identityCredential"], "base64url");
+        socket.send(
+          JSON.stringify({
+            type: "auth.confirm",
+            connectionId: hello.connectionId,
+            proof: createHmac("sha256", credential)
+              .update(companionIdentityConfirmPayload(challenge, origin, hello), "utf8")
               .digest("base64url"),
           }),
         );

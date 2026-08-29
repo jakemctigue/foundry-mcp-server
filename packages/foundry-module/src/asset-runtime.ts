@@ -6,6 +6,18 @@ import {
 } from "@foundry-mcp/protocol";
 
 export const MAX_RUNTIME_IMAGE_DIMENSION = 16_384;
+export const MAX_ASSET_SOURCE_CAPABILITIES_SETTING_LENGTH = 16_384;
+
+const MAX_CONFIGURED_ASSET_SOURCES = 16;
+const MAX_WRITABLE_PATH_PREFIXES = 32;
+const MAX_SOURCE_ID_LENGTH = 64;
+const MAX_BUCKET_LENGTH = 255;
+const MAX_PATH_PREFIX_LENGTH = 500;
+const MAX_CAPABILITY_REASON_LENGTH = 500;
+const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const BUCKET_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const CAPABILITY_KEYS = new Set(["writable", "bucket", "writablePathPrefixes", "reason"]);
+const FORBIDDEN_SOURCE_IDS = new Set(["__proto__", "constructor", "data", "prototype", "public"]);
 
 export interface RuntimeAssetEntry {
   path: string;
@@ -37,6 +49,8 @@ export interface RuntimeDecodedImage {
 export interface FoundryAssetRuntimeAdapter {
   isOnline(): boolean;
   listSources(): Promise<AssetSourceCapability[]>;
+  /** Non-mutating, destination-aware write preflight. Production runtimes must fail closed. */
+  getWriteCapability?(sourceId: string, destinationPath: string): Promise<AssetSourceCapability>;
   browse(sourceId: string, path: string, extensions?: string[]): Promise<RuntimeAssetBrowseResult>;
   exists(sourceId: string, path: string): Promise<boolean>;
   decodeImage(
@@ -153,15 +167,192 @@ function boundedDecodeLimit(value: number, hardMaximum: number, name: string): n
   return Math.min(value, hardMaximum);
 }
 
+export interface BrowserFoundryAssetSourceCapability {
+  writable: boolean;
+  reason?: string;
+  /** Explicitly authorized destination prefixes for non-core providers. */
+  writablePathPrefixes?: readonly string[];
+  /** Required to substantiate access to an S3 provider destination. */
+  bucket?: string;
+}
+
+export type BrowserFoundryAssetSourceCapabilities = Record<
+  string,
+  BrowserFoundryAssetSourceCapability
+>;
+
+export type AssetSourceCapabilitiesSettingResult =
+  { ok: true; value: BrowserFoundryAssetSourceCapabilities } | { ok: false; error: string };
+
+function invalidCapabilities(error: string): AssetSourceCapabilitiesSettingResult {
+  return { ok: false, error };
+}
+
+function containsControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)) return true;
+  }
+  return false;
+}
+
+function parsePathPrefixes(
+  sourceId: string,
+  value: unknown,
+): { ok: true; value?: string[] } | { ok: false; error: string } {
+  if (value === undefined) return { ok: true };
+  if (!Array.isArray(value) || value.length > MAX_WRITABLE_PATH_PREFIXES) {
+    return {
+      ok: false,
+      error: `${sourceId}.writablePathPrefixes must be an array with at most ${MAX_WRITABLE_PATH_PREFIXES} entries`,
+    };
+  }
+  const prefixes: string[] = [];
+  for (const candidate of value) {
+    if (typeof candidate !== "string") {
+      return { ok: false, error: `${sourceId}.writablePathPrefixes must contain only strings` };
+    }
+    const prefix = candidate.trim();
+    const segments = prefix.split("/");
+    if (
+      prefix.length === 0 ||
+      prefix.length > MAX_PATH_PREFIX_LENGTH ||
+      prefix.startsWith("/") ||
+      prefix.endsWith("/") ||
+      prefix.includes("\\") ||
+      prefix.includes(":") ||
+      prefix.includes("?") ||
+      prefix.includes("#") ||
+      containsControlCharacter(prefix) ||
+      segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
+    ) {
+      return {
+        ok: false,
+        error: `${sourceId}.writablePathPrefixes contains an invalid relative Foundry path`,
+      };
+    }
+    if (!prefixes.includes(prefix)) prefixes.push(prefix);
+  }
+  return { ok: true, value: prefixes };
+}
+
+/** Parses the GM-controlled world setting without accepting credentials or unbounded input. */
+export function parseAssetSourceCapabilitiesSetting(
+  raw: unknown,
+): AssetSourceCapabilitiesSettingResult {
+  if (typeof raw !== "string") return invalidCapabilities("the setting must be a JSON string");
+  const source = raw.trim();
+  if (source.length === 0) return { ok: true, value: {} };
+  if (source.length > MAX_ASSET_SOURCE_CAPABILITIES_SETTING_LENGTH) {
+    return invalidCapabilities(
+      `the setting exceeds ${MAX_ASSET_SOURCE_CAPABILITIES_SETTING_LENGTH} characters`,
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(source) as unknown;
+  } catch {
+    return invalidCapabilities("the setting is not valid JSON");
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return invalidCapabilities("the setting root must be an object keyed by Foundry source ID");
+  }
+
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (entries.length > MAX_CONFIGURED_ASSET_SOURCES) {
+    return invalidCapabilities(
+      `the setting contains more than ${MAX_CONFIGURED_ASSET_SOURCES} asset sources`,
+    );
+  }
+  const capabilities: BrowserFoundryAssetSourceCapabilities = Object.create(null) as Record<
+    string,
+    BrowserFoundryAssetSourceCapability
+  >;
+  for (const [sourceId, rawCapability] of entries) {
+    if (
+      sourceId.length === 0 ||
+      sourceId.length > MAX_SOURCE_ID_LENGTH ||
+      !SOURCE_ID_PATTERN.test(sourceId) ||
+      FORBIDDEN_SOURCE_IDS.has(sourceId)
+    ) {
+      return invalidCapabilities(`asset source ID ${sourceId || "(empty)"} is not allowed`);
+    }
+    if (
+      rawCapability === null ||
+      typeof rawCapability !== "object" ||
+      Array.isArray(rawCapability)
+    ) {
+      return invalidCapabilities(`${sourceId} must contain a capability object`);
+    }
+    const capability = rawCapability as Record<string, unknown>;
+    const unknownKey = Object.keys(capability).find((key) => !CAPABILITY_KEYS.has(key));
+    if (unknownKey) {
+      return invalidCapabilities(
+        `${sourceId} contains unsupported field ${unknownKey}; credentials are not accepted`,
+      );
+    }
+    if (typeof capability.writable !== "boolean") {
+      return invalidCapabilities(`${sourceId}.writable must be a boolean`);
+    }
+
+    const prefixes = parsePathPrefixes(sourceId, capability.writablePathPrefixes);
+    if (!prefixes.ok) return invalidCapabilities(prefixes.error);
+    if (capability.writable && (!prefixes.value || prefixes.value.length === 0)) {
+      return invalidCapabilities(
+        `${sourceId}.writablePathPrefixes must authorize at least one path when writable is true`,
+      );
+    }
+
+    let bucket: string | undefined;
+    if (capability.bucket !== undefined) {
+      if (typeof capability.bucket !== "string") {
+        return invalidCapabilities(`${sourceId}.bucket must be a string`);
+      }
+      bucket = capability.bucket.trim();
+      if (
+        bucket.length === 0 ||
+        bucket.length > MAX_BUCKET_LENGTH ||
+        !BUCKET_PATTERN.test(bucket)
+      ) {
+        return invalidCapabilities(`${sourceId}.bucket is invalid`);
+      }
+    }
+    if (sourceId === "s3" && !bucket) {
+      return invalidCapabilities("s3.bucket is required");
+    }
+
+    let reason: string | undefined;
+    if (capability.reason !== undefined) {
+      if (typeof capability.reason !== "string") {
+        return invalidCapabilities(`${sourceId}.reason must be a string`);
+      }
+      reason = capability.reason.trim();
+      if (reason.length === 0 || reason.length > MAX_CAPABILITY_REASON_LENGTH) {
+        return invalidCapabilities(`${sourceId}.reason must contain 1 to 500 characters`);
+      }
+    }
+    capabilities[sourceId] = {
+      writable: capability.writable,
+      ...(bucket ? { bucket } : {}),
+      ...(prefixes.value ? { writablePathPrefixes: prefixes.value } : {}),
+      ...(reason ? { reason } : {}),
+    };
+  }
+  return { ok: true, value: capabilities };
+}
+
 export interface BrowserFoundryAssetRuntimeOptions {
   global?: unknown;
-  sourceCapabilities?: Record<string, { writable: boolean; reason?: string }>;
+  sourceCapabilities?: BrowserFoundryAssetSourceCapabilities;
 }
 
 /** Uses only Foundry's public FilePicker surface; it never reads the browser host filesystem. */
 export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
   readonly #global: UnknownRecord;
-  readonly #configuredCapabilities: Record<string, { writable: boolean; reason?: string }>;
+  readonly #configuredCapabilities: NonNullable<
+    BrowserFoundryAssetRuntimeOptions["sourceCapabilities"]
+  >;
 
   constructor(options: BrowserFoundryAssetRuntimeOptions = {}) {
     this.#global = record(options.global ?? globalThis);
@@ -177,7 +368,6 @@ export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
     const uploadAllowed = canUpload(this.#global);
     return pickerSourceIds(FilePicker).map((id) => {
       const configured = this.#configuredCapabilities[id];
-      if (configured) return { id, ...configured };
       if (id === "public") {
         return {
           id,
@@ -185,10 +375,138 @@ export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
           reason: "Foundry core public assets are read-only",
         };
       }
-      return uploadAllowed
-        ? { id, writable: true }
-        : { id, writable: false, reason: "The connected Foundry user cannot upload files" };
+      if (!uploadAllowed)
+        return { id, writable: false, reason: "The connected Foundry user cannot upload files" };
+      if (typeof FilePicker.upload !== "function")
+        return { id, writable: false, reason: "Foundry FilePicker.upload() is unavailable" };
+      if (configured) {
+        if (!configured.writable) {
+          return {
+            id,
+            writable: false,
+            reason: configured.reason ?? `Asset source ${id} is configured read-only`,
+          };
+        }
+        if (id !== "data" && !configured.writablePathPrefixes?.length) {
+          return {
+            id,
+            writable: false,
+            reason: `Foundry source ${id} requires at least one configured writable path`,
+          };
+        }
+        if (id === "s3" && !configured.bucket) {
+          return {
+            id,
+            writable: false,
+            reason: "The S3 destination requires an explicitly configured bucket",
+          };
+        }
+        return {
+          id,
+          writable: true,
+        };
+      }
+      if (id !== "data") {
+        return {
+          id,
+          writable: false,
+          reason: `Foundry source ${id} requires explicit provider and destination configuration`,
+        };
+      }
+      return { id, writable: true };
     });
+  }
+
+  async getWriteCapability(
+    sourceId: string,
+    destinationPath: string,
+  ): Promise<AssetSourceCapability> {
+    const FilePicker = filePickerConstructor(this.#global);
+    if (!pickerSourceIds(FilePicker).includes(sourceId))
+      return { id: sourceId, writable: false, reason: `Asset source ${sourceId} is unavailable` };
+    if (sourceId === "public")
+      return { id: sourceId, writable: false, reason: "Foundry core public assets are read-only" };
+    if (!canUpload(this.#global))
+      return {
+        id: sourceId,
+        writable: false,
+        reason: "The connected Foundry user cannot upload files",
+      };
+    if (typeof FilePicker.upload !== "function")
+      return {
+        id: sourceId,
+        writable: false,
+        reason: "Foundry FilePicker.upload() is unavailable",
+      };
+
+    const configured = this.#configuredCapabilities[sourceId];
+    if (configured?.writable === false)
+      return {
+        id: sourceId,
+        writable: false,
+        reason: configured.reason ?? `Asset source ${sourceId} is configured read-only`,
+      };
+    const normalizedPath = destinationPath.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
+    const prefixes = configured?.writablePathPrefixes?.map((prefix) =>
+      prefix.replaceAll("\\", "/").replace(/^\/+|\/+$/g, ""),
+    );
+    if (sourceId !== "data" && configured?.writable === true && !prefixes?.length) {
+      return {
+        id: sourceId,
+        writable: false,
+        reason: `Foundry source ${sourceId} requires at least one configured writable path`,
+      };
+    }
+    if (
+      prefixes &&
+      prefixes.length > 0 &&
+      !prefixes.some(
+        (prefix) => normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`),
+      )
+    ) {
+      return {
+        id: sourceId,
+        writable: false,
+        reason: `Destination ${destinationPath} is outside the configured writable paths for ${sourceId}`,
+      };
+    }
+    if (sourceId !== "data" && configured?.writable !== true) {
+      return {
+        id: sourceId,
+        writable: false,
+        reason: `Foundry source ${sourceId} requires explicit provider and destination configuration`,
+      };
+    }
+    if (sourceId === "s3" && !configured?.bucket) {
+      return {
+        id: sourceId,
+        writable: false,
+        reason: "The S3 destination requires an explicitly configured bucket",
+      };
+    }
+
+    const slash = normalizedPath.lastIndexOf("/");
+    const directory = slash < 0 ? "" : normalizedPath.slice(0, slash);
+    const browse = FilePicker.browse;
+    if (typeof browse !== "function") {
+      return {
+        id: sourceId,
+        writable: false,
+        reason: "Foundry FilePicker.browse() is unavailable for destination validation",
+      };
+    }
+    try {
+      await browse.call(FilePicker, sourceId, directory, {
+        ...(configured?.bucket ? { bucket: configured.bucket } : {}),
+      });
+    } catch {
+      return {
+        id: sourceId,
+        writable: false,
+        reason: `Destination directory ${directory || "/"} could not be accessed for ${sourceId}`,
+      };
+    }
+    return { id: sourceId, writable: true };
   }
 
   async browse(
@@ -200,7 +518,12 @@ export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
     const browse = FilePicker.browse;
     if (typeof browse !== "function") throw new Error("Foundry FilePicker.browse() is unavailable");
     const raw = record(
-      await browse.call(FilePicker, sourceId, path, extensions ? { extensions } : {}),
+      await browse.call(FilePicker, sourceId, path, {
+        ...(extensions ? { extensions } : {}),
+        ...(this.#configuredCapabilities[sourceId]?.bucket
+          ? { bucket: this.#configuredCapabilities[sourceId]?.bucket }
+          : {}),
+      }),
     );
     const entries: RuntimeAssetEntry[] = [];
     for (const directory of values(raw.dirs ?? raw.directories)) {
@@ -327,7 +650,12 @@ export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
         sourceId,
         directory,
         file,
-        { overwrite: options.overwrite },
+        {
+          overwrite: options.overwrite,
+          ...(this.#configuredCapabilities[sourceId]?.bucket
+            ? { bucket: this.#configuredCapabilities[sourceId]?.bucket }
+            : {}),
+        },
         { notify: false },
       ),
     );

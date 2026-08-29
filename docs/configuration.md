@@ -22,6 +22,36 @@ An Origin is the Foundry page's browser Origin, not its world URL. For example, 
 
 Keep `localAssetRoots` empty unless the AI must import a local file. If enabled, choose narrow dedicated directories; the loader resolves the final path, rejects symlinks/junctions and escapes, limits bytes, and validates image data before upload.
 
+## Foundry non-core asset sources
+
+A Game Master can authorize bounded write destinations for a non-core Foundry `FilePicker` source in
+**Configure Settings → Module Settings → Foundry MCP non-core asset sources**. This is a world-scoped
+String setting and requires a reload. Its value is a JSON object keyed by source ID. For example:
+
+```json
+{
+  "s3": {
+    "writable": true,
+    "bucket": "campaign-bucket",
+    "writablePathPrefixes": ["campaign/art", "campaign/maps"]
+  },
+  "forge": {
+    "writable": false,
+    "reason": "Managed by the hosting provider"
+  }
+}
+```
+
+Each entry requires the boolean `writable`. `bucket`, `writablePathPrefixes`, and `reason` are the
+only optional fields. A writable non-core source must have at least one relative, traversal-safe
+path prefix; `s3` also requires a bucket. The module accepts at most 16 sources, 32 prefixes per
+source, and 16,384 total JSON characters. Invalid, oversized, incomplete, core-source, or
+unknown-field configuration is ignored in full, leaving every non-core source read-only.
+
+Do not put access keys, bearer tokens, passwords, endpoint URLs, or any other credential in this
+setting. It does not configure provider authentication; Foundry's existing provider configuration
+remains authoritative. The strict schema rejects credential fields rather than retaining them.
+
 ## Privacy and retention
 
 `capturePrivateContent: false` is the safe default. The event/reconciliation layer suppresses private chat and restricted Journal, Actor, and Item content while retaining public-safe metadata needed for continuity. Enabling private capture is a deliberate policy change: use a private world, review who can query the MCP client, shorten retention where appropriate, and avoid sending captured context to a network provider unless everyone affected has agreed.

@@ -483,10 +483,19 @@ export class HostBridgeRouter {
       );
     }
     const assetKind = record(operationParams["asset"])["kind"];
-    const additionalCapabilities: RequestedCapability[] =
-      method === "assets.images.attach" && (assetKind === "upload" || assetKind === "url")
-        ? ["assets:upload"]
-        : [];
+    const additionalCapabilities: RequestedCapability[] = [];
+    if (method === "assets.images.attach" && (assetKind === "upload" || assetKind === "url")) {
+      additionalCapabilities.push("assets:upload");
+    }
+    if (method === "assets.images.generate") {
+      const provider =
+        typeof operationParams["provider"] === "string"
+          ? operationParams["provider"]
+          : "deterministic";
+      if (this.imageProviders.requiresNetwork(provider)) {
+        additionalCapabilities.push("ai:network");
+      }
+    }
     return runAuthorizedOperation(
       this.db,
       {

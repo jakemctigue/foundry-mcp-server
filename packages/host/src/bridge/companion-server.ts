@@ -3,6 +3,7 @@ import type { IncomingMessage } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import {
   BRIDGE_PROTOCOL_VERSION,
+  CompanionAuthConfirmMessageSchema,
   CompanionAuthProofMessageSchema,
   CompanionRequestProgressMessageSchema,
   CompanionResponseMessageSchema,
@@ -13,6 +14,8 @@ import {
   makeError,
   companionAuthPayload,
   companionAuthReadyPayload,
+  companionIdentityAuthPayload,
+  companionIdentityConfirmPayload,
   type CompanionHelloMessage,
   type CompanionRequestMessage,
   type JsonValue,
@@ -30,6 +33,10 @@ const DEFAULT_RATE_LIMIT_WINDOW_MS = 10_000;
 const DEFAULT_MAX_MESSAGES_PER_CONNECTION = 1_000;
 const DEFAULT_MAX_MESSAGES_GLOBAL = 10_000;
 const CANCELLATION_ACK_TIMEOUT_MS = 1_000;
+const IDENTITY_CREDENTIAL_BYTES = 32;
+const IDENTITY_CIPHER_VERSION = "v1";
+const IDENTITY_CIPHER_DOMAIN = Buffer.from("foundry-mcp-companion-identity-cipher-v1\0", "utf8");
+const IDENTITY_KEY_ID_DOMAIN = Buffer.from("foundry-mcp-companion-pairing-key-id-v1\0", "utf8");
 const MUTATION_METHODS = new Set([
   "documents.create",
   "documents.update",
@@ -124,6 +131,23 @@ interface RateWindow {
   count: number;
 }
 
+interface CompanionIdentityRow {
+  connection_id: string;
+  world_id: string;
+  user_id: string;
+  foundry_user_role: CompanionHelloMessage["foundryUserRole"];
+  pairing_key_id: string;
+  credential_ciphertext: string;
+  confirmed: number;
+}
+
+interface CompanionIdentity {
+  connectionId: string;
+  worldId: string;
+  userId: string;
+  foundryUserRole: CompanionHelloMessage["foundryUserRole"];
+}
+
 function positiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${name} must be a positive safe integer`);
@@ -138,6 +162,113 @@ function canonicalJson(value: unknown): string {
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
     .join(",")}}`;
+}
+
+function canonicalBase64Url(value: string, expectedBytes: number): Buffer | undefined {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return undefined;
+  const decoded = Buffer.from(value, "base64url");
+  if (decoded.length !== expectedBytes || decoded.toString("base64url") !== value) return undefined;
+  return decoded;
+}
+
+function pairingKeyId(pairingSecret: Buffer): string {
+  return crypto
+    .createHmac("sha256", pairingSecret)
+    .update(IDENTITY_KEY_ID_DOMAIN)
+    .digest("base64url");
+}
+
+function identityFromHello(hello: CompanionHelloMessage): CompanionIdentity | undefined {
+  if (hello.foundryUserRole !== hello.currentUser.role) return undefined;
+  return {
+    connectionId: hello.connectionId,
+    worldId: hello.worldId,
+    userId: hello.currentUser.id,
+    foundryUserRole: hello.foundryUserRole,
+  };
+}
+
+function identityFromRow(row: CompanionIdentityRow): CompanionIdentity {
+  return {
+    connectionId: row.connection_id,
+    worldId: row.world_id,
+    userId: row.user_id,
+    foundryUserRole: row.foundry_user_role,
+  };
+}
+
+function sameIdentity(left: CompanionIdentity, right: CompanionIdentity): boolean {
+  return (
+    left.connectionId === right.connectionId &&
+    left.worldId === right.worldId &&
+    left.userId === right.userId &&
+    left.foundryUserRole === right.foundryUserRole
+  );
+}
+
+function identityAdditionalData(identity: CompanionIdentity, keyId: string): Buffer {
+  return Buffer.from(
+    canonicalJson([
+      "foundry-mcp-companion-identity-v1",
+      identity.connectionId,
+      identity.worldId,
+      identity.userId,
+      identity.foundryUserRole,
+      keyId,
+    ]),
+    "utf8",
+  );
+}
+
+function identityCipherKey(pairingSecret: Buffer): Buffer {
+  return crypto.createHmac("sha256", pairingSecret).update(IDENTITY_CIPHER_DOMAIN).digest();
+}
+
+function encryptIdentityCredential(
+  pairingSecret: Buffer,
+  identity: CompanionIdentity,
+  keyId: string,
+  credential: Buffer,
+): string {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", identityCipherKey(pairingSecret), iv);
+  cipher.setAAD(identityAdditionalData(identity, keyId));
+  const encrypted = Buffer.concat([cipher.update(credential), cipher.final()]);
+  return [
+    IDENTITY_CIPHER_VERSION,
+    iv.toString("base64url"),
+    cipher.getAuthTag().toString("base64url"),
+    encrypted.toString("base64url"),
+  ].join(".");
+}
+
+function decryptIdentityCredential(
+  pairingSecret: Buffer,
+  row: CompanionIdentityRow,
+): Buffer | undefined {
+  const [version, ivText, tagText, encryptedText, ...extra] = row.credential_ciphertext.split(".");
+  if (
+    version !== IDENTITY_CIPHER_VERSION ||
+    !ivText ||
+    !tagText ||
+    !encryptedText ||
+    extra.length > 0
+  ) {
+    return undefined;
+  }
+  const iv = canonicalBase64Url(ivText, 12);
+  const tag = canonicalBase64Url(tagText, 16);
+  const encrypted = canonicalBase64Url(encryptedText, IDENTITY_CREDENTIAL_BYTES);
+  if (!iv || !tag || !encrypted) return undefined;
+  try {
+    const decipher = crypto.createDecipheriv("aes-256-gcm", identityCipherKey(pairingSecret), iv);
+    decipher.setAAD(identityAdditionalData(identityFromRow(row), row.pairing_key_id));
+    decipher.setAuthTag(tag);
+    const credential = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    return credential.length === IDENTITY_CREDENTIAL_BYTES ? credential : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Fixed-size replay identity; request bodies are never retained by the completed-request cache. */
@@ -210,6 +341,7 @@ export async function startHostCompanionServer(
   let closing = false;
   let closePromise: Promise<void> | undefined;
   const globalRate: RateWindow = { startedAt: Date.now(), count: 0 };
+  const currentPairingKeyId = pairingKeyId(pairingSecret);
   const connectionSnapshot = (): CompanionConnectionInfo[] =>
     [...connections.values()]
       .map(({ info }) => ({ ...info }))
@@ -236,9 +368,14 @@ export async function startHostCompanionServer(
     if (socket.readyState === socket.OPEN) socket.close(code, reason);
   };
 
-  const send = (socket: WebSocket, value: unknown): void => {
-    if (socket.readyState !== socket.OPEN) return;
-    socket.send(JSON.stringify(value), () => undefined);
+  const send = (socket: WebSocket, value: unknown): boolean => {
+    if (socket.readyState !== socket.OPEN) return false;
+    try {
+      socket.send(JSON.stringify(value), () => undefined);
+      return true;
+    } catch {
+      return false;
+    }
   };
 
   const requestKey = (connectionId: string, requestId: string): string =>
@@ -247,10 +384,83 @@ export async function startHostCompanionServer(
   const authProof = (payload: string): string =>
     crypto.createHmac("sha256", pairingSecret).update(payload, "utf8").digest("base64url");
 
-  const validProof = (payload: string, supplied: string): boolean => {
-    const expected = Buffer.from(authProof(payload), "base64url");
+  const validProofWithSecret = (secret: Buffer, payload: string, supplied: string): boolean => {
+    const expected = crypto.createHmac("sha256", secret).update(payload, "utf8").digest();
     const candidate = Buffer.from(supplied, "base64url");
     return candidate.length === expected.length && crypto.timingSafeEqual(expected, candidate);
+  };
+
+  const identityRow = (connectionId: string): CompanionIdentityRow | undefined =>
+    options.db
+      .prepare("SELECT * FROM companion_identities WHERE connection_id = ?")
+      .get(connectionId) as CompanionIdentityRow | undefined;
+
+  const clearIdentityGrants = (connectionId: string): void => {
+    options.db.prepare("DELETE FROM capability_grants WHERE connection_id = ?").run(connectionId);
+  };
+
+  const enrollIdentity = (identity: CompanionIdentity, credential: Buffer): void => {
+    const now = new Date().toISOString();
+    const encrypted = encryptIdentityCredential(
+      pairingSecret,
+      identity,
+      currentPairingKeyId,
+      credential,
+    );
+    options.db.transaction(() => {
+      // A new credential must never inherit mutation authority that belonged to
+      // an older or previously unbound client identity.
+      clearIdentityGrants(identity.connectionId);
+      options.db
+        .prepare(
+          `INSERT INTO companion_identities
+            (connection_id, world_id, user_id, foundry_user_role, pairing_key_id,
+             credential_ciphertext, confirmed, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+           ON CONFLICT(connection_id) DO UPDATE SET
+             world_id = excluded.world_id,
+             user_id = excluded.user_id,
+             foundry_user_role = excluded.foundry_user_role,
+             pairing_key_id = excluded.pairing_key_id,
+             credential_ciphertext = excluded.credential_ciphertext,
+             confirmed = 0,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          identity.connectionId,
+          identity.worldId,
+          identity.userId,
+          identity.foundryUserRole,
+          currentPairingKeyId,
+          encrypted,
+          now,
+          now,
+        );
+    })();
+  };
+
+  const confirmIdentity = (identity: CompanionIdentity): void => {
+    options.db.transaction(() => {
+      // Pending enrollment is never allowed to inherit a grant created before
+      // the client proved possession of its connection-scoped credential.
+      clearIdentityGrants(identity.connectionId);
+      const updated = options.db
+        .prepare(
+          `UPDATE companion_identities
+           SET confirmed = 1, updated_at = ?
+           WHERE connection_id = ? AND world_id = ? AND user_id = ?
+             AND foundry_user_role = ? AND pairing_key_id = ? AND confirmed = 0`,
+        )
+        .run(
+          new Date().toISOString(),
+          identity.connectionId,
+          identity.worldId,
+          identity.userId,
+          identity.foundryUserRole,
+          currentPairingKeyId,
+        );
+      if (updated.changes !== 1) throw new Error("pending companion identity changed");
+    })();
   };
 
   const unacknowledgedCancellation = (
@@ -270,6 +480,23 @@ export async function startHostCompanionServer(
         {
           correlationId: request.correlationId,
           ...(mutation ? { indeterminate: true, reconciliationRequired: true } : {}),
+        },
+      ),
+    );
+  };
+
+  const shutdownError = (request: PendingRequest): CompanionRequestError => {
+    const indeterminate = request.dispatched && MUTATION_METHODS.has(request.message.method);
+    return new CompanionRequestError(
+      makeError(
+        indeterminate ? "INDETERMINATE_MUTATION" : "OFFLINE_BRIDGE",
+        indeterminate
+          ? `Mutation ${request.message.method} was dispatched before the companion server closed; reconcile state before retrying`
+          : "Companion server closed",
+        false,
+        {
+          correlationId: request.correlationId,
+          ...(indeterminate ? { indeterminate: true, reconciliationRequired: true } : {}),
         },
       ),
     );
@@ -317,6 +544,8 @@ export async function startHostCompanionServer(
     }
     const challenge = crypto.randomBytes(32).toString("base64url");
     let connectionId: string | undefined;
+    let pendingConfirmation:
+      { hello: CompanionHelloMessage; identity: CompanionIdentity } | undefined;
     const connectionRate: RateWindow = { startedAt: Date.now(), count: 0 };
     const authenticationTimer = setTimeout(() => {
       closeSocket(socket, 1008, "companion authentication timed out");
@@ -328,19 +557,49 @@ export async function startHostCompanionServer(
       challenge,
       origin,
     });
-    socket.on("message", (data) => {
-      const now = Date.now();
-      const withinConnectionLimit = consumeRate(
-        connectionRate,
-        now,
-        rateLimitWindowMs,
-        maxMessagesPerConnection,
-      );
-      const withinGlobalLimit = consumeRate(globalRate, now, rateLimitWindowMs, maxMessagesGlobal);
-      if (!withinConnectionLimit || !withinGlobalLimit) {
-        closeSocket(socket, 1008, "companion message rate limit exceeded");
-        return;
+    const activateConnection = (hello: CompanionHelloMessage, sendReady: boolean): void => {
+      clearTimeout(authenticationTimer);
+      const authenticatedConnectionId = hello.connectionId;
+      connectionId = authenticatedConnectionId;
+      const prior = connections.get(authenticatedConnectionId);
+      if (prior && prior.socket !== socket) {
+        closeSocket(prior.socket, 1012, "companion reconnected");
       }
+      const info: CompanionConnectionInfo = {
+        ...hello,
+        status: "connected",
+        lastSeenAt: new Date().toISOString(),
+      };
+      connections.set(authenticatedConnectionId, { socket, info });
+      notifyConnectionsChanged();
+      if (sendReady) {
+        send(socket, {
+          type: "auth.ready",
+          connectionId: authenticatedConnectionId,
+          proof: authProof(companionAuthReadyPayload(challenge, origin, hello)),
+        });
+      }
+      send(socket, eventStream.resume(authenticatedConnectionId));
+      for (const request of pending.values()) {
+        if (request.connectionId !== authenticatedConnectionId || request.cancelled) continue;
+        if (send(socket, request.message)) request.dispatched = true;
+      }
+    };
+    const awaitIdentityConfirmation = (
+      hello: CompanionHelloMessage,
+      identity: CompanionIdentity,
+      credential: Buffer,
+    ): void => {
+      clearIdentityGrants(identity.connectionId);
+      pendingConfirmation = { hello, identity };
+      send(socket, {
+        type: "auth.ready",
+        connectionId: identity.connectionId,
+        proof: authProof(companionAuthReadyPayload(challenge, origin, hello)),
+        identityCredential: credential.toString("base64url"),
+      });
+    };
+    socket.on("message", (data) => {
       let decoded: unknown;
       try {
         decoded = JSON.parse(data.toString()) as unknown;
@@ -348,42 +607,135 @@ export async function startHostCompanionServer(
         closeSocket(socket, 1003, "invalid JSON");
         return;
       }
+      const confirmationFrame =
+        !connectionId &&
+        pendingConfirmation !== undefined &&
+        decoded !== null &&
+        typeof decoded === "object" &&
+        (decoded as { type?: unknown }).type === "auth.confirm";
+      if (!confirmationFrame) {
+        const now = Date.now();
+        const withinConnectionLimit = consumeRate(
+          connectionRate,
+          now,
+          rateLimitWindowMs,
+          maxMessagesPerConnection,
+        );
+        const withinGlobalLimit = consumeRate(
+          globalRate,
+          now,
+          rateLimitWindowMs,
+          maxMessagesGlobal,
+        );
+        if (!withinConnectionLimit || !withinGlobalLimit) {
+          closeSocket(socket, 1008, "companion message rate limit exceeded");
+          return;
+        }
+      }
       if (!connectionId) {
+        if (pendingConfirmation) {
+          const confirmation = CompanionAuthConfirmMessageSchema.safeParse(decoded);
+          const { hello, identity } = pendingConfirmation;
+          const row = identityRow(identity.connectionId);
+          const credential = row ? decryptIdentityCredential(pairingSecret, row) : undefined;
+          const validConfirmation =
+            confirmation.success &&
+            confirmation.data.connectionId === identity.connectionId &&
+            row !== undefined &&
+            row.confirmed === 0 &&
+            row.pairing_key_id === currentPairingKeyId &&
+            sameIdentity(identityFromRow(row), identity) &&
+            credential !== undefined &&
+            validProofWithSecret(
+              credential,
+              companionIdentityConfirmPayload(challenge, origin, hello),
+              confirmation.data.proof,
+            );
+          credential?.fill(0);
+          if (!validConfirmation) {
+            closeSocket(socket, 1008, "valid companion identity confirmation required");
+            return;
+          }
+          try {
+            confirmIdentity(identity);
+          } catch {
+            closeSocket(socket, 1008, "companion identity confirmation was rejected");
+            return;
+          }
+          pendingConfirmation = undefined;
+          activateConnection(hello, false);
+          return;
+        }
         const proof = CompanionAuthProofMessageSchema.safeParse(decoded);
+        if (!proof.success) {
+          closeSocket(socket, 1008, "valid companion pairing proof required");
+          return;
+        }
+        const hello = proof.data.hello;
+        const identity = identityFromHello(hello);
         if (
-          !proof.success ||
-          !validProof(companionAuthPayload(challenge, origin, proof.data.hello), proof.data.proof)
+          !identity ||
+          !validProofWithSecret(
+            pairingSecret,
+            companionAuthPayload(challenge, origin, hello),
+            proof.data.proof,
+          )
         ) {
           closeSocket(socket, 1008, "valid companion pairing proof required");
           return;
         }
-        clearTimeout(authenticationTimer);
-        const hello = proof.data.hello;
-        connectionId = hello.connectionId;
-        const prior = connections.get(connectionId);
-        if (prior && prior.socket !== socket) {
-          closeSocket(prior.socket, 1012, "companion reconnected");
-        }
-        const info: CompanionConnectionInfo = {
-          ...hello,
-          status: "connected",
-          lastSeenAt: new Date().toISOString(),
-        };
-        connections.set(connectionId, { socket, info });
-        notifyConnectionsChanged();
-        send(socket, {
-          type: "auth.ready",
-          connectionId,
-          proof: authProof(companionAuthReadyPayload(challenge, origin, hello)),
-        });
-        send(socket, eventStream.resume(connectionId));
-        for (const request of pending.values()) {
-          if (request.connectionId === connectionId) {
-            if (request.cancelled) continue;
-            send(socket, request.message);
+        const existingIdentity = identityRow(identity.connectionId);
+        if (existingIdentity?.pairing_key_id === currentPairingKeyId) {
+          const credential = decryptIdentityCredential(pairingSecret, existingIdentity);
+          const sameBoundIdentity = sameIdentity(identityFromRow(existingIdentity), identity);
+          const identityProofValid =
+            sameBoundIdentity &&
+            credential !== undefined &&
+            proof.data.identityProof !== undefined &&
+            validProofWithSecret(
+              credential,
+              companionIdentityAuthPayload(challenge, origin, hello),
+              proof.data.identityProof,
+            );
+          if (!sameBoundIdentity || (existingIdentity.confirmed === 1 && !identityProofValid)) {
+            credential?.fill(0);
+            closeSocket(socket, 1008, "bound companion identity proof required");
+            return;
+          }
+          if (identityProofValid) {
+            credential?.fill(0);
+            if (existingIdentity.confirmed === 0) {
+              try {
+                confirmIdentity(identity);
+              } catch {
+                closeSocket(socket, 1008, "companion identity confirmation was rejected");
+                return;
+              }
+            }
+            activateConnection(hello, true);
+            return;
+          }
+          if (credential) {
+            try {
+              awaitIdentityConfirmation(hello, identity, credential);
+            } finally {
+              credential.fill(0);
+            }
+            return;
           }
         }
-        return;
+        {
+          const credential = crypto.randomBytes(IDENTITY_CREDENTIAL_BYTES);
+          try {
+            enrollIdentity(identity, credential);
+            awaitIdentityConfirmation(hello, identity, credential);
+          } catch {
+            closeSocket(socket, 1008, "companion identity enrollment was rejected");
+          } finally {
+            credential.fill(0);
+          }
+          return;
+        }
       }
 
       const message = CompanionWireMessageSchema.safeParse(decoded);
@@ -549,7 +901,7 @@ export async function startHostCompanionServer(
         requestOptions.signal.addEventListener("abort", onAbort, { once: true });
         removeAbortListener = () => requestOptions.signal?.removeEventListener("abort", onAbort);
       }
-      pending.set(key, {
+      const pendingRequest: PendingRequest = {
         connectionId,
         message,
         promise,
@@ -561,11 +913,12 @@ export async function startHostCompanionServer(
         onProgress: requestOptions.onProgress,
         removeAbortListener,
         cancelled: false,
-        dispatched: connections.has(connectionId),
+        dispatched: false,
         identity,
-      });
+      };
+      pending.set(key, pendingRequest);
       const live = connections.get(connectionId);
-      if (live) send(live.socket, message);
+      if (live && send(live.socket, message)) pendingRequest.dispatched = true;
       return promise;
     },
     close: () => {
@@ -578,11 +931,7 @@ export async function startHostCompanionServer(
           request.reject(
             request.cancelled
               ? unacknowledgedCancellation(request, request.cancellationReason ?? "cancelled")
-              : new CompanionRequestError(
-                  makeError("OFFLINE_BRIDGE", "Companion server closed", false, {
-                    correlationId: request.correlationId,
-                  }),
-                ),
+              : shutdownError(request),
           );
         }
         pending.clear();
