@@ -39,6 +39,7 @@ export interface InitializeResult {
 
 const DEFAULT_BRIDGE_REQUEST_TIMEOUT_MS = 5 * 60 * 1_000;
 const DEFAULT_NEGOTIATION_TIMEOUT_MS = 5_000;
+const CANCELLATION_ACK_TIMEOUT_MS = 1_000;
 
 interface PendingRequest {
   resolve: (result: unknown) => void;
@@ -48,6 +49,8 @@ interface PendingRequest {
   onProgress?: ((progress: OperationProgress) => void | Promise<void>) | undefined;
   progressUpdates: number;
   removeAbortListener?: (() => void) | undefined;
+  method: string;
+  cancelledReason?: "cancelled" | "timeout" | undefined;
 }
 
 export interface ConnectToDaemonOptions {
@@ -111,11 +114,37 @@ export async function connectToDaemon(
   const pending = new Map<string, PendingRequest>();
   let closed = false;
 
+  const cancellationWithoutAcknowledgement = (request: PendingRequest): BridgeRequestError => {
+    if (request.method === "mutation.execute") {
+      return new BridgeRequestError(
+        makeError(
+          "INDETERMINATE_MUTATION",
+          "Mutation cancellation was not acknowledged; reconcile Foundry state before retrying",
+          false,
+          {
+            correlationId: request.correlationId,
+            indeterminate: true,
+            reconciliationRequired: true,
+          },
+        ),
+      );
+    }
+    const timedOut = request.cancelledReason === "timeout";
+    return new BridgeRequestError(
+      makeError(
+        timedOut ? "TIMEOUT" : "CANCELLED",
+        timedOut ? "Bridge request deadline elapsed" : "Bridge request was cancelled",
+        false,
+        { correlationId: request.correlationId },
+      ),
+    );
+  };
+
   const rejectPending = (error: Error): void => {
     for (const request of pending.values()) {
       clearTimeout(request.timer);
       request.removeAbortListener?.();
-      request.reject(error);
+      request.reject(request.cancelledReason ? cancellationWithoutAcknowledgement(request) : error);
     }
     pending.clear();
   };
@@ -193,26 +222,22 @@ export async function connectToDaemon(
         const cancel = (reason: "cancelled" | "timeout"): void => {
           const pendingRequest = pending.get(id);
           if (!pendingRequest) return;
-          pending.delete(id);
+          if (pendingRequest.cancelledReason) return;
           clearTimeout(pendingRequest.timer);
           pendingRequest.removeAbortListener?.();
+          pendingRequest.removeAbortListener = undefined;
+          pendingRequest.cancelledReason = reason;
           try {
             client.send({ type: "request.cancel", id, correlationId, reason });
           } catch {
-            // The local rejection below is authoritative even if transport teardown won the race.
+            // The acknowledgement grace below still classifies mutations conservatively.
           }
-          pendingRequest.reject(
-            new BridgeRequestError(
-              makeError(
-                reason === "timeout" ? "TIMEOUT" : "CANCELLED",
-                reason === "timeout"
-                  ? `bridge request ${method} timed out after ${Math.max(1, deadline - now).toString()}ms`
-                  : `Bridge request ${method} was cancelled`,
-                false,
-                { correlationId },
-              ),
-            ),
-          );
+          pendingRequest.timer = setTimeout(() => {
+            if (pending.get(id) !== pendingRequest) return;
+            pending.delete(id);
+            pendingRequest.reject(cancellationWithoutAcknowledgement(pendingRequest));
+          }, CANCELLATION_ACK_TIMEOUT_MS);
+          pendingRequest.timer.unref?.();
         };
         const timer = setTimeout(
           () => {
@@ -235,6 +260,7 @@ export async function connectToDaemon(
           onProgress: requestOptions.onProgress,
           progressUpdates: 0,
           removeAbortListener,
+          method,
         });
         try {
           client.send({

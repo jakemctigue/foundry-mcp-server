@@ -8,6 +8,7 @@ import {
 } from "@foundry-mcp/protocol";
 
 import { IntelligenceBridgeApi } from "../intelligence-api.js";
+import { BridgeRequestError } from "../bridge-connection.js";
 import { bridgeRequestOptions, BridgeResultError, type ToolServer } from "./bridge-tool.js";
 
 function toolResult<T extends Record<string, unknown>>(operation: () => Promise<T>) {
@@ -23,7 +24,7 @@ function toolResult<T extends Record<string, unknown>>(operation: () => Promise<
       };
     } catch (error) {
       const envelope =
-        error instanceof BridgeResultError
+        error instanceof BridgeResultError || error instanceof BridgeRequestError
           ? error.envelope
           : makeError("OFFLINE_BRIDGE", "Foundry intelligence bridge request failed", true);
       return {

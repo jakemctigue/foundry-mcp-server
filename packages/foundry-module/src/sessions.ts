@@ -786,32 +786,41 @@ export class FoundrySessionService {
     task: () => Promise<T>,
     operation?: OperationExecutionOptions,
   ): Promise<T> {
-    const previous = this.#locks.get(key) ?? Promise.resolve();
+    const previous = (this.#locks.get(key) ?? Promise.resolve()).catch(() => undefined);
     let release = () => {};
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const tail = previous.catch(() => undefined).then(() => gate);
+    const tail = previous.then(() => gate);
     this.#locks.set(key, tail);
-    const waiting = previous.catch(() => undefined);
-    if (operation?.signal) {
-      await new Promise<void>((resolve, reject) => {
-        const onAbort = (): void => reject(new Error("Operation was cancelled while queued"));
-        operation.signal?.addEventListener("abort", onAbort, { once: true });
-        void waiting.then(() => {
-          operation.signal?.removeEventListener("abort", onAbort);
-          resolve();
-        });
-      });
-    } else {
-      await waiting;
-    }
+    void tail.then(() => {
+      if (this.#locks.get(key) === tail) this.#locks.delete(key);
+    });
     try {
+      const signal = operation?.signal;
+      if (signal) {
+        await new Promise<void>((resolve, reject) => {
+          const onAbort = (): void => {
+            signal.removeEventListener("abort", onAbort);
+            reject(new Error("Operation was cancelled while queued"));
+          };
+          if (signal.aborted) {
+            onAbort();
+            return;
+          }
+          signal.addEventListener("abort", onAbort, { once: true });
+          void previous.then(() => {
+            signal.removeEventListener("abort", onAbort);
+            resolve();
+          });
+        });
+      } else {
+        await previous;
+      }
       this.#guard(operation);
       return await task();
     } finally {
       release();
-      if (this.#locks.get(key) === tail) this.#locks.delete(key);
     }
   }
 

@@ -12,6 +12,7 @@ export interface CreateLocalImageLoaderOptions {
 export type LocalImageLoader = (
   filePath: string,
   requestedMaxBytes?: number,
+  signal?: AbortSignal,
 ) => Promise<{ bytes: Uint8Array; mimeType: string }>;
 
 export type LocalImageErrorCode =
@@ -69,11 +70,24 @@ async function assertNoReparseSegments(root: string, candidate: string): Promise
   }
 }
 
-async function readBounded(handle: fs.FileHandle, maxBytes: number): Promise<Uint8Array> {
+function assertNotAborted(signal: AbortSignal | undefined): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : Object.assign(new Error("Local image read was cancelled"), { name: "AbortError" });
+}
+
+async function readBounded(
+  handle: fs.FileHandle,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
   const buffer = Buffer.allocUnsafe(maxBytes + 1);
   let offset = 0;
   while (offset < buffer.byteLength) {
+    assertNotAborted(signal);
     const { bytesRead } = await handle.read(buffer, offset, buffer.byteLength - offset, null);
+    assertNotAborted(signal);
     if (bytesRead === 0) break;
     offset += bytesRead;
   }
@@ -95,17 +109,21 @@ export function createLocalImageLoader(options: CreateLocalImageLoaderOptions): 
     (rootsPromise ??= Promise.all(
       lexicalRoots.map(async (lexical) => ({ lexical, canonical: await fs.realpath(lexical) })),
     ));
-  return async (filePath, requestedMaxBytes) => {
+  return async (filePath, requestedMaxBytes, signal) => {
     try {
+      assertNotAborted(signal);
       const resolved = path.resolve(filePath);
       const configuredRoots = await roots();
+      assertNotAborted(signal);
       const root = configuredRoots.find((candidate) => isWithin(candidate.lexical, resolved));
       if (!root)
         throw new LocalImageError("OUTSIDE_ROOT", "Local image path is outside configured roots");
       const requested = requirePositiveByteLimit(requestedMaxBytes ?? configuredMax);
       const maxBytes = Math.min(requested, configuredMax);
       await assertNoReparseSegments(root.lexical, resolved);
+      assertNotAborted(signal);
       const canonicalBeforeOpen = await fs.realpath(resolved);
+      assertNotAborted(signal);
       if (!isWithin(root.canonical, canonicalBeforeOpen)) {
         throw new LocalImageError(
           "OUTSIDE_ROOT",
@@ -115,6 +133,7 @@ export function createLocalImageLoader(options: CreateLocalImageLoaderOptions): 
 
       const handle = await fs.open(resolved, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
       try {
+        assertNotAborted(signal);
         const opened = await handle.stat();
         if (!opened.isFile())
           throw new LocalImageError("NOT_FILE", "Local image path is not a file");
@@ -126,6 +145,7 @@ export function createLocalImageLoader(options: CreateLocalImageLoaderOptions): 
         }
 
         const canonicalAfterOpen = await fs.realpath(resolved);
+        assertNotAborted(signal);
         if (!isWithin(root.canonical, canonicalAfterOpen)) {
           throw new LocalImageError(
             "OUTSIDE_ROOT",
@@ -133,6 +153,7 @@ export function createLocalImageLoader(options: CreateLocalImageLoaderOptions): 
           );
         }
         const current = await fs.stat(resolved);
+        assertNotAborted(signal);
         if (!sameFile(opened, current)) {
           throw new LocalImageError(
             "CHANGED_DURING_READ",
@@ -140,7 +161,7 @@ export function createLocalImageLoader(options: CreateLocalImageLoaderOptions): 
           );
         }
 
-        const bytes = await readBounded(handle, maxBytes);
+        const bytes = await readBounded(handle, maxBytes, signal);
         const inspected = inspectImageBytes(bytes, {
           expectedExtension: path.extname(canonicalAfterOpen),
           maxBytes,
@@ -157,6 +178,7 @@ export function createLocalImageLoader(options: CreateLocalImageLoaderOptions): 
         await handle.close();
       }
     } catch (error) {
+      if (signal?.aborted) assertNotAborted(signal);
       if (error instanceof LocalImageError) throw error;
       throw new LocalImageError("READ_FAILED", "Local image could not be read safely");
     }

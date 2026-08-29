@@ -30,6 +30,17 @@ const DEFAULT_RATE_LIMIT_WINDOW_MS = 10_000;
 const DEFAULT_MAX_MESSAGES_PER_CONNECTION = 1_000;
 const DEFAULT_MAX_MESSAGES_GLOBAL = 10_000;
 const CANCELLATION_ACK_TIMEOUT_MS = 1_000;
+const MUTATION_METHODS = new Set([
+  "documents.create",
+  "documents.update",
+  "assets.images.upload",
+  "assets.images.generate",
+  "assets.images.attach",
+  "sessions.start",
+  "sessions.append",
+  "sessions.end",
+  "sessions.reopen",
+]);
 
 export interface CompanionConnectionInfo extends CompanionHelloMessage {
   status: "connected";
@@ -93,10 +104,14 @@ interface PendingRequest {
   onProgress?: ((progress: OperationProgress) => void | Promise<void>) | undefined;
   removeAbortListener?: (() => void) | undefined;
   cancelled: boolean;
+  cancellationReason?: "cancelled" | "timeout" | undefined;
+  dispatched: boolean;
+  identity: string;
 }
 
 interface CompletedRequest {
   value: JsonValue;
+  identity: string;
 }
 
 interface LiveConnection {
@@ -114,6 +129,27 @@ function positiveInteger(value: number, name: string): number {
     throw new Error(`${name} must be a positive safe integer`);
   }
   return value;
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
+    .join(",")}}`;
+}
+
+/** Fixed-size replay identity; request bodies are never retained by the completed-request cache. */
+export function companionRequestIdentityDigest(
+  method: string,
+  params: Record<string, JsonValue>,
+  correlationId: string,
+): string {
+  return crypto
+    .createHash("sha256")
+    .update(canonicalJson({ method, params, correlationId }), "utf8")
+    .digest("base64url");
 }
 
 function listenerAuthority(host: string, port: number): string {
@@ -171,6 +207,8 @@ export async function startHostCompanionServer(
   const connections = new Map<string, LiveConnection>();
   const pending = new Map<string, PendingRequest>();
   const completed = new Map<string, CompletedRequest>();
+  let closing = false;
+  let closePromise: Promise<void> | undefined;
   const globalRate: RateWindow = { startedAt: Date.now(), count: 0 };
   const connectionSnapshot = (): CompanionConnectionInfo[] =>
     [...connections.values()]
@@ -215,6 +253,28 @@ export async function startHostCompanionServer(
     return candidate.length === expected.length && crypto.timingSafeEqual(expected, candidate);
   };
 
+  const unacknowledgedCancellation = (
+    request: PendingRequest,
+    reason: "cancelled" | "timeout",
+  ): CompanionRequestError => {
+    const mutation = request.dispatched && MUTATION_METHODS.has(request.message.method);
+    return new CompanionRequestError(
+      makeError(
+        mutation ? "INDETERMINATE_MUTATION" : reason === "timeout" ? "TIMEOUT" : "CANCELLED",
+        mutation
+          ? `Mutation ${request.message.method} did not acknowledge cancellation; reconcile state before retrying`
+          : reason === "timeout"
+            ? `Companion request deadline elapsed: ${request.message.method}`
+            : `Companion request was cancelled: ${request.message.method}`,
+        false,
+        {
+          correlationId: request.correlationId,
+          ...(mutation ? { indeterminate: true, reconciliationRequired: true } : {}),
+        },
+      ),
+    );
+  };
+
   const cancelPending = (
     key: string,
     reason: "cancelled" | "timeout",
@@ -227,6 +287,7 @@ export async function startHostCompanionServer(
     request.removeAbortListener?.();
     request.removeAbortListener = undefined;
     request.cancelled = true;
+    request.cancellationReason = reason;
     const live = connections.get(request.connectionId);
     if (notifyCompanion && live) {
       send(live.socket, {
@@ -239,18 +300,7 @@ export async function startHostCompanionServer(
     request.timer = setTimeout(() => {
       if (pending.get(key) !== request) return;
       pending.delete(key);
-      request.reject(
-        new CompanionRequestError(
-          makeError(
-            reason === "timeout" ? "TIMEOUT" : "CANCELLED",
-            reason === "timeout"
-              ? `Companion request deadline elapsed: ${request.message.method}`
-              : `Companion request was cancelled: ${request.message.method}`,
-            false,
-            { correlationId: request.correlationId },
-          ),
-        ),
-      );
+      request.reject(unacknowledgedCancellation(request, reason));
     }, CANCELLATION_ACK_TIMEOUT_MS);
     request.timer.unref?.();
   };
@@ -376,7 +426,7 @@ export async function startHostCompanionServer(
       const result: JsonValue = response.ok
         ? (response.value as JsonValue)
         : ({ ok: false, error: response.error as JsonValue } as JsonValue);
-      completed.set(key, { value: result });
+      completed.set(key, { value: result, identity: request.identity });
       while (completed.size > 500) completed.delete(completed.keys().next().value as string);
       request.resolve(result);
     });
@@ -414,16 +464,47 @@ export async function startHostCompanionServer(
     listConnections: connectionSnapshot,
     request: (connectionId, method, params = {}, requestId, requestOptions = {}) => {
       const id = requestId ?? `host-${Date.now().toString(36)}-${(++requestCounter).toString(36)}`;
+      const correlationId = (requestOptions.correlationId ?? id).slice(0, 128);
+      if (closing) {
+        return Promise.reject(
+          new CompanionRequestError(
+            makeError("OFFLINE_BRIDGE", "Companion server is closing", false, {
+              correlationId,
+            }),
+          ),
+        );
+      }
       const key = requestKey(connectionId, id);
+      const requestParams = { ...params, connectionId };
+      const identity = companionRequestIdentityDigest(method, requestParams, correlationId);
       const priorResult = completed.get(key);
-      if (priorResult !== undefined) return Promise.resolve(priorResult.value);
+      if (priorResult !== undefined) {
+        return priorResult.identity === identity
+          ? Promise.resolve(priorResult.value)
+          : Promise.reject(
+              new CompanionRequestError(
+                makeError("CONFLICT", "Completed companion request id was reused", false, {
+                  correlationId,
+                }),
+              ),
+            );
+      }
       const priorPending = pending.get(key);
-      if (priorPending) return priorPending.promise;
+      if (priorPending) {
+        return priorPending.identity === identity
+          ? priorPending.promise
+          : Promise.reject(
+              new CompanionRequestError(
+                makeError("CONFLICT", "In-flight companion request id was reused", false, {
+                  correlationId,
+                }),
+              ),
+            );
+      }
       const now = Date.now();
       const configuredTimeout = options.requestTimeoutMs ?? 30_000;
       const maximumDeadline = now + Math.min(configuredTimeout, MAX_OPERATION_DURATION_MS);
       const deadline = Math.min(requestOptions.deadline ?? maximumDeadline, maximumDeadline);
-      const correlationId = (requestOptions.correlationId ?? id).slice(0, 128);
       if (requestOptions.signal?.aborted || deadline <= now) {
         return Promise.reject(
           new CompanionRequestError(
@@ -448,7 +529,7 @@ export async function startHostCompanionServer(
         type: "request",
         id,
         method,
-        params: { ...params, connectionId },
+        params: requestParams,
         control: {
           deadline,
           correlationId,
@@ -480,25 +561,43 @@ export async function startHostCompanionServer(
         onProgress: requestOptions.onProgress,
         removeAbortListener,
         cancelled: false,
+        dispatched: connections.has(connectionId),
+        identity,
       });
       const live = connections.get(connectionId);
       if (live) send(live.socket, message);
       return promise;
     },
-    close: async () => {
-      for (const request of pending.values()) {
-        clearTimeout(request.timer);
-        request.removeAbortListener?.();
-        request.reject(new Error("companion server closed"));
-      }
-      pending.clear();
-      for (const { socket } of connections.values()) socket.terminate();
-      connections.clear();
-      notifyConnectionsChanged();
-      await new Promise<void>((resolve, reject) => {
-        wss.close((error) => (error ? reject(error) : resolve()));
-      });
-      pairingSecret.fill(0);
+    close: () => {
+      if (closePromise) return closePromise;
+      closing = true;
+      closePromise = (async () => {
+        for (const request of pending.values()) {
+          clearTimeout(request.timer);
+          request.removeAbortListener?.();
+          request.reject(
+            request.cancelled
+              ? unacknowledgedCancellation(request, request.cancellationReason ?? "cancelled")
+              : new CompanionRequestError(
+                  makeError("OFFLINE_BRIDGE", "Companion server closed", false, {
+                    correlationId: request.correlationId,
+                  }),
+                ),
+          );
+        }
+        pending.clear();
+        for (const socket of wss.clients) socket.terminate();
+        connections.clear();
+        notifyConnectionsChanged();
+        try {
+          await new Promise<void>((resolve, reject) => {
+            wss.close((error) => (error ? reject(error) : resolve()));
+          });
+        } finally {
+          pairingSecret.fill(0);
+        }
+      })();
+      return closePromise;
     },
   };
 }

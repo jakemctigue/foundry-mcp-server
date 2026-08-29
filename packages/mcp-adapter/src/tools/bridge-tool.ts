@@ -44,9 +44,20 @@ function boundedDeadline(meta: Record<string, unknown> | undefined): number {
   const now = Date.now();
   const maximum = now + MAX_OPERATION_DURATION_MS;
   const requested = meta?.["foundryMcp/deadline"];
-  return typeof requested === "number" && Number.isSafeInteger(requested) && requested > now
+  return typeof requested === "number" && Number.isSafeInteger(requested) && requested > 0
     ? Math.min(requested, maximum)
     : maximum;
+}
+
+async function reportProgressSafely(
+  onProgress: BridgeRequestOptions["onProgress"],
+  update: OperationProgress,
+): Promise<void> {
+  try {
+    await onProgress?.(update);
+  } catch {
+    // Progress is advisory and must never change an operation's terminal result.
+  }
 }
 
 /** Converts SDK v2 request context into private bridge operation controls. */
@@ -70,15 +81,19 @@ export function bridgeRequestOptions(
             return;
           lastProgress = update.progress;
           notifications += 1;
-          await request.notify?.({
-            method: "notifications/progress",
-            params: {
-              progressToken,
-              progress: update.progress,
-              total: update.total,
-              ...(update.message ? { message: update.message } : {}),
-            },
-          });
+          try {
+            await request.notify?.({
+              method: "notifications/progress",
+              params: {
+                progressToken,
+                progress: update.progress,
+                total: update.total,
+                ...(update.message ? { message: update.message } : {}),
+              },
+            });
+          } catch {
+            // A disconnected or non-conforming progress consumer cannot undo bridge work.
+          }
         }
       : undefined;
   return {
@@ -98,7 +113,7 @@ export async function requestBridgeValue<T>(
   outputSchema: z.ZodType<T>,
   options?: BridgeRequestOptions,
 ): Promise<T> {
-  await options?.onProgress?.({
+  await reportProgressSafely(options?.onProgress, {
     stage: "start",
     progress: 0,
     total: MAX_OPERATION_PROGRESS_UPDATES,
@@ -112,7 +127,7 @@ export async function requestBridgeValue<T>(
               onProgress: (progress: OperationProgress) =>
                 progress.stage === "start" || progress.stage === "complete"
                   ? undefined
-                  : options.onProgress?.(progress),
+                  : reportProgressSafely(options.onProgress, progress),
             }
           : {}),
       }
@@ -140,7 +155,7 @@ export async function requestBridgeValue<T>(
       }),
     );
   }
-  await options?.onProgress?.({
+  await reportProgressSafely(options?.onProgress, {
     stage: "complete",
     progress: MAX_OPERATION_PROGRESS_UPDATES,
     total: MAX_OPERATION_PROGRESS_UPDATES,

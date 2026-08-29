@@ -9,6 +9,7 @@ import {
 } from "@foundry-mcp/protocol";
 
 import {
+  companionRequestIdentityDigest,
   startHostCompanionServer,
   type HostCompanionServer,
 } from "../src/bridge/companion-server.js";
@@ -583,11 +584,17 @@ describe("real browser companion host (mocked Foundry WebSocket)", () => {
       settled = true;
     });
     await requestOnA;
+    await expect(
+      server.request("world-a", "documents.get", { uuid: "Actor.other" }, "shared-id"),
+    ).rejects.toMatchObject({ envelope: { code: "CONFLICT", retryable: false } });
     socketB.send(JSON.stringify({ type: "response", id: "shared-id", ok: true, value: "wrong" }));
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(settled).toBe(false);
     socketA.send(JSON.stringify({ type: "response", id: "shared-id", ok: true, value: "right" }));
     await expect(resultA).resolves.toBe("right");
+    await expect(
+      server.request("world-a", "documents.get", { uuid: "Actor.other" }, "shared-id"),
+    ).rejects.toMatchObject({ envelope: { code: "CONFLICT", retryable: false } });
 
     const requestOnB = waitForRequest(socketB);
     const resultB = server.request("world-b", "documents.get", {}, "shared-id");
@@ -660,6 +667,135 @@ describe("real browser companion host (mocked Foundry WebSocket)", () => {
     ).toEqual([{ outcome: "denied" }, { outcome: "success" }]);
   });
 
+  it("maps host progress callbacks to the companion request option", async () => {
+    const db = openDatabase(":memory:");
+    runMigrations(db);
+    cleanups.push(() => {
+      db.close();
+    });
+    const request: HostCompanionServer["request"] = async (
+      _connectionId,
+      _method,
+      _params,
+      _requestId,
+      options,
+    ) => {
+      await options?.onProgress?.({
+        stage: "progress",
+        progress: 450,
+        total: 1_000,
+        message: "reading documents",
+      });
+      return { ok: true, value: { uuid: "Actor.a" } };
+    };
+    const companion: HostCompanionServer = {
+      address: () => ({ host: "127.0.0.1", port: 1, endpoint: "ws://127.0.0.1:1" }),
+      listConnections: () => [
+        {
+          ...hello("world-a"),
+          status: "connected",
+          lastSeenAt: "2026-08-29T12:00:00.000Z",
+        },
+      ],
+      request,
+      close: () => Promise.resolve(),
+    };
+    const reportProgress = vi.fn();
+
+    await new HostBridgeRouter(db, companion).dispatch(
+      "documents.get",
+      { connectionId: "world-a", uuid: "Actor.a" },
+      {
+        signal: new AbortController().signal,
+        deadline: Date.now() + 1_000,
+        correlationId: "read-progress",
+        reportProgress,
+      },
+    );
+
+    expect(reportProgress).toHaveBeenCalledWith(
+      expect.objectContaining({ progress: 450, message: "reading documents" }),
+    );
+  });
+
+  it("returns a successful mutation result when cancellation arrives after commit", async () => {
+    const db = openDatabase(":memory:");
+    runMigrations(db);
+    cleanups.push(() => {
+      db.close();
+    });
+    let completeMutation: ((value: { ok: true; value: { uuid: string } }) => void) | undefined;
+    const request = vi.fn(
+      () =>
+        new Promise<{ ok: true; value: { uuid: string } }>((resolve) => {
+          completeMutation = resolve;
+        }),
+    );
+    const companion: HostCompanionServer = {
+      address: () => ({ host: "127.0.0.1", port: 1, endpoint: "ws://127.0.0.1:1" }),
+      listConnections: () => [
+        {
+          ...hello("world-a"),
+          status: "connected",
+          lastSeenAt: "2026-08-29T12:00:00.000Z",
+        },
+      ],
+      request,
+      close: () => Promise.resolve(),
+    };
+    setCapabilityGrant(
+      db,
+      {
+        connectionId: "world-a",
+        foundryUserRole: "GAMEMASTER",
+        requestedCapability: "documents:create",
+      },
+      true,
+    );
+    const router = new HostBridgeRouter(db, companion);
+    const respond = vi.fn();
+    router.handle(
+      {
+        id: "post-commit",
+        method: "mutation.execute",
+        params: {
+          method: "documents.create",
+          params: { connectionId: "world-a", documentType: "Actor", data: { name: "Hero" } },
+          authorization: {
+            connectionId: "world-a",
+            requestedCapability: "documents:create",
+            tool: "foundry.documents.create",
+            correlationId: "post-commit",
+          },
+        },
+        control: {
+          deadline: Date.now() + 1_000,
+          correlationId: "post-commit",
+          progress: false,
+        },
+      },
+      respond,
+    );
+    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+    router.handle(
+      {
+        type: "request.cancel",
+        id: "post-commit",
+        correlationId: "post-commit",
+        reason: "cancelled",
+      },
+      respond,
+    );
+    completeMutation?.({ ok: true, value: { uuid: "Actor.created" } });
+
+    await vi.waitFor(() =>
+      expect(respond).toHaveBeenCalledWith({
+        id: "post-commit",
+        result: { ok: true, value: { uuid: "Actor.created" } },
+      }),
+    );
+  });
+
   it("forwards progress and correlated cancellation over a real WebSocket without retrying", async () => {
     const db = openDatabase(":memory:");
     runMigrations(db);
@@ -726,12 +862,43 @@ describe("real browser companion host (mocked Foundry WebSocket)", () => {
     controller.abort();
     await expect(result).resolves.toMatchObject({ ok: false, error: { code: "CANCELLED" } });
     await expect(
-      server.request("world-cancel", "documents.snapshot", {}, "cancel-op"),
+      server.request("world-cancel", "documents.snapshot", {}, "cancel-op", {
+        correlationId: "mcp-cancel-op",
+      }),
     ).resolves.toMatchObject({ ok: false, error: { code: "CANCELLED" } });
     expect(progress).toHaveBeenCalledWith(
       expect.objectContaining({ progress: 350, message: "snapshot traversal" }),
     );
     expect(requests).toBe(1);
+
+    vi.useFakeTimers();
+    try {
+      const mutationController = new AbortController();
+      const requestReceived = waitForRequest(socket);
+      const mutation = server.request(
+        "world-cancel",
+        "documents.update",
+        { uuid: "Actor.a", data: { name: "Possibly updated" } },
+        "mutation-no-ack",
+        {
+          signal: mutationController.signal,
+          correlationId: "mutation-no-ack",
+        },
+      );
+      await requestReceived;
+      mutationController.abort();
+      const rejection = expect(mutation).rejects.toMatchObject({
+        envelope: {
+          code: "INDETERMINATE_MUTATION",
+          retryable: false,
+          details: { indeterminate: true, reconciliationRequired: true },
+        },
+      });
+      await vi.advanceTimersByTimeAsync(1_001);
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects pre-dispatch aborts and deadlines, then times out offline work", async () => {
@@ -774,10 +941,74 @@ describe("real browser companion host (mocked Foundry WebSocket)", () => {
           details: { correlationId: "offline-timeout" },
         },
       });
+      const mutation = server.request(
+        "offline-world",
+        "documents.create",
+        { documentType: "Actor", data: { name: "Possibly created" } },
+        "offline-mutation-timeout",
+        { correlationId: "offline-mutation-timeout" },
+      );
+      const mutationRejection = expect(mutation).rejects.toMatchObject({
+        envelope: {
+          code: "TIMEOUT",
+          retryable: false,
+          details: {
+            correlationId: "offline-mutation-timeout",
+          },
+        },
+      });
       await vi.advanceTimersByTimeAsync(1_011);
-      await rejection;
+      await Promise.all([rejection, mutationRejection]);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("rejects requests synchronously once close begins and makes close idempotent", async () => {
+    const db = openDatabase(":memory:");
+    runMigrations(db);
+    cleanups.push(() => {
+      db.close();
+    });
+    const server = await startHostCompanionServer({
+      db,
+      allowedOrigins: ["http://foundry.test"],
+      pairingSecret: PAIRING_SECRET,
+    });
+    cleanups.push(server.close);
+
+    const pending = server.request("offline-world", "documents.get", {}, "close-pending");
+    const pendingRejection = expect(pending).rejects.toMatchObject({
+      envelope: { code: "OFFLINE_BRIDGE", retryable: false },
+    });
+    const firstClose = server.close();
+    const secondClose = server.close();
+    expect(secondClose).toBe(firstClose);
+    await expect(
+      server.request("offline-world", "documents.get", {}, "after-close", {
+        correlationId: "after-close",
+      }),
+    ).rejects.toMatchObject({
+      envelope: {
+        code: "OFFLINE_BRIDGE",
+        retryable: false,
+        details: { correlationId: "after-close" },
+      },
+    });
+    await Promise.all([pendingRejection, firstClose]);
+  });
+
+  it("uses fixed-size replay identities instead of retaining large request bodies", () => {
+    const marker = "private-image-payload";
+    const data = marker.repeat(800_000);
+    const digest = companionRequestIdentityDigest(
+      "assets.images.upload",
+      { connectionId: "world-a", source: { kind: "base64", data } },
+      "large-upload",
+    );
+
+    expect(digest).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(digest).not.toContain(marker);
+    expect(digest.length).toBe(43);
   });
 });

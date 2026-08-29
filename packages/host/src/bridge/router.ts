@@ -37,7 +37,11 @@ import {
   ImageProviderRegistry,
 } from "../providers/images.js";
 import { PermissionDeniedError, runAuthorizedOperation } from "../security/policy.js";
-import { CompanionRequestError, type HostCompanionServer } from "./companion-server.js";
+import {
+  CompanionRequestError,
+  type CompanionRequestOptions,
+  type HostCompanionServer,
+} from "./companion-server.js";
 
 const MUTATION_CAPABILITIES = {
   "documents.create": "documents:create",
@@ -73,6 +77,18 @@ interface HostOperationContext extends OperationExecutionOptions {
   deadline: number;
   correlationId: string;
   signal: AbortSignal;
+}
+
+function companionRequestOptions(
+  operation: HostOperationContext | undefined,
+): CompanionRequestOptions | undefined {
+  if (!operation) return undefined;
+  return {
+    signal: operation.signal,
+    deadline: operation.deadline,
+    correlationId: operation.correlationId,
+    ...(operation.reportProgress ? { onProgress: operation.reportProgress } : {}),
+  };
 }
 
 const LOCAL_IMAGE_ERROR_MESSAGES: Record<LocalImageErrorCode, string> = {
@@ -154,7 +170,7 @@ async function resolveLocalImageSource(
     );
   }
   try {
-    const loaded = await loader(source.path);
+    const loaded = await loader(source.path, undefined, operation?.signal);
     assertOperationActive(operation);
     const declaredMimeType = source.mimeType?.toLowerCase().split(";")[0]?.trim();
     if (declaredMimeType && declaredMimeType !== loaded.mimeType) {
@@ -169,6 +185,7 @@ async function resolveLocalImageSource(
       mimeType: loaded.mimeType,
     };
   } catch (error) {
+    assertOperationActive(operation);
     if (error instanceof CompanionOperationError) throw error;
     throw localImageFailure(error);
   }
@@ -287,7 +304,7 @@ export class HostBridgeRouter {
     });
     void this.dispatch(method, params, operation)
       .then((result) => {
-        assertOperationActive(operation);
+        if (method !== "mutation.execute") assertOperationActive(operation);
         void reportProgress?.({
           stage: "complete",
           progress: MAX_OPERATION_PROGRESS_UPDATES,
@@ -423,7 +440,13 @@ export class HostBridgeRouter {
       return { ok: false, error: makeError("NOT_FOUND", `Unknown bridge method ${method}`) };
     }
     const connectionId = this.#resolveConnectionId(params);
-    return this.companion.request(connectionId, method, jsonRecord(params), undefined, operation);
+    return this.companion.request(
+      connectionId,
+      method,
+      jsonRecord(params),
+      undefined,
+      companionRequestOptions(operation),
+    );
   }
 
   async #mutation(params: UnknownRecord, operation?: HostOperationContext): Promise<JsonValue> {
@@ -592,7 +615,7 @@ export class HostBridgeRouter {
           companionMethod,
           companionParams,
           correlationId,
-          effectiveOperation,
+          companionRequestOptions(effectiveOperation),
         );
         const operationResult = record(result);
         if (operationResult.ok === false) {

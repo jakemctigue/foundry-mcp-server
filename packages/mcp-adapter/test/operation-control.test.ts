@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import type { PipeClient } from "@foundry-mcp/host";
 import { MAX_OPERATION_PROGRESS_UPDATES } from "@foundry-mcp/protocol";
 
 import { connectToDaemon, type BridgeConnection } from "../src/bridge-connection.js";
+import { bridgeRequestOptions, requestBridgeValue } from "../src/tools/bridge-tool.js";
 
 function fakePipe(): {
   client: PipeClient;
@@ -44,7 +46,33 @@ describe("adapter operation control", () => {
     expect(pipe.send).not.toHaveBeenCalled();
   });
 
-  it("sends correlated cancellation, ignores a late reply, and clears pending work", async () => {
+  it("preserves an expired MCP deadline and ignores progress notification failures", async () => {
+    const expired = Date.now() - 1;
+    const notify = vi.fn(() => Promise.reject(new Error("progress consumer disconnected")));
+    const options = bridgeRequestOptions({
+      mcpReq: {
+        id: 7,
+        signal: new AbortController().signal,
+        _meta: { progressToken: 0, "foundryMcp/deadline": expired },
+        notify,
+      },
+    });
+    expect(options.deadline).toBe(expired);
+    const value = await requestBridgeValue(
+      {
+        request: vi.fn(() => Promise.resolve({ value: "committed" })),
+        close: vi.fn(() => Promise.resolve()),
+      },
+      "mutation.execute",
+      {},
+      z.object({ value: z.string() }),
+      options,
+    );
+    expect(value).toEqual({ value: "committed" });
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+
+  it("sends correlated cancellation and preserves the terminal acknowledgement", async () => {
     const pipe = fakePipe();
     bridge = await connectToDaemon("test", {
       connectPipeClient: async () => pipe.client,
@@ -60,6 +88,14 @@ describe("adapter operation control", () => {
     );
     const sent = pipe.send.mock.calls[0]?.[0] as { id: string };
     controller.abort();
+    pipe.receive({
+      id: sent.id,
+      error: {
+        code: "CANCELLED",
+        message: "host acknowledged cancellation",
+        retryable: false,
+      },
+    });
     await expect(request).rejects.toMatchObject({
       envelope: { code: "CANCELLED" },
     });
@@ -69,7 +105,51 @@ describe("adapter operation control", () => {
       correlationId: "mcp-cancel-1",
       reason: "cancelled",
     });
-    expect(() => pipe.receive({ id: sent.id, result: { ignored: true } })).not.toThrow();
+  });
+
+  it("keeps a cancelled mutation pending for a committed result or indeterminate fallback", async () => {
+    const pipe = fakePipe();
+    bridge = await connectToDaemon("test", {
+      connectPipeClient: async () => pipe.client,
+    });
+    const committedController = new AbortController();
+    const committed = bridge.request(
+      "mutation.execute",
+      {},
+      { signal: committedController.signal, correlationId: "committed-mutation" },
+    );
+    const committedRequest = pipe.send.mock.calls[0]?.[0] as { id: string };
+    committedController.abort();
+    pipe.receive({
+      id: committedRequest.id,
+      result: { ok: true, value: { uuid: "Actor.committed" } },
+    });
+    await expect(committed).resolves.toEqual({
+      ok: true,
+      value: { uuid: "Actor.committed" },
+    });
+
+    vi.useFakeTimers();
+    try {
+      const unknownController = new AbortController();
+      const unknown = bridge.request(
+        "mutation.execute",
+        {},
+        { signal: unknownController.signal, correlationId: "unknown-mutation" },
+      );
+      unknownController.abort();
+      const rejection = expect(unknown).rejects.toMatchObject({
+        envelope: {
+          code: "INDETERMINATE_MUTATION",
+          retryable: false,
+          details: { correlationId: "unknown-mutation", indeterminate: true },
+        },
+      });
+      await vi.advanceTimersByTimeAsync(1_001);
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("expires deadlines and forwards bounded progress", async () => {
@@ -104,23 +184,30 @@ describe("adapter operation control", () => {
       expect.objectContaining({ progress: 400, message: "provider request" }),
     );
 
-    const expired = bridge.request(
-      "documents.snapshot",
-      {},
-      {
-        deadline: Date.now() + 15,
-        correlationId: "mcp-timeout-1",
-      },
-    );
-    await expect(expired).rejects.toMatchObject({
-      envelope: { code: "TIMEOUT" },
-    });
-    expect(pipe.send).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        type: "request.cancel",
-        correlationId: "mcp-timeout-1",
-        reason: "timeout",
-      }),
-    );
+    vi.useFakeTimers();
+    try {
+      const expired = bridge.request(
+        "documents.snapshot",
+        {},
+        {
+          deadline: Date.now() + 15,
+          correlationId: "mcp-timeout-1",
+        },
+      );
+      const rejection = expect(expired).rejects.toMatchObject({
+        envelope: { code: "TIMEOUT" },
+      });
+      await vi.advanceTimersByTimeAsync(1_016);
+      await rejection;
+      expect(pipe.send).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          type: "request.cancel",
+          correlationId: "mcp-timeout-1",
+          reason: "timeout",
+        }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

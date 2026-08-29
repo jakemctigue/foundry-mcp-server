@@ -11,6 +11,7 @@ import {
 import {
   CompanionBridgeClient,
   FoundryEventHooks,
+  FoundrySessionService,
   validateCompanionEndpoint,
   type CompanionSocket,
   type CompanionStorage,
@@ -264,6 +265,85 @@ describe("browser companion (mocked Foundry global)", () => {
     ]);
   });
 
+  it("rejects in-flight and cached request ID reuse when request identity differs", async () => {
+    const socket = new MockSocket();
+    let finish: ((value: JsonValue) => void) | undefined;
+    const handler = vi.fn(
+      () =>
+        new Promise<JsonValue>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const client = new CompanionBridgeClient({
+      endpoint: "ws://127.0.0.1:3210",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
+      ...pairedOptions(),
+      storage: new MemoryStorage(),
+      createSocket: () => socket,
+      handleRequest: handler,
+    });
+    client.start();
+    await authenticate(socket);
+    const deadline = Date.now() + 10_000;
+    const original = {
+      type: "request",
+      id: "identity-bound-mutation",
+      method: "documents.update",
+      params: { uuid: "Actor.a", data: { name: "Alpha" } },
+      control: {
+        deadline,
+        correlationId: "mcp-identity-a",
+        progress: false,
+      },
+    };
+    socket.emit("message", original);
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
+
+    socket.emit("message", {
+      ...original,
+      control: { ...original.control, correlationId: "mcp-identity-b" },
+    });
+    socket.emit("message", {
+      ...original,
+      method: "documents.create",
+    });
+    socket.emit("message", {
+      ...original,
+      params: { uuid: "Actor.b", data: { name: "Beta" } },
+    });
+    await vi.waitFor(() =>
+      expect(
+        socket.sent.filter(
+          (message) => (message as { error?: { code?: string } }).error?.code === "CONFLICT",
+        ),
+      ).toHaveLength(3),
+    );
+    expect(handler).toHaveBeenCalledOnce();
+
+    finish?.({ updated: "Actor.a" });
+    await vi.waitFor(() =>
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({ id: "identity-bound-mutation", ok: true }),
+      ),
+    );
+    const conflictsBeforeCachedMismatch = socket.sent.filter(
+      (message) => (message as { error?: { code?: string } }).error?.code === "CONFLICT",
+    ).length;
+    socket.emit("message", {
+      ...original,
+      params: { uuid: "Actor.c", data: { name: "Gamma" } },
+    });
+    await vi.waitFor(() =>
+      expect(
+        socket.sent.filter(
+          (message) => (message as { error?: { code?: string } }).error?.code === "CONFLICT",
+        ),
+      ).toHaveLength(conflictsBeforeCachedMismatch + 1),
+    );
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
   it("reports an indeterminate committed mutation when cancellation arrives after a side effect", async () => {
     const socket = new MockSocket();
     const handler = vi.fn(
@@ -335,6 +415,125 @@ describe("browser companion (mocked Foundry global)", () => {
         }),
       ),
     );
+  });
+
+  it("bounds non-cooperative mutation cancellation and durably clears in-flight state", async () => {
+    const storage = new MemoryStorage();
+    const socket = new MockSocket();
+    const handler = vi.fn(() => new Promise<JsonValue>(() => undefined));
+    const client = new CompanionBridgeClient({
+      endpoint: "ws://127.0.0.1:3210",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
+      ...pairedOptions(),
+      storage,
+      createSocket: () => socket,
+      handleRequest: handler,
+    });
+    client.start();
+    await authenticate(socket);
+    const request = {
+      type: "request",
+      id: "non-cooperative-mutation",
+      method: "documents.update",
+      params: { uuid: "Actor.non-cooperative" },
+      control: {
+        deadline: Date.now() + 10_000,
+        correlationId: "mcp-non-cooperative",
+        progress: false,
+      },
+    };
+    socket.emit("message", request);
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
+    socket.emit("message", {
+      type: "request.cancel",
+      id: request.id,
+      correlationId: request.control.correlationId,
+      reason: "cancelled",
+    });
+    await vi.waitFor(() =>
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({
+          type: "response",
+          id: request.id,
+          ok: false,
+          error: expect.objectContaining({
+            code: "INDETERMINATE_MUTATION",
+            retryable: false,
+            details: expect.objectContaining({ indeterminate: true }),
+          }),
+        }),
+      ),
+    );
+    expect(JSON.parse(storage.getItem("foundry-mcp:world-a:bridge-state") ?? "null")).toMatchObject(
+      {
+        inFlightMutations: [],
+        responses: [
+          expect.objectContaining({
+            id: request.id,
+            error: expect.objectContaining({ code: "INDETERMINATE_MUTATION" }),
+          }),
+        ],
+      },
+    );
+
+    socket.sent.length = 0;
+    socket.emit("message", request);
+    await vi.waitFor(() =>
+      expect(socket.sent).toEqual([
+        expect.objectContaining({
+          id: request.id,
+          error: expect.objectContaining({ code: "INDETERMINATE_MUTATION" }),
+        }),
+      ]),
+    );
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("releases a queued session lock when that waiter is cancelled", async () => {
+    const terminalFailure = {
+      ok: false as const,
+      error: {
+        code: "FOUNDRY_ERROR" as const,
+        message: "stop after entering the lock",
+        retryable: false,
+      },
+    };
+    let releaseFirst: (() => void) | undefined;
+    const firstList = new Promise<typeof terminalFailure>((resolve) => {
+      releaseFirst = () => resolve(terminalFailure);
+    });
+    const list = vi
+      .fn()
+      .mockImplementationOnce(() => firstList)
+      .mockResolvedValue(terminalFailure);
+    const documents = {
+      runtime: {},
+      list,
+    } as unknown as ConstructorParameters<typeof FoundrySessionService>[0];
+    const sessions = new FoundrySessionService(documents, { journalFolderName: null });
+    const input = {
+      title: "Lock cleanup",
+      purpose: "Prove a cancelled waiter cannot poison the key",
+      folder: null,
+      idempotencyKey: "same-lock-key",
+    };
+
+    const first = sessions.start(input);
+    await vi.waitFor(() => expect(list).toHaveBeenCalledOnce());
+    const controller = new AbortController();
+    const cancelled = sessions.start(input, { signal: controller.signal });
+    controller.abort();
+    await expect(cancelled).rejects.toThrow(/cancel/i);
+
+    const later = sessions.start(input);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(list).toHaveBeenCalledOnce();
+    releaseFirst?.();
+    await expect(first).resolves.toEqual(terminalFailure);
+    await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    await expect(later).resolves.toEqual(terminalFailure);
   });
 
   it("advances to the durable host sequence and prunes stale pending events on resume", async () => {

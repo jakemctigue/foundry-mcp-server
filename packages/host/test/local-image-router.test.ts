@@ -369,4 +369,57 @@ describe("host-local image routing", () => {
     expect(runtime.request).not.toHaveBeenCalled();
     expect(auditJson(runtime.db)).not.toContain("C:/sensitive/image.png");
   });
+
+  it("passes cancellation into a pending local image read", async () => {
+    let observedSignal: AbortSignal | undefined;
+    const loader = vi.fn<LocalImageLoader>(
+      (_path, _requestedMaxBytes, signal) =>
+        new Promise((_resolve, reject) => {
+          observedSignal = signal;
+          signal?.addEventListener(
+            "abort",
+            () => reject(Object.assign(new Error("cancelled local read"), { name: "AbortError" })),
+            { once: true },
+          );
+        }),
+    );
+    const runtime = harness(loader);
+    grant(runtime.db, "assets:upload");
+    const respond = vi.fn();
+    runtime.router.handle(
+      {
+        id: "cancel-local-read",
+        method: "mutation.execute",
+        params: mutation("assets.images.upload", "assets:upload", {
+          destinationPath: "art/cancelled.png",
+          source: { kind: "file", path: "C:/allowed/pending.png" },
+        }),
+      },
+      respond,
+    );
+    await vi.waitFor(() => expect(loader).toHaveBeenCalledOnce());
+    expect(observedSignal).toBeInstanceOf(AbortSignal);
+
+    runtime.router.handle(
+      {
+        type: "request.cancel",
+        id: "cancel-local-read",
+        correlationId: "test-assets.images.upload",
+        reason: "cancelled",
+      },
+      respond,
+    );
+
+    await vi.waitFor(() =>
+      expect(respond).toHaveBeenCalledWith({
+        id: "cancel-local-read",
+        result: expect.objectContaining({
+          ok: false,
+          error: expect.objectContaining({ code: "CANCELLED" }),
+        }),
+      }),
+    );
+    expect(observedSignal?.aborted).toBe(true);
+    expect(runtime.request).not.toHaveBeenCalled();
+  });
 });

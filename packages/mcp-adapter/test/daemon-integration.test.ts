@@ -89,9 +89,13 @@ describe("mcp-adapter <-> real host daemon", () => {
       requestTimeoutMs: 10,
     });
 
-    await expect(bridge.request("initialize")).rejects.toThrow(
-      "bridge request initialize timed out",
-    );
+    await expect(bridge.request("initialize")).rejects.toMatchObject({
+      envelope: {
+        code: "TIMEOUT",
+        message: "Bridge request deadline elapsed",
+        retryable: false,
+      },
+    });
     await bridge.close();
   });
 

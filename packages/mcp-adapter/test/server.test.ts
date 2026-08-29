@@ -4,9 +4,14 @@ import {
   BRIDGE_PROTOCOL_VERSION,
   LEGACY_MCP_PROTOCOL_VERSIONS,
   MCP_PROTOCOL_VERSION,
+  makeError,
 } from "@foundry-mcp/protocol";
 import { createFoundryMcpServer } from "../src/server.js";
-import { createStubBridgeConnection, type BridgeConnection } from "../src/bridge-connection.js";
+import {
+  BridgeRequestError,
+  createStubBridgeConnection,
+  type BridgeConnection,
+} from "../src/bridge-connection.js";
 
 async function setup(bridge: BridgeConnection = createStubBridgeConnection()): Promise<{
   client: Client;
@@ -53,6 +58,33 @@ describe("foundry.connections.list", () => {
       const text = (result.content as Array<{ type: string; text: string }>)[0]?.text ?? "";
       const envelope = JSON.parse(text) as { code: string };
       expect(envelope.code).toBe("INVALID_DATA");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it("preserves structured cancellation errors for connections and intelligence", async () => {
+    const bridge: BridgeConnection = {
+      request: () =>
+        Promise.reject(
+          new BridgeRequestError(makeError("TIMEOUT", "operation deadline elapsed", false)),
+        ),
+      close: () => Promise.resolve(),
+    };
+    const { client, cleanup } = await setup(bridge);
+    try {
+      for (const call of [
+        { name: "foundry.connections.list", arguments: {} },
+        {
+          name: "foundry.intelligence.status",
+          arguments: { connectionId: "world-a" },
+        },
+      ]) {
+        const result = await client.callTool(call);
+        expect(result.isError).toBe(true);
+        const text = (result.content as Array<{ type: string; text: string }>)[0]?.text ?? "";
+        expect(JSON.parse(text)).toMatchObject({ code: "TIMEOUT", retryable: false });
+      }
     } finally {
       await cleanup();
     }

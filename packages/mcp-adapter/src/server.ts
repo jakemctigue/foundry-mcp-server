@@ -10,7 +10,7 @@ import {
   makeError,
   type CapabilitiesGetOutput as CapabilitiesGetOutputData,
 } from "@foundry-mcp/protocol";
-import type { BridgeConnection } from "./bridge-connection.js";
+import { BridgeRequestError, type BridgeConnection } from "./bridge-connection.js";
 import type { MutationAuthorizer } from "./mutation-authorization.js";
 import { IntelligenceBridgeApi } from "./intelligence-api.js";
 import { registerAssetTools } from "./tools/assets.js";
@@ -19,7 +19,7 @@ import { registerIntelligenceTools } from "./tools/intelligence.js";
 import { registerSessionTools } from "./tools/sessions.js";
 import { registerFoundryResources } from "./resources.js";
 import { registerFoundryPrompts } from "./prompts.js";
-import { bridgeRequestOptions } from "./tools/bridge-tool.js";
+import { bridgeRequestOptions, BridgeResultError } from "./tools/bridge-tool.js";
 
 // Accepts any object shape so the SDK never rejects the call before our
 // handler runs; we perform the "no unexpected arguments" check ourselves so
@@ -40,6 +40,17 @@ function errorContent(
   isError: true;
 } {
   const envelope = makeError(code, message, false);
+  return {
+    content: [{ type: "text", text: JSON.stringify(envelope) }],
+    isError: true,
+  };
+}
+
+function bridgeFailureContent(error: unknown, message: string): ReturnType<typeof errorContent> {
+  const envelope =
+    error instanceof BridgeRequestError || error instanceof BridgeResultError
+      ? error.envelope
+      : makeError("OFFLINE_BRIDGE", message, true);
   return {
     content: [{ type: "text", text: JSON.stringify(envelope) }],
     isError: true,
@@ -68,39 +79,44 @@ export function createFoundryMcpServer(options: CreateServerOptions): McpServer 
       }
 
       const requestOptions = bridgeRequestOptions(context);
-      await requestOptions.onProgress?.({
-        stage: "start",
-        progress: 0,
-        total: MAX_OPERATION_PROGRESS_UPDATES,
-        message: "connections.list started",
-      });
-      const result = (await bridge.request(
-        "connections.list",
-        {},
-        {
-          ...requestOptions,
-          ...(requestOptions.onProgress
-            ? {
-                onProgress: (
-                  progress: Parameters<NonNullable<typeof requestOptions.onProgress>>[0],
-                ) =>
-                  progress.stage === "start" || progress.stage === "complete"
-                    ? undefined
-                    : requestOptions.onProgress?.(progress),
-              }
-            : {}),
-        },
-      )) as unknown;
-      const parsed = ConnectionsListOutput.safeParse(result);
-      if (!parsed.success) {
-        return errorContent("INVALID_DATA", "bridge returned a malformed connections list");
+      let parsed: ReturnType<typeof ConnectionsListOutput.safeParse>;
+      try {
+        await requestOptions.onProgress?.({
+          stage: "start",
+          progress: 0,
+          total: MAX_OPERATION_PROGRESS_UPDATES,
+          message: "connections.list started",
+        });
+        const result = (await bridge.request(
+          "connections.list",
+          {},
+          {
+            ...requestOptions,
+            ...(requestOptions.onProgress
+              ? {
+                  onProgress: (
+                    progress: Parameters<NonNullable<typeof requestOptions.onProgress>>[0],
+                  ) =>
+                    progress.stage === "start" || progress.stage === "complete"
+                      ? undefined
+                      : requestOptions.onProgress?.(progress),
+                }
+              : {}),
+          },
+        )) as unknown;
+        parsed = ConnectionsListOutput.safeParse(result);
+        if (!parsed.success) {
+          return errorContent("INVALID_DATA", "bridge returned a malformed connections list");
+        }
+        await requestOptions.onProgress?.({
+          stage: "complete",
+          progress: MAX_OPERATION_PROGRESS_UPDATES,
+          total: MAX_OPERATION_PROGRESS_UPDATES,
+          message: "connections.list completed",
+        });
+      } catch (error) {
+        return bridgeFailureContent(error, "Foundry connections bridge request failed");
       }
-      await requestOptions.onProgress?.({
-        stage: "complete",
-        progress: MAX_OPERATION_PROGRESS_UPDATES,
-        total: MAX_OPERATION_PROGRESS_UPDATES,
-        message: "connections.list completed",
-      });
 
       return {
         content: [
