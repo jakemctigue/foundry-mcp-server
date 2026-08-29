@@ -61,6 +61,20 @@ describe("daemon doctor status snapshot", () => {
     for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it("rejects relative local asset roots before starting host services", async () => {
+    priorNodeEnv = process.env["NODE_ENV"];
+    const appDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "foundry-mcp-root-validation-"));
+    tempDirs.push(appDataDir);
+    await expect(
+      startDaemon({
+        appDataDir,
+        companionPairingSecret: PAIRING_SECRET,
+        cliConfig: { localAssetRoots: ["relative/assets"] },
+      }),
+    ).rejects.toThrow(/local asset roots must be absolute filesystem paths/);
+    expect(fs.existsSync(path.join(appDataDir, "status.json"))).toBe(false);
+  });
+
   it("atomically reports start, authenticated connection changes, and graceful stop", async () => {
     priorNodeEnv = process.env["NODE_ENV"];
     process.env["NODE_ENV"] = "test";
@@ -92,6 +106,10 @@ describe("daemon doctor status snapshot", () => {
       worldTitle: "Status World",
       foundryVersion: "14.0",
       foundryUserRole: "GAMEMASTER",
+      currentUser: { id: "gm-a", name: "Game Master", role: "GAMEMASTER" },
+      system: { id: "dnd5e", version: "5.1.0" },
+      activeModules: [{ id: "foundry-mcp", version: "0.1.0" }],
+      moduleCapabilities: ["documents.read"],
     });
     await vi.waitFor(() => expect(readStatus(statusPath)["activeConnections"]).toBe(1));
     const serialized = fs.readFileSync(statusPath, "utf8");

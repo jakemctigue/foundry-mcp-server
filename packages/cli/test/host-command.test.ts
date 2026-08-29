@@ -45,6 +45,9 @@ describe("host command", () => {
 
   it("applies config file then environment then CLI precedence", () => {
     const appDataDir = tempDir();
+    const fileAssetRoot = path.join(appDataDir, "file-assets");
+    const envAssetRoot = path.join(appDataDir, "env-assets");
+    const cliAssetRoot = path.join(appDataDir, "cli-assets");
     const configPath = path.join(appDataDir, "config.json");
     fs.writeFileSync(
       configPath,
@@ -53,6 +56,7 @@ describe("host command", () => {
         pipeName: "from-file",
         logLevel: "warn",
         allowedOrigins: ["https://file.example.test"],
+        localAssetRoots: [fileAssetRoot],
       }),
     );
 
@@ -62,12 +66,14 @@ describe("host command", () => {
         port: "3103",
         logLevel: "debug",
         allowedOrigins: ["https://cli.example.test", "https://cli.example.test/"],
+        localAssetRoots: [cliAssetRoot, cliAssetRoot],
       },
       {
         FOUNDRY_MCP_PORT: "3102",
         FOUNDRY_MCP_PIPE_NAME: "from-env",
         FOUNDRY_MCP_LOG_LEVEL: "error",
         FOUNDRY_MCP_ALLOWED_ORIGINS: "https://env.example.test",
+        FOUNDRY_MCP_LOCAL_ASSET_ROOTS: envAssetRoot,
       },
     );
 
@@ -77,6 +83,7 @@ describe("host command", () => {
       pipeName: "from-env",
       logLevel: "debug",
       allowedOrigins: ["https://cli.example.test"],
+      localAssetRoots: [cliAssetRoot],
     });
   });
 
@@ -88,6 +95,7 @@ describe("host command", () => {
       "http://localhost:30000",
       "http://127.0.0.1:30000",
     ]);
+    expect(launch.config.localAssetRoots).toEqual([]);
     expect(launch.configPath).toBeUndefined();
   });
 
@@ -105,6 +113,16 @@ describe("host command", () => {
       { FOUNDRY_MCP_ALLOWED_ORIGINS: "https://good.example.test,*" },
       /FOUNDRY_MCP_ALLOWED_ORIGINS.*exact http/,
     ],
+    [
+      { allowedOrigins: [], localAssetRoots: ["relative/assets"] },
+      {},
+      /--allow-local-asset-root.*absolute filesystem path/,
+    ],
+    [
+      { allowedOrigins: [] },
+      { FOUNDRY_MCP_LOCAL_ASSET_ROOTS: "relative/assets" },
+      /FOUNDRY_MCP_LOCAL_ASSET_ROOTS.*absolute filesystem path/,
+    ],
   ])("rejects invalid CLI or environment host configuration", (options, env, expected) => {
     expect(() => resolveHostLaunch({ appDataDir: tempDir(), ...options }, env)).toThrow(
       expected as RegExp,
@@ -116,6 +134,17 @@ describe("host command", () => {
     fs.writeFileSync(path.join(appDataDir, "config.json"), JSON.stringify({ port: "3100" }));
     expect(() => resolveHostLaunch({ appDataDir, port: "3200", allowedOrigins: [] }, {})).toThrow(
       /host config file\.port.*integer/,
+    );
+  });
+
+  it("rejects relative local asset roots from the config file", () => {
+    const appDataDir = tempDir();
+    fs.writeFileSync(
+      path.join(appDataDir, "config.json"),
+      JSON.stringify({ localAssetRoots: ["relative/assets"] }),
+    );
+    expect(() => resolveHostLaunch({ appDataDir, allowedOrigins: [] }, {})).toThrow(
+      /host config file\.localAssetRoots.*absolute filesystem path/,
     );
   });
 

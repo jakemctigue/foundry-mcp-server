@@ -133,6 +133,31 @@ function validateAllowedOrigins(value: unknown, label: string): string[] {
   ];
 }
 
+function validateLocalAssetRoots(value: unknown, label: string): string[] {
+  if (!Array.isArray(value)) invalid(label, "must be an array of absolute filesystem paths");
+  const normalized = value.map((root, index) => {
+    if (
+      typeof root !== "string" ||
+      root.length === 0 ||
+      root.trim() !== root ||
+      root.includes("\0") ||
+      !path.isAbsolute(root)
+    ) {
+      invalid(`${label}[${index.toString()}]`, "must be an absolute filesystem path");
+    }
+    return path.resolve(root);
+  });
+  return [...new Set(normalized)];
+}
+
+function splitLocalAssetRoots(value: string): string[] {
+  const separator = value.includes(";") ? ";" : ",";
+  return value
+    .split(separator)
+    .map((root) => root.trim())
+    .filter(Boolean);
+}
+
 function validateHostConfigSource(
   source: Record<string, unknown>,
   label: string,
@@ -170,6 +195,12 @@ function validateHostConfigSource(
     validated.allowedOrigins = validateAllowedOrigins(
       source["allowedOrigins"],
       `${label}.allowedOrigins`,
+    );
+  }
+  if (Object.hasOwn(source, "localAssetRoots")) {
+    validated.localAssetRoots = validateLocalAssetRoots(
+      source["localAssetRoots"],
+      `${label}.localAssetRoots`,
     );
   }
   return validated;
@@ -223,6 +254,10 @@ function validateEnvironment(env: EnvSource): void {
       "FOUNDRY_MCP_ALLOWED_ORIGINS",
     );
   }
+  const localAssetRoots = env["FOUNDRY_MCP_LOCAL_ASSET_ROOTS"];
+  if (localAssetRoots !== undefined) {
+    validateLocalAssetRoots(splitLocalAssetRoots(localAssetRoots), "FOUNDRY_MCP_LOCAL_ASSET_ROOTS");
+  }
 }
 
 function validateResolvedConfig(config: HostConfig): HostConfig {
@@ -246,6 +281,10 @@ function validateResolvedConfig(config: HostConfig): HostConfig {
     allowedOrigins: validateAllowedOrigins(
       config.allowedOrigins,
       "resolved host config.allowedOrigins",
+    ),
+    localAssetRoots: validateLocalAssetRoots(
+      config.localAssetRoots,
+      "resolved host config.localAssetRoots",
     ),
   };
 }
@@ -288,6 +327,12 @@ function cliConfigSource(options: HostCommandOptions): Partial<HostConfig> {
     source.logLevel = validateLogLevel(options.logLevel, "--log-level");
   if (options.allowedOrigins.length > 0) {
     source.allowedOrigins = validateAllowedOrigins(options.allowedOrigins, "--allow-origin");
+  }
+  if ((options.localAssetRoots?.length ?? 0) > 0) {
+    source.localAssetRoots = validateLocalAssetRoots(
+      options.localAssetRoots,
+      "--allow-local-asset-root",
+    );
   }
   return source;
 }

@@ -197,7 +197,7 @@ describe("real browser companion host (mocked Foundry WebSocket)", () => {
       method: "assets.images.upload",
       params: {
         connectionId: "world-a",
-        source: { kind: "file", path: "C:\\api_key=never-log-this.png" },
+        source: { kind: "base64", data: "api_key=never-log-this" },
       },
       authorization: {
         connectionId: "world-a",

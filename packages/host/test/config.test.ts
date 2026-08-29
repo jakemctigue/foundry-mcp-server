@@ -32,6 +32,7 @@ describe("resolveConfig precedence", () => {
     expect(config.eventRetentionDays).toBe(30);
     expect(config.eventCategories).toContain("chat.public");
     expect(config.eventCategories).not.toContain("chat.private");
+    expect(config.localAssetRoots).toEqual([]);
   });
 
   it("parses event capture and retention environment settings", () => {
@@ -46,5 +47,14 @@ describe("resolveConfig precedence", () => {
     expect(config.eventCategories).toEqual(["document.create", "combat", "chat.private"]);
     expect(config.capturePrivateContent).toBe(true);
     expect(config.eventRetentionDays).toBe(14);
+  });
+
+  it("parses local asset roots without splitting Windows drive letters", () => {
+    const config = resolveConfig(
+      { localAssetRoots: ["C:/from-file"] },
+      { FOUNDRY_MCP_LOCAL_ASSET_ROOTS: "C:/from-env;D:/also-env" },
+      {},
+    );
+    expect(config.localAssetRoots).toEqual(["C:/from-env", "D:/also-env"]);
   });
 });

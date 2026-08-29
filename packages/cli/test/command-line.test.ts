@@ -20,6 +20,10 @@ describe("CLI argument parser", () => {
         "http://127.0.0.1:30000",
         "--allow-origin",
         "https://foundry.example.test",
+        "--allow-local-asset-root",
+        "C:/FoundryAssets",
+        "--allow-local-asset-root",
+        "D:/SharedArt",
       ]),
     ).toEqual({
       command: "host",
@@ -30,6 +34,7 @@ describe("CLI argument parser", () => {
         pipeName: "desktop",
         logLevel: "debug",
         allowedOrigins: ["http://127.0.0.1:30000", "https://foundry.example.test"],
+        localAssetRoots: ["C:/FoundryAssets", "D:/SharedArt"],
       },
     });
   });

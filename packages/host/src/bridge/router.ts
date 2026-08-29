@@ -1,6 +1,7 @@
 import {
   AssetsImagesAttachInput,
   AssetsImagesGenerateInput,
+  AssetsImagesUploadInput,
   BRIDGE_PROTOCOL_VERSION,
   ErrorEnvelope,
   IntelligenceChangedSinceInput,
@@ -14,6 +15,11 @@ import {
 import type Database from "better-sqlite3";
 
 import { importImageUrl, UrlImportError } from "../assets/url-import.js";
+import {
+  LocalImageError,
+  type LocalImageErrorCode,
+  type LocalImageLoader,
+} from "../assets/local-file.js";
 import { buildContextPack } from "../intelligence/context-pack.js";
 import { getChangedSincePage, getTimeline, searchEvents } from "../intelligence/queries.js";
 import {
@@ -54,6 +60,17 @@ type UnknownRecord = Record<string, unknown>;
 type UrlImporter = typeof importImageUrl;
 type AuditFailureReporter = (error: Error, committed: boolean) => void;
 
+const LOCAL_IMAGE_ERROR_MESSAGES: Record<LocalImageErrorCode, string> = {
+  OUTSIDE_ROOT: "Local image path is outside the configured roots",
+  REPARSE_POINT: "Local image paths cannot contain symbolic links or junctions",
+  SIZE_LIMIT: "Local image exceeds the configured size limit",
+  NOT_FILE: "Local image path is not a regular file",
+  CHANGED_DURING_READ: "Local image changed while it was being authorized",
+  MIME_MISMATCH: "Local image MIME type does not match its contents",
+  INVALID_IMAGE: "Local image is not a supported valid image",
+  READ_FAILED: "Local image could not be read safely",
+};
+
 class CompanionOperationError extends Error {
   constructor(readonly envelope: ReturnType<typeof makeError>) {
     super(envelope.message);
@@ -69,6 +86,76 @@ function jsonRecord(value: unknown): Record<string, JsonValue> {
   return JSON.parse(JSON.stringify(record(value))) as Record<string, JsonValue>;
 }
 
+function redactUploadSource(value: unknown): Record<string, JsonValue> {
+  const source = jsonRecord(value);
+  if (source["kind"] === "file" && typeof source["path"] === "string") {
+    source["path"] = "[REDACTED]";
+  }
+  if (
+    (source["kind"] === "base64" || source["kind"] === "generated") &&
+    typeof source["data"] === "string"
+  ) {
+    source["data"] = "[REDACTED]";
+  }
+  return source;
+}
+
+function mutationAuditDetails(
+  method: string,
+  operationParams: UnknownRecord,
+): Record<string, JsonValue> {
+  const safe = jsonRecord(operationParams);
+  if (method === "assets.images.upload") {
+    safe["source"] = redactUploadSource(safe["source"]);
+  }
+  if (method === "assets.images.attach") {
+    const asset = jsonRecord(safe["asset"]);
+    if (asset["kind"] === "upload") asset["source"] = redactUploadSource(asset["source"]);
+    safe["asset"] = asset;
+  }
+  return safe;
+}
+
+function localImageFailure(error: unknown): CompanionOperationError {
+  const code = error instanceof LocalImageError ? error.code : "READ_FAILED";
+  return new CompanionOperationError(
+    makeError("INVALID_DATA", LOCAL_IMAGE_ERROR_MESSAGES[code], false, {
+      localFileCode: code,
+    }),
+  );
+}
+
+async function resolveLocalImageSource(
+  source: { path: string; mimeType?: string | undefined },
+  loader?: LocalImageLoader,
+): Promise<{ kind: "base64"; data: string; mimeType: string }> {
+  if (!loader) {
+    throw new CompanionOperationError(
+      makeError("PERMISSION_DENIED", "Local image file access is disabled", false, {
+        localFileCode: "DISABLED",
+      }),
+    );
+  }
+  try {
+    const loaded = await loader(source.path);
+    const declaredMimeType = source.mimeType?.toLowerCase().split(";")[0]?.trim();
+    if (declaredMimeType && declaredMimeType !== loaded.mimeType) {
+      throw new LocalImageError(
+        "MIME_MISMATCH",
+        "Local image MIME type does not match its contents",
+      );
+    }
+    return {
+      kind: "base64",
+      data: Buffer.from(loaded.bytes).toString("base64"),
+      mimeType: loaded.mimeType,
+    };
+  } catch (error) {
+    if (error instanceof CompanionOperationError) throw error;
+    throw localImageFailure(error);
+  }
+}
+
 function defaultImageProviders(): ImageProviderRegistry {
   return new ImageProviderRegistry().register(new DeterministicImageProvider());
 }
@@ -80,6 +167,7 @@ export class HostBridgeRouter {
     readonly imageProviders: ImageProviderRegistry = defaultImageProviders(),
     readonly urlImporter: UrlImporter = importImageUrl,
     readonly reportAuditFailure?: AuditFailureReporter,
+    readonly localImageLoader?: LocalImageLoader,
   ) {}
 
   handle(message: unknown, respond: (response: unknown) => void): void {
@@ -230,16 +318,38 @@ export class HostBridgeRouter {
         ...(additionalCapabilities.length > 0 ? { additionalCapabilities } : {}),
         tool,
         correlationId,
-        auditDetails: operationParams,
+        auditDetails: mutationAuditDetails(method, operationParams),
         ...(this.reportAuditFailure ? { onAuditFailure: this.reportAuditFailure } : {}),
       },
       async () => {
         let companionMethod = method;
         let companionParams = jsonRecord(operationParams);
         let generation: { provider: string; model?: string } | undefined;
+        if (
+          method === "assets.images.upload" &&
+          record(operationParams["source"])["kind"] === "file"
+        ) {
+          const input = AssetsImagesUploadInput.parse(operationParams);
+          if (input.source.kind !== "file")
+            throw new Error("Local image source changed unexpectedly");
+          companionParams = jsonRecord({
+            ...input,
+            connectionId,
+            source: await resolveLocalImageSource(input.source, this.localImageLoader),
+          });
+        }
         if (method === "assets.images.attach") {
           const input = AssetsImagesAttachInput.parse(operationParams);
-          if (input.asset.kind === "url") {
+          if (input.asset.kind === "upload" && input.asset.source.kind === "file") {
+            companionParams = jsonRecord({
+              ...input,
+              connectionId,
+              asset: {
+                ...input.asset,
+                source: await resolveLocalImageSource(input.asset.source, this.localImageLoader),
+              },
+            });
+          } else if (input.asset.kind === "url") {
             try {
               const imported = await this.urlImporter(input.asset.url);
               companionParams = jsonRecord({

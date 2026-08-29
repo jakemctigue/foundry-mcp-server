@@ -14,6 +14,7 @@ import { HostBridgeRouter } from "./bridge/router.js";
 import { createImageProviderRegistry } from "./providers/images.js";
 import { createSecretStorage } from "./secrets/storage.js";
 import { writeHostStatusAtomic } from "./status.js";
+import { createLocalImageLoader } from "./assets/local-file.js";
 
 export interface Daemon {
   config: HostConfig;
@@ -39,6 +40,15 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
   fs.mkdirSync(appDataDir, { recursive: true });
 
   const config = resolveConfig({}, process.env, options.cliConfig ?? {});
+  for (const root of config.localAssetRoots) {
+    if (root.length === 0 || root.includes("\0") || !path.isAbsolute(root)) {
+      throw new Error("local asset roots must be absolute filesystem paths");
+    }
+  }
+  const localImageLoader =
+    config.localAssetRoots.length === 0
+      ? undefined
+      : createLocalImageLoader({ allowedRoots: config.localAssetRoots });
   const logger = createLogger({ level: config.logLevel, sinks: [stderrSink()] });
   const statusPath = path.join(appDataDir, "status.json");
   let hostState: "running" | "stopped" = "running";
@@ -104,6 +114,7 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
         committed,
         errorType: error.name,
       }),
+    localImageLoader,
   );
   const pipe = await startPipeServer({
     pipePath,

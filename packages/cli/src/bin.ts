@@ -71,7 +71,7 @@ async function main(): Promise<void> {
 main().catch((err: unknown) => {
   const message = err instanceof Error ? err.message : String(err);
   process.stderr.write(
-    `foundry-mcp cli failed: ${message}\nusage:\n  foundry-mcp host [--config PATH] [--app-data PATH] [--port PORT] [--pipe-name NAME] [--log-level LEVEL] [--allow-origin ORIGIN]...\n  foundry-mcp capabilities list --connection-id ID [--json] [--config PATH] [--app-data PATH]\n  foundry-mcp capabilities <grant|revoke> --connection-id ID --role ROLE --capability CAPABILITY [--json] [--config PATH] [--app-data PATH]\n  foundry-mcp provider <configure|remove|status> [--json] [--app-data PATH]\n  foundry-mcp doctor [--json] [--config PATH] [--app-data PATH] [--foundry-data PATH | --docker-data PATH] [--bridge-url URL] [--foundry-origin ORIGIN] [--allow-origin ORIGIN]...\n  foundry-mcp build-module [--json] [--output DIR] [--version SEMVER]\n`,
+    `foundry-mcp cli failed: ${message}\nusage:\n  foundry-mcp host [--config PATH] [--app-data PATH] [--port PORT] [--pipe-name NAME] [--log-level LEVEL] [--allow-origin ORIGIN]... [--allow-local-asset-root PATH]...\n  foundry-mcp capabilities list --connection-id ID [--json] [--config PATH] [--app-data PATH]\n  foundry-mcp capabilities <grant|revoke> --connection-id ID --role ROLE --capability CAPABILITY [--json] [--config PATH] [--app-data PATH]\n  foundry-mcp provider <configure|remove|status> [--json] [--app-data PATH]\n  foundry-mcp doctor [--json] [--config PATH] [--app-data PATH] [--foundry-data PATH | --docker-data PATH] [--bridge-url URL] [--foundry-origin ORIGIN] [--allow-origin ORIGIN]...\n  foundry-mcp build-module [--json] [--output DIR] [--version SEMVER]\n`,
   );
   process.exitCode = 1;
 });

@@ -18,6 +18,7 @@ export interface BuildModuleCommandOptions {
 
 export interface HostCommandOptions {
   allowedOrigins: string[];
+  localAssetRoots?: string[];
   appDataDir?: string;
   configPath?: string;
   port?: string;
@@ -161,9 +162,11 @@ function parseHost(args: readonly string[]): HostCommandOptions {
     "--pipe-name": "scalar",
     "--log-level": "scalar",
     "--allow-origin": "repeatable",
+    "--allow-local-asset-root": "repeatable",
   });
   const result: HostCommandOptions = {
     allowedOrigins: repeated(parsed, "--allow-origin"),
+    localAssetRoots: repeated(parsed, "--allow-local-asset-root"),
   };
   const appDataDir = scalar(parsed, "--app-data");
   const configPath = scalar(parsed, "--config");
