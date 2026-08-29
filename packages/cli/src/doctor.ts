@@ -3,11 +3,18 @@ import net from "node:net";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import {
+  BRIDGE_PROTOCOL_VERSION,
+  DEFAULT_CONFIG,
   MIGRATIONS,
+  connectPipeClient,
   defaultUserIdentifier,
   openDatabase,
   resolveAppDataDir,
+  resolveConfig,
   resolvePipePath,
+  type ConfigFileSource,
+  type HostConfig,
+  type PipeClient,
 } from "@foundry-mcp/host";
 
 export type CheckStatus = "OK" | "WARN" | "FAIL";
@@ -31,8 +38,25 @@ export interface DoctorOptions {
   allowedOrigins?: readonly string[];
   providerEnv?: Record<string, string | undefined>;
   statusPath?: string;
-  pipeProbe?: (pipePath: string) => Promise<boolean>;
+  pipeProbe?: DoctorPipeProbe;
 }
+
+export interface DoctorPipeProbeResult {
+  status: "authenticated" | "offline" | "rejected";
+  protocolVersion?: string;
+}
+
+export type DoctorPipeProbe = (
+  pipePath: string,
+  appDataDir: string,
+) => Promise<DoctorPipeProbeResult>;
+
+interface PipeProbeDependencies {
+  connect?: (pipePath: string, appDataDir: string) => Promise<PipeClient>;
+  timeoutMs?: number;
+}
+
+const DEFAULT_PIPE_PROBE_TIMEOUT_MS = 2_000;
 
 interface LoadedConfig {
   result: CheckResult;
@@ -43,9 +67,34 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function stringArray(value: unknown): string[] | undefined {
+function stringArrayValue(value: unknown): string[] | undefined {
   if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) return undefined;
   return value;
+}
+
+function hostConfigFileSource(config: Record<string, unknown>): ConfigFileSource {
+  const source: ConfigFileSource = {};
+  const port = config["port"];
+  const pipeName = stringValue(config["pipeName"]);
+  const logLevel = config["logLevel"];
+  const dbPath = stringValue(config["dbPath"]);
+  const eventCategories = stringArrayValue(config["eventCategories"]);
+  const capturePrivateContent = config["capturePrivateContent"];
+  const eventRetentionDays = config["eventRetentionDays"];
+  const allowedOrigins = stringArrayValue(config["allowedOrigins"]);
+  if (typeof port === "number") source.port = port;
+  if (pipeName) source.pipeName = pipeName;
+  if (["debug", "info", "warn", "error"].includes(String(logLevel))) {
+    source.logLevel = logLevel as HostConfig["logLevel"];
+  }
+  if (dbPath) source.dbPath = dbPath;
+  if (eventCategories) source.eventCategories = eventCategories;
+  if (typeof capturePrivateContent === "boolean") {
+    source.capturePrivateContent = capturePrivateContent;
+  }
+  if (typeof eventRetentionDays === "number") source.eventRetentionDays = eventRetentionDays;
+  if (allowedOrigins) source.allowedOrigins = allowedOrigins;
+  return source;
 }
 
 function loadConfig(options: DoctorOptions): LoadedConfig {
@@ -89,14 +138,20 @@ function loadConfig(options: DoctorOptions): LoadedConfig {
   }
 }
 
-function resolveWindowsIcaclsPath(): string | undefined {
+function resolveWindowsAclInspectorPath(): string | undefined {
   const systemRoot = process.env["SystemRoot"];
   if (!systemRoot || !path.win32.isAbsolute(systemRoot)) return undefined;
 
   const normalizedRoot = path.win32.normalize(systemRoot);
   if (!/^[a-z]:\\$/i.test(path.win32.parse(normalizedRoot).root)) return undefined;
 
-  const candidate = path.win32.join(normalizedRoot, "System32", "icacls.exe");
+  const candidate = path.win32.join(
+    normalizedRoot,
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  );
   const relativeCandidate = path.win32.relative(normalizedRoot, candidate);
   if (
     !path.win32.isAbsolute(candidate) ||
@@ -125,6 +180,64 @@ function resolveWindowsIcaclsPath(): string | undefined {
   }
 }
 
+const BROAD_WINDOWS_TRUSTEES = new Set([
+  "WD",
+  "AU",
+  "BU",
+  "S-1-1-0",
+  "S-1-5-11",
+  "S-1-5-32-545",
+]);
+
+const WINDOWS_ALLOW_ACE_TYPES = new Set(["A", "OA", "XA", "ZA"]);
+
+/** Detect broad allow ACEs from locale-independent SDDL trustee identifiers. */
+export function sddlHasBroadAccess(sddl: string): boolean {
+  for (const match of sddl.matchAll(/\(([^()]*)\)/g)) {
+    const fields = (match[1] ?? "").split(";");
+    const aceType = fields[0]?.toUpperCase();
+    const rights = fields[2];
+    const trustee = fields[5]?.toUpperCase();
+    if (
+      aceType &&
+      WINDOWS_ALLOW_ACE_TYPES.has(aceType) &&
+      rights &&
+      trustee &&
+      BROAD_WINDOWS_TRUSTEES.has(trustee)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function inspectWindowsAclSddl(configPath: string): string | undefined {
+  const inspectorPath = resolveWindowsAclInspectorPath();
+  if (!inspectorPath) return undefined;
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    "$target = [Environment]::GetEnvironmentVariable('FOUNDRY_MCP_ACL_TARGET', 'Process')",
+    "if ([string]::IsNullOrWhiteSpace($target)) { throw 'ACL target is unavailable' }",
+    "$sections = [System.Security.AccessControl.AccessControlSections]::All",
+    "$acl = New-Object System.Security.AccessControl.FileSecurity($target, $sections)",
+    "[Console]::Out.Write($acl.GetSecurityDescriptorSddlForm($sections))",
+  ].join("; ");
+  const inspected = spawnSync(
+    inspectorPath,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+    {
+      encoding: "utf8",
+      env: { ...process.env, FOUNDRY_MCP_ACL_TARGET: configPath },
+      maxBuffer: 64 * 1024,
+      timeout: 5_000,
+      windowsHide: true,
+    },
+  );
+  if (inspected.error || inspected.status !== 0) return undefined;
+  const sddl = inspected.stdout.trim();
+  return sddl.includes("D:") ? sddl : undefined;
+}
+
 function checkConfigPermissions(configPath: string | undefined): CheckResult {
   if (!configPath || !fs.existsSync(configPath)) {
     return {
@@ -137,28 +250,16 @@ function checkConfigPermissions(configPath: string | undefined): CheckResult {
   try {
     fs.accessSync(configPath, fs.constants.R_OK | fs.constants.W_OK);
     if (process.platform === "win32") {
-      const icaclsPath = resolveWindowsIcaclsPath();
-      if (!icaclsPath) {
+      const sddl = inspectWindowsAclSddl(configPath);
+      if (!sddl) {
         return {
           id: "config-permissions",
           status: "FAIL",
           message: "trusted Windows ACL inspection tool is unavailable",
-          hint: "verify that SystemRoot points to Windows and System32\\icacls.exe is present",
+          hint: "verify that SystemRoot points to Windows and Windows PowerShell is present",
         };
       }
-      const acl = spawnSync(icaclsPath, [configPath], {
-        encoding: "utf8",
-        windowsHide: true,
-      });
-      if (acl.error || acl.status !== 0) {
-        return {
-          id: "config-permissions",
-          status: "FAIL",
-          message: "config is accessible, but its Windows ACL could not be verified safely",
-          hint: "run the trusted System32 icacls.exe and restrict access to the current user",
-        };
-      }
-      if (/(?:Everyone|BUILTIN\\Users|Authenticated Users):/i.test(acl.stdout)) {
+      if (sddlHasBroadAccess(sddl)) {
         return {
           id: "config-permissions",
           status: "WARN",
@@ -169,7 +270,7 @@ function checkConfigPermissions(configPath: string | undefined): CheckResult {
       return {
         id: "config-permissions",
         status: "OK",
-        message: "config Windows ACL does not expose a known broad user principal",
+        message: "config Windows SDDL does not grant a known broad user SID",
       };
     }
     const mode = fs.statSync(configPath).mode & 0o777;
@@ -216,7 +317,7 @@ function checkDatabase(databasePath: string): CheckResult[] {
 
   let db: ReturnType<typeof openDatabase> | undefined;
   try {
-    db = openDatabase(databasePath);
+    db = openDatabase(databasePath, { readonly: true, fileMustExist: true });
     db.prepare("SELECT 1").get();
     const table = db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
@@ -237,10 +338,20 @@ function checkDatabase(databasePath: string): CheckResult[] {
       id: number;
     }>;
     const appliedIds = new Set(applied.map(({ id }) => id));
-    const missing = MIGRATIONS.map(({ id }) => id).filter((id) => !appliedIds.has(id));
+    const knownIds = new Set(MIGRATIONS.map(({ id }) => id));
+    const missing = [...knownIds].filter((id) => !appliedIds.has(id));
+    const unknown = [...appliedIds].filter((id) => !knownIds.has(id));
+    const migrationIssues = [
+      ...(missing.length > 0
+        ? [`${missing.length.toString()} database migration(s) are pending`]
+        : []),
+      ...(unknown.length > 0
+        ? [`${unknown.length.toString()} unknown or future database migration(s) are present`]
+        : []),
+    ];
     return [
       { id: "database", status: "OK", message: `database reachable at ${databasePath}` },
-      missing.length === 0
+      migrationIssues.length === 0
         ? {
             id: "migrations",
             status: "OK",
@@ -249,7 +360,7 @@ function checkDatabase(databasePath: string): CheckResult[] {
         : {
             id: "migrations",
             status: "FAIL",
-            message: `${missing.length.toString()} database migration(s) are pending`,
+            message: migrationIssues.join("; "),
             hint: "stop the host, back up the database, and run the supported migration command",
           },
     ];
@@ -259,7 +370,7 @@ function checkDatabase(databasePath: string): CheckResult[] {
         id: "database",
         status: "FAIL",
         message: `could not open database at ${databasePath}`,
-        hint: "check that the database directory is writable and the file is not locked",
+        hint: "check that the database file exists, is readable, and is not locked",
       },
       {
         id: "migrations",
@@ -273,43 +384,142 @@ function checkDatabase(databasePath: string): CheckResult[] {
   }
 }
 
-async function defaultPipeProbe(pipePath: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = net.createConnection(pipePath);
-    let settled = false;
-    const finish = (connected: boolean): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      socket.destroy();
-      resolve(connected);
-    };
-    const timer = setTimeout(() => finish(false), 500);
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timed out after ${timeoutMs.toString()}ms`)),
+          timeoutMs,
+        );
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function initializePipe(client: PipeClient): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const id = "doctor-initialize";
+    client.onMessage((message) => {
+      if (!message || typeof message !== "object") return;
+      const response = message as { id?: unknown; result?: unknown; error?: unknown };
+      if (response.id !== id) return;
+      if (response.error !== undefined) {
+        reject(new Error("daemon rejected bridge protocol initialization"));
+        return;
+      }
+      const result = response.result as { protocolVersion?: unknown } | undefined;
+      if (!result || typeof result.protocolVersion !== "string") {
+        reject(new Error("daemon returned a malformed bridge protocol version"));
+        return;
+      }
+      resolve(result.protocolVersion);
+    });
+    client.onError(reject);
+    client.onClose?.(() => reject(new Error("daemon bridge closed during initialization")));
+    client.send({ id, method: "initialize", params: {} });
   });
+}
+
+function isOfflinePipeError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ENOENT" || code === "ECONNREFUSED" || code === "EBUSY";
+}
+
+export async function probeDaemonPipe(
+  pipePath: string,
+  appDataDir: string,
+  dependencies: PipeProbeDependencies = {},
+): Promise<DoctorPipeProbeResult> {
+  const timeoutMs = dependencies.timeoutMs ?? DEFAULT_PIPE_PROBE_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error("doctor pipe probe timeout must be a positive integer");
+  }
+  const connect =
+    dependencies.connect ??
+    ((targetPipePath: string, targetAppDataDir: string) =>
+      connectPipeClient(targetPipePath, { appDataDir: targetAppDataDir }));
+  let client: PipeClient | undefined;
+  const pendingClient = connect(pipePath, appDataDir);
+  try {
+    try {
+      client = await withTimeout(pendingClient, timeoutMs, "daemon authentication");
+    } catch (error) {
+      void pendingClient
+        .then(async (lateClient) => lateClient.close())
+        .catch(() => undefined);
+      throw error;
+    }
+    const protocolVersion = await withTimeout(
+      initializePipe(client),
+      timeoutMs,
+      "daemon protocol negotiation",
+    );
+    return { status: "authenticated", protocolVersion };
+  } catch (error) {
+    return { status: isOfflinePipeError(error) ? "offline" : "rejected" };
+  } finally {
+    if (client) {
+      try {
+        await client.close();
+      } catch {
+        // The diagnostic result already fails closed; cleanup cannot make it healthier.
+      }
+    }
+  }
 }
 
 async function checkPipe(
   appDataDir: string,
-  probe: (pipePath: string) => Promise<boolean>,
+  pipeName: string,
+  probe: DoctorPipeProbe,
 ): Promise<{ result: CheckResult; connected: boolean }> {
-  const pipePath = resolvePipePath(defaultUserIdentifier(), appDataDir);
-  const connected = await probe(pipePath);
-  return connected
-    ? {
-        connected,
-        result: { id: "pipe", status: "OK", message: `bridge pipe reachable at ${pipePath}` },
-      }
-    : {
-        connected,
-        result: {
-          id: "pipe",
-          status: "WARN",
-          message: `bridge pipe not reachable at ${pipePath}`,
-          hint: "start the foundry-mcp host daemon before connecting an MCP client",
-        },
-      };
+  const userIdentifier = defaultUserIdentifier();
+  const pipeIdentifier =
+    pipeName === DEFAULT_CONFIG.pipeName ? userIdentifier : `${userIdentifier}:${pipeName}`;
+  const pipePath = resolvePipePath(pipeIdentifier, appDataDir);
+  const outcome = await probe(pipePath, appDataDir);
+  if (
+    outcome.status === "authenticated" &&
+    outcome.protocolVersion === BRIDGE_PROTOCOL_VERSION
+  ) {
+    return {
+      connected: true,
+      result: {
+        id: "pipe",
+        status: "OK",
+        message: `bridge pipe authenticated with protocol ${BRIDGE_PROTOCOL_VERSION} at ${pipePath}`,
+      },
+    };
+  }
+  if (outcome.status === "offline") {
+    return {
+      connected: false,
+      result: {
+        id: "pipe",
+        status: "WARN",
+        message: `bridge pipe is offline at ${pipePath}`,
+        hint: "start the foundry-mcp host daemon before connecting an MCP client",
+      },
+    };
+  }
+  return {
+    connected: false,
+    result: {
+      id: "pipe",
+      status: "FAIL",
+      message:
+        outcome.status === "authenticated"
+          ? `bridge protocol version mismatch at ${pipePath}`
+          : `bridge authentication or protocol negotiation failed at ${pipePath}`,
+      hint: "verify the current-user bridge secret and run matching host and CLI versions",
+    },
+  };
 }
 
 function checkActiveConnections(connected: boolean, statusPath: string): CheckResult {
@@ -447,6 +657,7 @@ function checkModule(foundryUserDataPath: string | undefined, moduleId: string):
 interface ParsedEndpoint {
   protocol: string;
   origin: string;
+  hostname: string;
 }
 
 function parseEndpoint(
@@ -466,18 +677,33 @@ function parseEndpoint(
     ) {
       return undefined;
     }
-    return { protocol: url.protocol, origin: url.origin };
+    return { protocol: url.protocol, origin: url.origin, hostname: url.hostname };
   } catch {
     return undefined;
   }
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1)
+    : hostname;
+  if (normalized.toLowerCase() === "localhost") return true;
+  const ipVersion = net.isIP(normalized);
+  if (ipVersion === 4) return normalized.startsWith("127.");
+  if (ipVersion === 6) {
+    const lower = normalized.toLowerCase();
+    return lower === "::1" || lower.startsWith("::ffff:127.");
+  }
+  return false;
 }
 
 function checkEndpointSecurity(
   bridgeUrl: string | undefined,
   foundryOrigin: string | undefined,
   allowedOrigins: readonly string[] | undefined,
+  invalidConfiguredOrigin = false,
 ): CheckResult[] {
-  if (!bridgeUrl && !foundryOrigin && !allowedOrigins) {
+  if (!bridgeUrl && !foundryOrigin) {
     return [
       {
         id: "bridge-endpoint",
@@ -505,7 +731,14 @@ function checkEndpointSecurity(
         message: "bridge URL is missing or is not a credential-free ws:// or wss:// URL",
         hint: "configure a ws:// URL for HTTP Foundry or wss:// for HTTPS Foundry",
       }
-    : !origin
+    : bridge.protocol === "ws:" && !isLoopbackHostname(bridge.hostname)
+      ? {
+          id: "bridge-endpoint",
+          status: "FAIL",
+          message: "plaintext ws:// bridge URLs are restricted to loopback hosts",
+          hint: "use wss:// for remote bridges, or bind ws:// only to localhost/loopback",
+        }
+      : !origin
       ? {
           id: "bridge-endpoint",
           status: "FAIL",
@@ -525,9 +758,16 @@ function checkEndpointSecurity(
             message: `${bridge.protocol === "wss:" ? "TLS" : "local plaintext"} WebSocket scheme is compatible with the Foundry origin`,
           };
 
-  const normalizedAllowed = (allowedOrigins ?? [])
-    .map((value) => parseEndpoint(value, ["http:", "https:"], false)?.origin)
-    .filter((value): value is string => Boolean(value));
+  const parsedAllowed = (allowedOrigins ?? []).map((value) => ({
+    raw: value,
+    parsed: value.includes("*")
+      ? undefined
+      : parseEndpoint(value, ["http:", "https:"], false),
+  }));
+  const invalidAllowed = invalidConfiguredOrigin || parsedAllowed.some(({ parsed }) => !parsed);
+  const normalizedAllowed = parsedAllowed.flatMap(({ parsed }) =>
+    parsed ? [parsed.origin] : [],
+  );
   const originResult: CheckResult = !origin
     ? {
         id: "origin-allowlist",
@@ -535,7 +775,14 @@ function checkEndpointSecurity(
         message: "Foundry origin cannot be validated",
         hint: "configure the exact Foundry origin and allowlist",
       }
-    : normalizedAllowed.length === 0
+    : invalidAllowed
+      ? {
+          id: "origin-allowlist",
+          status: "FAIL",
+          message: "origin allowlist contains an invalid or wildcard Origin",
+          hint: "remove every wildcard or invalid entry and allow exact http(s) origins only",
+        }
+      : normalizedAllowed.length === 0
       ? {
           id: "origin-allowlist",
           status: "FAIL",
@@ -594,13 +841,20 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<CheckResul
   const appDataDir = options.appDataDir ?? resolveAppDataDir();
   const loaded = loadConfig(options);
   const config = loaded.value;
-  const configuredDatabasePath =
-    options.databasePath ??
-    stringValue(config["dbPath"]) ??
-    path.join(appDataDir, "foundry-mcp.db");
-  const databasePath = path.isAbsolute(configuredDatabasePath)
-    ? configuredDatabasePath
-    : path.join(appDataDir, configuredDatabasePath);
+  const env = options.providerEnv ?? process.env;
+  const invalidConfiguredOrigin =
+    config["allowedOrigins"] !== undefined &&
+    stringArrayValue(config["allowedOrigins"]) === undefined;
+  const cliHostConfig: Partial<HostConfig> = {
+    ...(options.databasePath === undefined ? {} : { dbPath: options.databasePath }),
+    ...(options.allowedOrigins === undefined
+      ? {}
+      : { allowedOrigins: [...options.allowedOrigins] }),
+  };
+  const hostConfig = resolveConfig(hostConfigFileSource(config), env, cliHostConfig);
+  const databasePath = path.isAbsolute(hostConfig.dbPath)
+    ? hostConfig.dbPath
+    : path.join(appDataDir, hostConfig.dbPath);
   const dockerUserDataPath =
     options.dockerUserDataPath ?? stringValue(config["dockerUserDataPath"]);
   const foundryUserDataPath =
@@ -608,17 +862,28 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<CheckResul
   const moduleId = options.moduleId ?? stringValue(config["moduleId"]) ?? "foundry-mcp";
   const bridgeUrl = options.bridgeUrl ?? stringValue(config["bridgeUrl"]);
   const foundryOrigin = options.foundryOrigin ?? stringValue(config["foundryOrigin"]);
-  const allowedOrigins = options.allowedOrigins ?? stringArray(config["allowedOrigins"]);
+  const allowedOrigins = hostConfig.allowedOrigins;
   const statusPath = options.statusPath ?? path.join(appDataDir, "status.json");
 
   const results: CheckResult[] = [loaded.result, checkConfigPermissions(options.configPath)];
   results.push(...checkDatabase(path.resolve(databasePath)));
-  const pipe = await checkPipe(appDataDir, options.pipeProbe ?? defaultPipeProbe);
+  const pipe = await checkPipe(
+    appDataDir,
+    hostConfig.pipeName,
+    options.pipeProbe ?? probeDaemonPipe,
+  );
   results.push(pipe.result, checkActiveConnections(pipe.connected, statusPath));
   results.push(checkDockerUserData(dockerUserDataPath));
   results.push(checkModule(foundryUserDataPath, moduleId));
-  results.push(...checkEndpointSecurity(bridgeUrl, foundryOrigin, allowedOrigins));
-  results.push(checkProvider(options.providerEnv ?? process.env, config));
+  results.push(
+    ...checkEndpointSecurity(
+      bridgeUrl,
+      foundryOrigin,
+      allowedOrigins,
+      invalidConfiguredOrigin,
+    ),
+  );
+  results.push(checkProvider(env, config));
   return results;
 }
 

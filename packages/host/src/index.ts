@@ -1,3 +1,4 @@
+export { BRIDGE_PROTOCOL_VERSION } from "@foundry-mcp/protocol";
 export * from "./config.js";
 export * from "./paths.js";
 export * from "./logger.js";

@@ -82,6 +82,27 @@ describe("SQLite init and migrations", () => {
     db.close();
   });
 
+  it("supports file-must-exist read-only inspection without changing journal mode", () => {
+    const dbPath = tmpDbPath();
+    const writable = openDatabase(dbPath);
+    runMigrations(writable);
+    writable.pragma("journal_mode = DELETE");
+    writable.close();
+    expect([...fs.readFileSync(dbPath).subarray(18, 20)]).toEqual([1, 1]);
+
+    const readonly = openDatabase(dbPath, { readonly: true, fileMustExist: true });
+    expect(readonly.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get()).toEqual({
+      count: MIGRATIONS.length,
+    });
+    readonly.close();
+
+    expect([...fs.readFileSync(dbPath).subarray(18, 20)]).toEqual([1, 1]);
+    expect(fs.existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(() =>
+      openDatabase(`${dbPath}.missing`, { readonly: true, fileMustExist: true }),
+    ).toThrow();
+  });
+
   it("forward-migrates and backfills a version-one event ledger", () => {
     const db = openDatabase(tmpDbPath());
     const initial = MIGRATIONS[0];

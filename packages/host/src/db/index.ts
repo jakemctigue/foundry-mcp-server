@@ -1,9 +1,23 @@
 import Database from "better-sqlite3";
 import { MIGRATIONS } from "./migrations.js";
 
-export function openDatabase(dbPath: string): Database.Database {
-  const db = new Database(dbPath);
-  db.pragma("journal_mode = WAL");
+export interface OpenDatabaseOptions {
+  readonly?: boolean;
+  fileMustExist?: boolean;
+}
+
+export function openDatabase(
+  dbPath: string,
+  options: OpenDatabaseOptions = {},
+): Database.Database {
+  const databaseOptions: Database.Options = {
+    ...(options.readonly === undefined ? {} : { readonly: options.readonly }),
+    ...(options.fileMustExist === undefined ? {} : { fileMustExist: options.fileMustExist }),
+  };
+  const db = new Database(dbPath, databaseOptions);
+  if (options.readonly !== true) {
+    db.pragma("journal_mode = WAL");
+  }
   db.pragma("busy_timeout = 5000");
   return db;
 }
