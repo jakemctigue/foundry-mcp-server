@@ -1,0 +1,19 @@
+{
+  "port": 32145,
+  "pipeName": "foundry-mcp",
+  "logLevel": "info",
+  "dbPath": "foundry-mcp.db",
+  "eventCategories": [
+    "document.create",
+    "document.update",
+    "document.delete",
+    "journal",
+    "scene",
+    "combat",
+    "chat.public"
+  ],
+  "capturePrivateContent": false,
+  "eventRetentionDays": 30,
+  "allowedOrigins": ["http://127.0.0.1:30000"],
+  "localAssetRoots": []
+}

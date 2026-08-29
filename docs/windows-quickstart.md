@@ -1,20 +1,14 @@
 # Windows quick start
 
-This guide goes from a fresh clone to a successful `foundry.connections.list` MCP call on Windows. A successful call with `connections: []` proves the client, stdio adapter, and local broker path; it does **not** prove that a live Foundry world is paired. A live connection requires a loadable companion-module artifact, a Foundry v14 world, and the browser bridge.
+This guide builds a loadable Foundry v14 module, installs it transactionally, pairs the current Windows user, starts the local host, and reaches the first MCP call. A successful `foundry.connections.list` with `connections: []` proves the adapter/pipe path only; a live pass requires a non-empty record from your licensed test world.
 
-The current evidence boundary is documented in [validation-matrix.md](./validation-matrix.md).
+The exact automated/manual boundary is in [validation-matrix.md](./validation-matrix.md).
 
 ## Prerequisites
 
-- Windows 10 or 11.
-- Git.
-- Node.js 22 or newer.
-- pnpm 9.15.0 (the version pinned by `packageManager`).
-- PowerShell 7 recommended. Windows PowerShell 5.1 is covered by the script tests.
-- A licensed Foundry v14 installation and a private test world only for the live-world portion.
-- No administrator shell is required or recommended.
-
-Verify the local tools:
+- Windows 10 or 11; no administrator shell is required or recommended.
+- Node.js 22+, pnpm 9.15.0, Git, and PowerShell 7.
+- A licensed Foundry v14 installation and a disposable or backed-up test world for live validation.
 
 ```powershell
 node --version
@@ -22,128 +16,126 @@ pnpm --version
 pwsh --version
 ```
 
-## 1. Clone and build
-
-Substitute the repository URL supplied by the project owner:
+## 1. Build the workspace and source-checkout CLI
 
 ```powershell
-git clone <REPOSITORY-URL> foundry-mcp-server
-Set-Location -LiteralPath .\foundry-mcp-server
 pnpm install --frozen-lockfile
 pnpm build
 pnpm typecheck
 pnpm lint
 ```
 
-`<REPOSITORY-URL>` is intentionally a placeholder; this checkout's `origin` is an Archon-local path and is not a distributable clone URL.
-
-Run the unlicensed adapter smoke test before involving Foundry:
+An installed release exposes `foundry-mcp` directly. In this source checkout, define the same command for the current PowerShell session:
 
 ```powershell
-pnpm --filter @foundry-mcp/mcp-adapter test:e2e
+$FoundryMcpCli = (Resolve-Path -LiteralPath .\packages\cli\dist\bin.js).Path
+function foundry-mcp { & node $FoundryMcpCli @args }
 ```
 
-The smoke test calls `foundry.connections.list`. An empty array is expected when no real world is connected.
+The examples use [`config.example.json`](../config.example.json): exact Foundry Origin `http://127.0.0.1:30000`, stable loopback bridge port `32145`, private capture off, 30-day retention, and local-file import denied. Edit the exact Origin before continuing if your browser opens Foundry at another scheme, host, or port. See [configuration.md](./configuration.md) for types and precedence.
 
-## 2. Prepare the companion module
+## 2. Build and transactionally install the companion
 
-Choose the exact Foundry User Data directory selected in Foundry's configuration. Do not assume the default if you chose a custom path.
+Choose a fresh output directory because the release builder refuses to overwrite an existing artifact:
+
+```powershell
+$Release = foundry-mcp build-module --json --output .\release | ConvertFrom-Json
+$ModulePackage = $Release.zipPath
+$Release
+```
+
+The ZIP contains only `foundry-mcp/module.json` and `foundry-mcp/scripts/foundry-mcp.js`. It is the same artifact for desktop Foundry and a Docker User Data bind mount.
+
+Set the exact User Data directory selected in Foundry, then preview and run the installer:
 
 ```powershell
 $FoundryUserData = 'D:\Foundry User Data'
-if (-not (Test-Path -LiteralPath $FoundryUserData -PathType Container)) {
-    throw "Foundry User Data directory not found: $FoundryUserData"
-}
-```
 
-Set `$ModulePackage` to a trusted versioned ZIP or module directory whose root contains `module.json` with ID `foundry-mcp`:
+& .\scripts\windows\install.ps1 `
+    -FoundryUserDataPath $FoundryUserData `
+    -ModuleSourcePath $ModulePackage `
+    -Layout Desktop `
+    -WhatIf
 
-```powershell
-$ModulePackage = 'C:\Downloads\foundry-mcp-module.zip'
-if (-not (Test-Path -LiteralPath $ModulePackage)) {
-    throw "Module package not found: $ModulePackage"
-}
-```
-
-`pnpm build` alone must not be assumed to produce a loadable module ZIP. At the time of this documentation pass, this checkout did not contain a versioned ZIP or a built `module.json`; live installation is therefore marked unavailable in the validation matrix. Do not manufacture a manifest around `packages\foundry-module\dist` and call it a release artifact.
-
-Install only after a valid artifact exists:
-
-```powershell
 & .\scripts\windows\install.ps1 `
     -FoundryUserDataPath $FoundryUserData `
     -ModuleSourcePath $ModulePackage `
     -Layout Desktop
 ```
 
-The installer uses literal paths, records owned file hashes, is rerunnable, and refuses to overwrite an unowned module directory.
+Installation validates the archive before extraction, rejects traversal/reparse/special-file/decompression abuse, stages beside the target, and swaps atomically with rollback. A rerun upgrades only an owned module directory and preserves unrelated files.
 
-Launch Foundry, open a non-production test world as an authorized GM, enable the `foundry-mcp` module, and reload the world. If the module does not expose the documented GM-only pairing and bridge settings, stop: the live bridge path is not complete in that artifact.
+Expected manifest:
 
-## 3. Generate or rotate the pairing secret
+```text
+<FoundryUserData>\Data\modules\foundry-mcp\module.json
+```
 
-Resolve the built adapter and run the pairing script:
+## 3. Pair this Windows user
+
+Pairing creates a 32-byte secret, stores the host copy under current-user DPAPI, and displays a Base32 value once for the module's password field. Preview mode creates no secret.
 
 ```powershell
 $AdapterPath = (Resolve-Path -LiteralPath .\packages\mcp-adapter\dist\cli.js).Path
 $NodePath = (Get-Command node.exe).Source
+
+& .\scripts\windows\pair.ps1 `
+    -AdapterCommand $NodePath `
+    -AdapterArguments @($AdapterPath) `
+    -WhatIf
+
 & .\scripts\windows\pair.ps1 `
     -AdapterCommand $NodePath `
     -AdapterArguments @($AdapterPath)
 ```
 
-The script:
+Keep the displayed secret out of configuration files, environment variables, command history, screenshots, chat, and source control. Save the secret-free MCP client JSON printed by the script. Rerunning the command rotates the secret; update the module afterward and confirm the old value no longer connects.
 
-- generates a cryptographically random value;
-- protects the local copy with current-user DPAPI;
-- displays the pairing secret once for entry into the module's GM-only setting; and
-- prints MCP client JSON that contains the adapter command and **does not contain the secret**.
+## 4. Start the host and configure the real module endpoint
 
-Paste the one-time secret into the module setting, save it, and clear the terminal if its scrollback is not private. Do not put the secret in MCP client JSON, command history, an environment file, chat, or source control. Run the script again to rotate a suspected secret, then replace the value in the module.
-
-## 4. Start the local host
-
-Until a packaged launcher is available, use a dedicated PowerShell terminal from the repository root:
+Run the host in a dedicated foreground terminal:
 
 ```powershell
-node --input-type=module -e "const { startDaemon } = await import('./packages/host/dist/index.js'); const daemon = await startDaemon(); console.error('foundry-mcp host ready at ' + daemon.pipePath); const stop = async () => { await daemon.shutdown(); process.exit(0); }; process.once('SIGINT', stop); process.once('SIGTERM', stop); await new Promise(() => {});"
+foundry-mcp host --config .\config.example.json
 ```
 
-Leave this terminal open. Press Ctrl+C for a graceful shutdown. The host writes diagnostics to stderr; MCP stdio stdout remains protocol-only.
+On readiness, stderr prints a JSON record containing `companionEndpoint` and `pipePath`. With the checked-in explicit port, the endpoint is:
 
-The module's browser bridge URL is a separate setting from the named pipe. Use the endpoint supplied by the broker deployment:
+```text
+ws://127.0.0.1:32145
+```
 
-- an HTTP Foundry page may use `ws://`;
-- an HTTPS Foundry page must use `wss://` with a certificate trusted by the browser; and
-- the exact Foundry origin (`scheme://host:port`, no path) must be allowlisted.
+Now start Foundry, open the intended test world as an authenticated GM, enable **Foundry MCP Companion**, and reload. In the module's GM-only settings:
 
-Do not invent a bridge port or expose an unauthenticated listener on `0.0.0.0`. The current implementation snapshot has no recorded live browser-bridge endpoint, so this part requires a completed broker artifact and manual validation.
+1. set **Foundry MCP bridge endpoint** to the exact emitted endpoint, with no invented path;
+2. paste the one-time pairing value into **Foundry MCP pairing secret**; and
+3. reload when Foundry requests it.
+
+The browser page's exact Origin must also appear in `allowedOrigins`. An HTTP Foundry page can use loopback `ws://`. An HTTPS Foundry page must use a browser-trusted `wss://` reverse proxy; do not disable mixed-content or Origin checks.
+
+Press Ctrl+C to shut the foreground host down cleanly.
 
 ## 5. Run doctor
 
-In a second terminal:
+In a second terminal with the same session-local function:
 
 ```powershell
-node .\packages\cli\dist\bin.js doctor --foundry-data $FoundryUserData
-```
+$FoundryOrigin = 'http://127.0.0.1:30000'
+$BridgeUrl = 'ws://127.0.0.1:32145'
 
-For an explicitly configured browser bridge, add the real values:
-
-```powershell
-$BridgeUrl = 'wss://broker.example.test/foundry-mcp'
-$FoundryOrigin = 'https://foundry.example.test'
-node .\packages\cli\dist\bin.js doctor `
+foundry-mcp doctor `
+    --config .\config.example.json `
     --foundry-data $FoundryUserData `
     --bridge-url $BridgeUrl `
     --foundry-origin $FoundryOrigin `
     --allow-origin $FoundryOrigin
 ```
 
-`FAIL` rows must be fixed before a live test. `WARN` may mean an optional provider is disabled, no status snapshot exists, or no active world is connected; read the remediation beside each warning rather than ignoring it.
+Fix every `FAIL`. A `WARN` may mean no active world, optional provider, or status snapshot; read its remediation. Doctor validates local state and URL policy, not a live browser certificate, Docker daemon, or Foundry API.
 
-## 6. Configure the MCP client
+## 6. Connect the MCP client and discover the world
 
-Copy the `mcpServers.foundry-vtt` object printed by `pair.ps1` into the MCP configuration supported by your desktop client. Configuration-file location and reload behavior are client-specific; use that client's current documentation. The shape is generic:
+Copy the secret-free `mcpServers.foundry-vtt` object printed by `pair.ps1` into the configuration supported by your MCP desktop client. It should use absolute paths and contain no pairing or provider secret:
 
 ```json
 {
@@ -156,51 +148,102 @@ Copy the `mcpServers.foundry-vtt` object printed by `pair.ps1` into the MCP conf
 }
 ```
 
-Use absolute paths. Restart or reload the MCP client after editing its configuration. Do not add the pairing secret to this JSON.
+Reload that client and call `foundry.connections.list` with `{}`. A paired world returns a stable `connectionId`, `worldId`, title, current user/role, system/version, active modules, and module capabilities. Save the exact `connectionId`; every world-scoped call must select it.
 
-## 7. Make the first call
+## 7. Grant only intended mutations
 
-In the MCP client's tool picker, call:
+Read tools work without mutation grants and are still limited by Foundry permissions. List current grants:
 
-- tool: `foundry.connections.list`
-- arguments: `{}`
-
-A successful transport-only response has this structure:
-
-```json
-{
-  "connections": []
-}
+```powershell
+$ConnectionId = 'your-real-connection-id'
+foundry-mcp capabilities list --connection-id $ConnectionId
 ```
 
-That result is a valid first MCP call but is not live Foundry evidence. A genuinely paired world returns at least one connection record with a stable `connectionId`, `worldId`, `worldTitle`, and `status`. Record the `connectionId`; later calls must use an explicit selector whenever more than one eligible world is present.
+Grant one capability at a time to the connected Foundry role:
 
-Do not report the quick start as live-complete unless all of the following are observed together:
+```powershell
+foundry-mcp capabilities grant --connection-id $ConnectionId --role GAMEMASTER --capability documents:create
+foundry-mcp capabilities grant --connection-id $ConnectionId --role GAMEMASTER --capability documents:update
+foundry-mcp capabilities grant --connection-id $ConnectionId --role GAMEMASTER --capability assets:upload
+foundry-mcp capabilities grant --connection-id $ConnectionId --role GAMEMASTER --capability assets:attach
+foundry-mcp capabilities grant --connection-id $ConnectionId --role GAMEMASTER --capability sessions:start
+foundry-mcp capabilities grant --connection-id $ConnectionId --role GAMEMASTER --capability sessions:append
+```
 
-1. the module is enabled in the intended Foundry v14 world;
-2. doctor reports the expected module and bridge state;
-3. `foundry.connections.list` returns that world's real ID/title as connected; and
-4. Foundry and browser logs show no pairing, Origin, mixed-content, or protocol error.
+Use the same syntax with `revoke`. Valid roles are `PLAYER`, `TRUSTED`, `ASSISTANT`, and `GAMEMASTER`; the policy layer can still refuse a grant or operation above that role's ceiling. OpenAI generation additionally requires `ai:network`.
+
+## 8. Optional OpenAI Images provider
+
+Deterministic local image generation needs no key. To opt in to OpenAI Images, pass the key over stdin in a private PowerShell 7 terminal:
+
+```powershell
+Read-Host -MaskInput 'OpenAI Images API key' | foundry-mcp provider configure
+foundry-mcp provider status
+foundry-mcp capabilities grant --connection-id $ConnectionId --role GAMEMASTER --capability ai:network
+```
+
+The production Windows path stores the key with current-user DPAPI and never echoes it. Revoke `ai:network` and run `foundry-mcp provider remove` to disable it. No external provider call is required for deterministic generation or repository tests.
+
+## 9. Foreground and logon launchers
+
+`foundry-mcp host` is the full foreground CLI. The checked-in PowerShell launcher offers the same bounded Windows source-checkout path and supports `-WhatIf`:
+
+```powershell
+$RepositoryPath = (Resolve-Path -LiteralPath .).Path
+
+& .\scripts\windows\start-host.ps1 `
+    -RepositoryPath $RepositoryPath `
+    -NodePath $NodePath `
+    -AllowedOriginsCsv $FoundryOrigin `
+    -CompanionPort 32145 `
+    -WhatIf
+```
+
+Remove `-WhatIf` to run it in the foreground. To start at this user's interactive logon with a limited principal, first preview and then register the owned task:
+
+```powershell
+& .\scripts\windows\install-logon-task.ps1 `
+    -RepositoryPath $RepositoryPath `
+    -NodePath $NodePath `
+    -AllowedOrigin @($FoundryOrigin) `
+    -CompanionPort 32145 `
+    -WhatIf
+
+& .\scripts\windows\install-logon-task.ps1 `
+    -RepositoryPath $RepositoryPath `
+    -NodePath $NodePath `
+    -AllowedOrigin @($FoundryOrigin) `
+    -CompanionPort 32145
+```
+
+The task is per-user, interactive-logon only, limited (not elevated), and refuses to replace or remove an unowned task. Remove it with:
+
+```powershell
+& .\scripts\windows\remove-logon-task.ps1 -RepositoryPath $RepositoryPath -WhatIf
+& .\scripts\windows\remove-logon-task.ps1 -RepositoryPath $RepositoryPath
+```
+
+The task launcher intentionally exposes only host/port/pipe/log/origin/app-data controls. Use `foundry-mcp host --config ...` when you need custom retention, event categories, or local asset roots.
 
 ## Troubleshooting
 
-| Symptom                           | Check                                                                                                                                                               |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Client cannot start adapter       | Use absolute `command` and `args` paths; rebuild; confirm Node 22+; inspect client stderr, never stdout.                                                            |
-| `connections: []`                 | Confirm host is running, module is enabled in the correct world, the secret matches, bridge URL is reachable from the browser, and the exact Origin is allowlisted. |
-| Browser reports mixed content     | An HTTPS Foundry page cannot open `ws://`; use a browser-trusted `wss://` endpoint.                                                                                 |
-| Module not found                  | Confirm `$FoundryUserData\Data\modules\foundry-mcp\module.json`; a custom User Data path is a common source of mistakes.                                            |
-| Pairing fails after rotation      | Update the module with the newly displayed secret and reconnect; old values must stop working.                                                                      |
-| Doctor reports pending migrations | Stop the host, back up its application-data directory, run the supported migration/start path, then rerun doctor.                                                   |
-| Provider warning                  | Providers are optional and disabled by default. Configure one only after reviewing privacy and cost policy.                                                         |
-| MCP JSON is corrupted             | Ensure nothing writes logs or banners to adapter stdout. Diagnostics belong on stderr.                                                                              |
+| Symptom                             | Check                                                                                                                                 |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `connections: []`                   | Host is running, module is enabled in the intended world, endpoint is exact, pairing values match, and browser Origin is allowlisted. |
+| Browser mixed-content error         | HTTPS Foundry cannot open `ws://`; use a trusted `wss://` reverse proxy to the loopback host.                                         |
+| Host says pairing secret is missing | Run `pair.ps1` as the same Windows user and with the same app-data path before starting the host.                                     |
+| Module is absent                    | Check `<FoundryUserData>\Data\modules\foundry-mcp\module.json` and restart/reload Foundry's package list.                             |
+| Mutation is denied                  | Confirm the selected `connectionId`, current Foundry role, explicit capability grant, and native Document permission.                 |
+| Local image import is denied        | `localAssetRoots` defaults to `[]`; add only an absolute dedicated directory and restart the host.                                    |
+| MCP client shows malformed protocol | Adapter stdout must remain JSON-RPC only; inspect stderr for diagnostics.                                                             |
 
 ## Safe removal
 
-Stop the host and disable the module in Foundry. Then run:
+Disable the module and stop the host. Preview and run the ownership-aware uninstaller:
 
 ```powershell
+& .\scripts\windows\uninstall.ps1 -FoundryUserDataPath $FoundryUserData -WhatIf
 & .\scripts\windows\uninstall.ps1 -FoundryUserDataPath $FoundryUserData
 ```
 
-The uninstaller removes only manifest-owned files whose hashes still match. It refuses an unrecognized directory, refuses modified owned files, and preserves unrelated files. It does not delete worlds, Foundry User Data, or application data.
+It removes only manifest-owned files whose hashes still match, preserves unrelated files, and never deletes worlds or the User Data root. Provider and pairing secrets remain in the per-user app-data directory until deliberately rotated/removed.

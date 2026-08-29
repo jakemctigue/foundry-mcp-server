@@ -1,41 +1,32 @@
 # Docker-hosted Foundry
 
-This guide covers a user-managed, licensed Foundry v14 container. This repository does not include, build, redistribute, or authenticate to a Foundry image. Substitute only an image and credentials you are authorized to use.
+Foundry MCP supports a user-managed, licensed Foundry v14 container without embedding Foundry, choosing an image, handling its license, or touching the Docker socket. The companion runs in the authenticated GM's browser and connects to the same local Windows host used for desktop Foundry.
 
-No live licensed container was started for this documentation pass. See [validation-matrix.md](./validation-matrix.md) for the exact evidence boundary.
+No licensed container was started for this repository pass. The loadable module, bind-mount installer, Compose rendering, real local transports, and mocked Foundry lifecycle are automated; image-specific configuration and the live browser/container boundary remain manual in [validation-matrix.md](./validation-matrix.md).
 
 ## Deployment boundary
 
-There are three distinct paths:
-
-1. **Host bind mount:** a Windows or remote-host directory is mounted at the container's Foundry User Data path. Module install/remove targets the host-side directory explicitly.
-2. **Browser bridge:** the companion module runs in the authenticated GM's browser, not in the Docker daemon. Its `ws://` or `wss://` URL must be reachable from that browser.
-3. **Desktop MCP path:** the MCP client, stdio adapter, named pipe, broker, SQLite store, and secrets normally remain on the GM's Windows desktop.
-
-The tooling never needs the Docker socket and does not edit the Foundry database or unrelated container data.
-
-## Compose example without a bundled image
-
-The following is a standalone example or overlay template. It references a user-supplied image and explicit bind paths through required environment variables. Save it beside your own Compose file if it matches your deployment:
-
-```yaml
-name: foundry-mcp-example
-
-services:
-  foundry:
-    image: "${FOUNDRY_IMAGE:?Set FOUNDRY_IMAGE to an image you are licensed to use}"
-    restart: unless-stopped
-    ports:
-      - "${FOUNDRY_HTTP_BIND:-127.0.0.1:30000}:${FOUNDRY_CONTAINER_PORT:-30000}"
-    volumes:
-      - type: bind
-        source: "${FOUNDRY_USER_DATA:?Set FOUNDRY_USER_DATA to an absolute host path}"
-        target: "${FOUNDRY_CONTAINER_USER_DATA:?Set the User Data path expected by your image}"
+```text
+MCP desktop client -> Windows stdio adapter -> current-user pipe -> Windows host
+                                                             ^
+                                                             | authenticated ws/wss
+Docker Foundry -> GM browser -> foundry-mcp browser companion -+
+      |
+      +-> writable host User Data bind/Data/modules/foundry-mcp
 ```
 
-This example deliberately does not prescribe an image name, license key, administrator password, container User Data path, or non-default internal port. Those are image-specific. Keep secrets out of Compose YAML and source control.
+Keep the SQLite database, pairing secret, provider key, and MCP client configuration on the Windows desktop. Only the allowlisted companion files go into Foundry's writable User Data bind. The browser—not the Docker container—opens the bridge URL.
 
-Set non-secret substitutions in the current PowerShell session and render the merged model before starting anything:
+## Checked-in Compose templates
+
+This repository includes two image-neutral files:
+
+- [`compose.foundry-mcp.example.yaml`](../compose.foundry-mcp.example.yaml) is a complete single-service example.
+- [`compose.foundry-mcp.override.yaml`](../compose.foundry-mcp.override.yaml) adds/replaces the writable User Data bind on an existing service named `foundry`.
+
+Both require a user-supplied authorized image and explicit host/container paths. Neither contains a license key, administrator password, token, or opinionated image-specific path.
+
+Render the standalone example before starting anything:
 
 ```powershell
 $env:FOUNDRY_IMAGE = 'your-authorized-registry/foundry:your-pinned-version'
@@ -43,33 +34,40 @@ $env:FOUNDRY_USER_DATA = 'D:\Foundry Docker Data'
 $env:FOUNDRY_CONTAINER_USER_DATA = '/path/required/by/your/image'
 $env:FOUNDRY_HTTP_BIND = '127.0.0.1:30000'
 $env:FOUNDRY_CONTAINER_PORT = '30000'
+
 docker compose -f .\compose.foundry-mcp.example.yaml config
 ```
 
-`docker compose config` renders configuration; it does not prove the image is licensed, present, loadable, or compatible. Review the output for the exact host source and container target before `up`.
-
-If this is an overlay on an existing service, keep the service name identical and use both files:
+For an existing Compose project whose service is named `foundry`, render both files in the same order you will run them:
 
 ```powershell
-docker compose -f .\compose.yaml -f .\compose.foundry-mcp.override.yaml config
+docker compose `
+    -f .\compose.yaml `
+    -f .\compose.foundry-mcp.override.yaml `
+    config
 ```
 
-Compose merges service volume entries by their container target, with the later file winning for the same target. Inspect the rendered `volumes` list for an unintended target or a bind that replaced a volume you meant to keep.
+Inspect the rendered image, port mapping, and `volumes` target. The later file wins when two volume entries use the same container target. `docker compose config` proves interpolation/model validity only; it does not pull, license, start, or health-check Foundry.
 
-## Install into an explicit bind mount
+## Build and install the same browser companion
+
+Build the workspace and define the source-checkout CLI as described in [Windows quick start](./windows-quickstart.md#1-build-the-workspace-and-source-checkout-cli), then create a fresh module artifact:
+
+```powershell
+$Release = foundry-mcp build-module --json --output .\release | ConvertFrom-Json
+$ModulePackage = $Release.zipPath
+```
 
 Run installation on the machine that owns the host-side bind directory. For Docker Desktop on Windows:
 
 ```powershell
 $FoundryUserData = 'D:\Foundry Docker Data'
-$ModulePackage = 'C:\Downloads\foundry-mcp-module.zip'
 
-if (-not ([System.IO.Path]::IsPathRooted($FoundryUserData))) {
-    throw 'Foundry User Data must be an absolute host path.'
-}
-if (-not (Test-Path -LiteralPath $FoundryUserData -PathType Container)) {
-    throw "Bind-mounted User Data directory not found: $FoundryUserData"
-}
+& .\scripts\windows\install.ps1 `
+    -FoundryUserDataPath $FoundryUserData `
+    -ModuleSourcePath $ModulePackage `
+    -Layout DockerBindMount `
+    -WhatIf
 
 & .\scripts\windows\install.ps1 `
     -FoundryUserDataPath $FoundryUserData `
@@ -77,140 +75,127 @@ if (-not (Test-Path -LiteralPath $FoundryUserData -PathType Container)) {
     -Layout DockerBindMount
 ```
 
-The expected host-side destination is:
+The expected host-side file is:
 
 ```text
-<FoundryUserData>\Data\modules\foundry-mcp\module.json
+D:\Foundry Docker Data\Data\modules\foundry-mcp\module.json
 ```
 
-Use the host-side path, not `/data`, a container ID, or a path inside Docker Desktop's VM. The script does not invoke Docker. It writes an ownership manifest inside its module directory and refuses an unowned existing directory.
+Use the host-side bind path, not `/data`, a container ID, or a Docker Desktop VM-internal path. The installer does not invoke Docker. It validates the archive, stages and atomically swaps the owned module, rolls back activation failures, and preserves unrelated files.
 
-Restart the Foundry service only after reviewing the correct Compose project/service:
+For a remote Linux bind owner, the Windows scripts are not claimed as a first-class installer. Copy the verified module directory/ZIP through your normal administration workflow while preserving the exact `Data/modules/foundry-mcp` destination. Do not guess an opaque Docker volume's engine-internal path.
+
+## Pair and run the Windows host
+
+Pair the Windows user once, exactly as for desktop Foundry:
+
+```powershell
+$AdapterPath = (Resolve-Path -LiteralPath .\packages\mcp-adapter\dist\cli.js).Path
+$NodePath = (Get-Command node.exe).Source
+& .\scripts\windows\pair.ps1 -AdapterCommand $NodePath -AdapterArguments @($AdapterPath)
+```
+
+Use a stable explicit loopback port and the exact Origin at which the browser opens containerized Foundry. The checked-in config is correct only when that Origin is `http://127.0.0.1:30000`:
+
+```powershell
+foundry-mcp host --config .\config.example.json
+```
+
+With that config, the host emits this module endpoint:
+
+```text
+ws://127.0.0.1:32145
+```
+
+Start/restart your licensed service only after verifying the Compose project and bind:
 
 ```powershell
 docker compose -f .\compose.yaml restart foundry
 ```
 
-The restart command above is a manual licensed-container step and was not run as evidence for this repository.
+Open the world as GM in the browser, enable **Foundry MCP Companion**, set its bridge endpoint to the exact value emitted by the host, paste the one-time pairing secret into the password field, and reload. The endpoint belongs to the browser machine:
 
-## Docker Desktop and remote-host layouts
+| Layout                                          | What loopback means                                        | Module files live at                                                            |
+| ----------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Docker Desktop; browser on same Windows desktop | `127.0.0.1` is the Windows browser/host, not the container | Explicit Windows User Data bind                                                 |
+| Remote Foundry; browser on Windows desktop      | `127.0.0.1` is still the GM desktop                        | Bind directory on the remote Foundry host                                       |
+| Browser in remote VDI                           | Loopback is the VDI browser machine                        | Bind directory on the Foundry host; route the bridge to the VDI host explicitly |
 
-| Layout                                               | Module files                        | Broker address seen by the browser                             | Important boundary                                                                                                                            |
-| ---------------------------------------------------- | ----------------------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Docker Desktop, browser on same Windows desktop      | Explicit Windows bind directory     | Usually a loopback broker URL on the Windows desktop           | `127.0.0.1` means the browser's Windows host, not the container. `host.docker.internal` is normally unnecessary for browser-side module code. |
-| Remote Foundry server, GM browser on Windows desktop | Bind directory on the remote server | The URL configured in that GM's browser/module                 | `127.0.0.1` still means the GM desktop. Install module files on the remote bind owner, but keep desktop secrets local.                        |
-| Remote browser/VDI session                           | Bind directory on the Foundry host  | Broker reachable from the machine running that browser session | Do not assume the MCP client desktop and browser share loopback. Configure and authenticate the actual route.                                 |
+`host.docker.internal` is normally unnecessary because the browser companion is not making a request from inside the container.
 
-For a remote non-Windows bind owner, the checked-in PowerShell scripts require a compatible PowerShell runtime and have not been claimed as a supported Linux installer. Use a reviewed equivalent that preserves the ownership-manifest rules, or copy a verified module artifact through the host's normal administration process. Never mutate an opaque Docker volume by guessing its engine-internal path.
+## HTTP, HTTPS, and exact Origin
 
-## `ws://` versus `wss://`
+The host accepts an Origin only when it exactly matches `scheme://host:port` (with a default port optionally omitted). It rejects wildcards, paths, queries, fragments, and credentials.
 
-Browser mixed-content rules determine the scheme:
+```text
+valid:   http://127.0.0.1:30000
+valid:   https://foundry.example.test
+invalid: https://*.example.test
+invalid: https://foundry.example.test/game
+```
 
-| Foundry page                   | Module bridge                         | Result                                                                                                     |
-| ------------------------------ | ------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `http://foundry.example:30000` | `ws://127.0.0.1:<broker-port>/<path>` | Allowed by scheme; still requires authentication and exact Origin allowlisting.                            |
-| `https://foundry.example`      | `ws://...`                            | Blocked as mixed content.                                                                                  |
-| `https://foundry.example`      | `wss://broker.example/<path>`         | Correct when the certificate is trusted and the proxy preserves WebSocket upgrade and the original Origin. |
-
-Do not downgrade an HTTPS Foundry deployment to solve a WebSocket error. Terminate TLS at a reviewed reverse proxy and proxy only to a loopback broker listener. A minimal conceptual Caddy route is:
+An HTTP Foundry page can open the loopback `ws://` endpoint. An HTTPS Foundry page cannot: mixed-content rules require a browser-trusted `wss://` endpoint. Terminate TLS at a reviewed reverse proxy and forward only to the loopback host, preserving the browser's Origin:
 
 ```caddyfile
 broker.example.test {
-    reverse_proxy 127.0.0.1:<BROKER_PORT>
+    reverse_proxy 127.0.0.1:32145
 }
 ```
 
-`<BROKER_PORT>` is a deployment placeholder, not a documented current default. The production broker must exist and be configured before using this route. The certificate name must match the browser URL and be trusted by the browser. The proxy must not replace an untrusted Origin with an allowed one, and the upstream must still authenticate the session and messages.
+Configure `https://foundry.example.test` in `allowedOrigins` and `wss://broker.example.test` in the module. Do not bind the host broadly, rewrite an untrusted Origin into an allowed one, or disable certificate validation.
 
-For remote access, do not expose an unauthenticated broker by binding it broadly. Prefer a narrowly routed TLS endpoint with authentication, firewall restrictions appropriate to the deployment, strict Host/Origin validation, and no access to host administration paths.
-
-## Strict Foundry Origin allowlist
-
-An Origin is exactly `scheme://host:port` (the default port may be omitted). It has no path, query, fragment, wildcard, or credentials.
-
-Examples:
-
-```text
-https://foundry.example.test
-http://127.0.0.1:30000
-```
-
-These are not safe allowlist entries:
-
-```text
-*
-https://*.example.test
-https://foundry.example.test/some/world
-```
-
-Configure the same real value in the module/broker settings and doctor:
+Run doctor with the Docker bind and the same real values:
 
 ```powershell
-$FoundryOrigin = 'https://foundry.example.test'
-$BridgeUrl = 'wss://broker.example.test/foundry-mcp'
-node .\packages\cli\dist\bin.js doctor `
+$FoundryOrigin = 'http://127.0.0.1:30000'
+$BridgeUrl = 'ws://127.0.0.1:32145'
+
+foundry-mcp doctor `
+    --config .\config.example.json `
     --docker-data $FoundryUserData `
     --bridge-url $BridgeUrl `
     --foundry-origin $FoundryOrigin `
     --allow-origin $FoundryOrigin
 ```
 
-Doctor validates syntax, scheme compatibility, exact allowlist membership, and local bind-path access. It does not contact Docker, validate a live certificate chain, or prove that reverse-proxy headers are correct.
+Doctor checks local bind/module/config/status and scheme/Origin consistency. It does not inspect Docker health, contact Foundry, or prove a live proxy certificate.
 
-## Broker discovery
+## Reconnect expectations
 
-There is no safe assumption that a browser can discover the correct broker across Docker Desktop, a remote host, VPN, VDI, or several GM desktops. Configure an explicit bridge URL in the module's GM-only settings. Discovery metadata, if added later, must be authenticated and cannot widen the Origin allowlist.
+Container, browser, and host restarts are separate events. The companion authenticates again, resumes from acknowledged sequence state, suppresses duplicates, and the background reconciler compares permitted world state. A connection never silently selects another world.
 
-Use these diagnostics from the browser machine:
+Manual restart record:
 
-1. confirm the Foundry page's exact origin in browser developer tools;
-2. confirm the bridge URL uses `ws` for HTTP or `wss` for HTTPS;
-3. inspect certificate and WebSocket upgrade errors without copying secrets;
-4. run doctor with the same origin and bridge URL; and
-5. call `foundry.connections.list` and match `worldId`, not only the title.
+1. Record the connected `connectionId`, `worldId`, last sequence, reconciliation status, and event count.
+2. Restart only the Foundry service and wait for the world/module—not merely the container—to become ready.
+3. Confirm the same world reconnects; make one harmless identifiable test-world change and observe it once.
+4. Repeat separately for a browser reload and a Windows-host restart.
+5. Record any reported gap/truncation instead of treating stale state as complete.
 
-The current validation snapshot has no live browser-broker discovery evidence. Treat an absent module bridge setting or production WebSocket listener as an implementation gap, not a networking problem to work around by disabling security.
-
-## Restart and reconnect
-
-Expected behavior after a container, browser, or broker restart is authenticated reconnect followed by bounded reconciliation; events must resume from acknowledged sequence state and duplicates must be suppressed. A connection must not silently target a different world.
-
-Manual restart checklist:
-
-1. Record the connected `connectionId`, `worldId`, last-sync marker, and current event count.
-2. Restart only the Foundry service: `docker compose -f .\compose.yaml restart foundry`.
-3. Wait for the world and module to become ready; do not infer readiness from container state alone.
-4. Confirm the same world reconnects and that `foundry.connections.list` does not retain a false connected state.
-5. Make one harmless, identifiable change in the test world.
-6. Verify reconciliation observes it exactly once and reports any gap/truncation.
-7. Repeat separately for browser reload and broker restart.
-
-No real container restart/reconnect run is claimed in this repository snapshot.
+Repository tests exercise this sequence with mocked Foundry and real local pipe/WebSocket transport. A real licensed container/browser restart remains manual evidence.
 
 ## Safe removal
 
-Disable the module in the world and stop the local broker before removal. On the bind owner:
+Disable the module in the world, stop the Windows host, and preview the ownership-aware removal on the bind owner:
 
 ```powershell
+& .\scripts\windows\uninstall.ps1 -FoundryUserDataPath $FoundryUserData -WhatIf
 & .\scripts\windows\uninstall.ps1 -FoundryUserDataPath $FoundryUserData
 ```
 
-The uninstaller verifies its ownership manifest and current file hashes. It refuses an unrecognized directory or a modified owned file and preserves unrelated files. It never recursively deletes the bind root, worlds, configuration, or unrelated module data. Restart Foundry after safe removal if you need the package list refreshed.
+The uninstaller refuses unrecognized or modified owned files, preserves unrelated files, and never recursively deletes the bind root, worlds, configuration, or unrelated module data. Restart Foundry afterward only after checking the correct Compose project/service.
 
 ## Opt-in licensed-container smoke checklist
 
-Run this only with your licensed image and a disposable or backed-up test world:
+- [ ] The rendered Compose model uses the intended authorized image and exact writable bind source/target.
+- [ ] Foundry v14 reaches the setup/world page and lists `foundry-mcp` from the bind.
+- [ ] A GM enables the module and pairs without exposing the secret in logs or screenshots.
+- [ ] The browser opens the exact `ws://` endpoint for HTTP or trusts the reviewed `wss://` certificate for HTTPS.
+- [ ] Wrong Origin and the rotated old secret fail closed.
+- [ ] `foundry.connections.list` returns the intended real `worldId` and `connectionId`.
+- [ ] Read-only enumeration shows only content visible to that Foundry user.
+- [ ] Explicit grants permit only the intended document/asset/session mutations.
+- [ ] Container, browser, and host restarts reconnect/reconcile without duplicate events.
+- [ ] Uninstall removes only manifest-owned files and the test world still loads.
 
-- [ ] `docker compose config` resolves the intended image and exact bind source/target.
-- [ ] The container becomes healthy and the Foundry v14 setup/world page is reachable.
-- [ ] `Data/modules/foundry-mcp/module.json` is visible through the bind mount and Foundry lists the module.
-- [ ] An authorized GM enables and pairs the module without exposing the secret in logs.
-- [ ] The browser accepts the `wss` certificate when Foundry is HTTPS.
-- [ ] A wrong Origin and an expired/rotated secret both fail closed.
-- [ ] `foundry.connections.list` reports the intended real `worldId`.
-- [ ] A read-only enumeration observes only content visible to that user.
-- [ ] Container, browser, and broker restarts reconnect and reconcile without duplicate events.
-- [ ] Uninstall removes only manifest-owned files and Foundry continues to load the test world.
-
-Record image reference/digest, Foundry version, game system, browser, proxy, commands, timestamps, and redacted logs. Do not commit license keys, cookies, provider keys, world data, or proprietary image layers.
+Record image reference/digest, Foundry/browser/system/module versions, commands, timestamps, and redacted logs. Never commit license keys, cookies, provider keys, world data, or proprietary image layers.
