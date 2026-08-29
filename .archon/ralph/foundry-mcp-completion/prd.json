@@ -19,8 +19,8 @@
       "technicalNotes": "Use packages/mcp-adapter/test-e2e/smoke.test.ts as the harness pattern. server.connect(transport) in cli.ts:26-27 is where negotiation happens server-side; use the SDK's own Client class client-side rather than hand-rolling JSON-RPC.",
       "dependsOn": [],
       "priority": 1,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Implemented in iteration 1. Added packages/mcp-adapter/test-e2e/protocol-negotiation.test.ts, which spawns dist/cli.js as a real child process via StdioClientTransport + Client and taps transport.onmessage to capture the raw initialize response's protocolVersion (Protocol.connect wraps, not replaces, a pre-existing onmessage handler). Evidence: installed @modelcontextprotocol/sdk@1.30.0's SUPPORTED_PROTOCOL_VERSIONS is ['2025-11-25','2025-06-18','2025-03-26','2024-11-05','2024-10-07'] (dist/esm/types.js) -- '2026-07-28' is NOT a version this SDK can negotiate. Since the client requests LATEST_PROTOCOL_VERSION and the server (server/index.js _oninitialize) echoes the requested version if supported else falls back to LATEST_PROTOCOL_VERSION, the actual negotiated wire version in this stack is '2025-11-25'. This feeds directly into US-002."
     },
     {
       "id": "US-002",

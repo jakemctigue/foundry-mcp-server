@@ -1,0 +1,42 @@
+## Codebase Patterns
+
+### MCP SDK negotiated protocol version is NOT exposed by Client
+- **Where**: `node_modules/.pnpm/@modelcontextprotocol+sdk@1.30.0.../dist/esm/client/index.js:280-330`
+- **Pattern**: `Client.connect()` performs the initialize handshake internally but only stores `serverCapabilities`/`serverVersion`/`instructions` on the instance -- the negotiated `protocolVersion` from the initialize response is discarded, no public getter exists (stdio transport has no `setProtocolVersion`, unlike SSE/streamableHTTP transports). To observe it, set `transport.onmessage` to a capturing handler *before* calling `client.connect(transport)` -- `Protocol.connect()` (`shared/protocol.js:230-232`) saves whatever `onmessage` was already installed and still invokes it for every inbound frame alongside its own handler, so this does not require hand-rolling JSON-RPC.
+- **Example**: see `packages/mcp-adapter/test-e2e/protocol-negotiation.test.ts`.
+
+### Installed MCP SDK's real supported protocol versions
+- **Where**: `node_modules/.pnpm/@modelcontextprotocol+sdk@1.30.0.../dist/esm/types.js:2-4`
+- **Fact**: `LATEST_PROTOCOL_VERSION = '2025-11-25'`; `SUPPORTED_PROTOCOL_VERSIONS = ['2025-11-25','2025-06-18','2025-03-26','2024-11-05','2024-10-07']`. The PRD/spec's claimed `2026-07-28` MCP wire version does not exist in this SDK at all -- confirmed to be a fictional value. `packages/protocol/src/version.ts`'s `PROTOCOL_VERSION`/`LEGACY_PROTOCOL_VERSIONS` govern the **private host<->adapter bridge protocol only** (see `bridge-connection.ts` `negotiateProtocolVersion`, which talks to the host daemon over the named pipe) -- they are a completely separate protocol from the MCP wire version negotiated between mcp-adapter and an MCP client. Do not conflate the two when fixing US-002.
+- **Server-side negotiation logic**: `dist/esm/server/index.js:259-266` `_oninitialize` echoes the client-requested `protocolVersion` back if it's in `SUPPORTED_PROTOCOL_VERSIONS`, else falls back to `LATEST_PROTOCOL_VERSION`. Since `Client.connect()` always requests `LATEST_PROTOCOL_VERSION`, the negotiated version in a default same-SDK client<->server pairing is always `2025-11-25`.
+
+### Build-before-test-e2e is already wired
+- **Where**: `turbo.json` `test:e2e` task has `dependsOn: ["^build", "build"]`.
+- **Pattern**: child-process E2E tests that spawn `dist/cli.js` don't need to invoke a build themselves -- turbo guarantees the package's own `dist/` is built first. When running a single package's test:e2e manually outside turbo (`pnpm --filter @foundry-mcp/mcp-adapter test:e2e`), you must `pnpm exec turbo run build` (or `pnpm --filter ... build`) first or `dist/cli.js` won't exist yet.
+
+### cli.ts falls back to a stub bridge with no daemon running
+- **Where**: `packages/mcp-adapter/src/cli.ts` `resolveBridge()` catches any `connectToDaemon` failure and returns `createStubBridgeConnection()`.
+- **Pattern**: spawning `dist/cli.js` directly (no host daemon started) is a valid, fast way to test MCP-wire-level behavior (initialize handshake, tool registration/listing) without needing `startDaemon()` + a real named pipe. Only use the full daemon/bridge setup (as in `test-e2e/smoke.test.ts`) when the test actually needs `foundry.connections.list` or other bridge-backed tool behavior.
+
+---
+
+## 2026-08-29 — US-001: Verify real MCP SDK protocol negotiation
+
+**Status**: PASSED
+**Files changed**:
+- `packages/mcp-adapter/test-e2e/protocol-negotiation.test.ts` (new) — child-process test spawning `dist/cli.js` via `StdioClientTransport` + SDK `Client`; taps `transport.onmessage` before `connect()` to capture the real initialize response's `protocolVersion` off the wire; asserts it's a well-formed date-shaped version string, not the `PROTOCOL_VERSION` bridge constant. Second test asserts `client.connect()` rejects loudly if the child process exits mid-handshake.
+
+**Acceptance criteria verified**:
+- [x] New test in `packages/mcp-adapter/test-e2e/` spawns the built adapter via SDK Client + StdioClientTransport, captures negotiated protocolVersion from the initialize response
+- [x] Test asserts the actual negotiated value from the SDK, not the `PROTOCOL_VERSION` constant
+- [x] Test fails loudly if negotiation errors (second test case, child exits before completing handshake -> `connect()` rejects)
+- [x] `pnpm --filter @foundry-mcp/mcp-adapter test:e2e` passes (3 tests: existing smoke test + 2 new)
+- [x] Type-check passes (`pnpm --filter @foundry-mcp/mcp-adapter typecheck`)
+- [x] Tests pass (`pnpm exec turbo run typecheck lint test test:e2e` — 25/25 tasks green)
+
+**Learnings**:
+- See Codebase Patterns above (negotiated version isn't exposed by `Client`, real SDK version list, build ordering, stub bridge fallback).
+- Confirmed the PRD's claimed `2026-07-28` MCP wire version cannot be substantiated against the installed SDK — this is exactly the finding US-002 needs to act on (set `PROTOCOL_VERSION`/`LEGACY_PROTOCOL_VERSIONS` in `packages/protocol/src/version.ts` to real SDK-supported values, and stop advertising `2026-07-28` as a currently-negotiated MCP wire version). Note again: `packages/protocol/src/version.ts` is the *bridge* protocol version (host daemon <-> mcp-adapter), a different protocol from MCP itself — US-002 should be careful to only change what's actually wrong (the MCP-wire-version claim), not silently redefine the private bridge protocol version if it's otherwise fine.
+- Ran `npx prettier --write` on the new test file after authoring — this repo's file formatting expects prettier default style; no root `format`/`format:check` script exists, so prettier was invoked ad hoc. Consider checking for a `.prettierrc` before assuming defaults in future stories.
+
+---
