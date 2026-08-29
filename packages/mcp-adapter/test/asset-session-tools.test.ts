@@ -109,4 +109,40 @@ describe("asset and session MCP tool registration", () => {
       await context.close();
     }
   });
+
+  it("forwards opaque session cursors unchanged and rejects unsafe legacy offsets", async () => {
+    const opaqueCursor = "sc1.eyJrZXkiOiJ2YWx1ZSJ9.1234abcd";
+    const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];
+    const bridge: BridgeConnection = {
+      request: (method, params) => {
+        calls.push({ method, ...(params ? { params } : {}) });
+        return Promise.resolve({ sessions: [], nextCursor: opaqueCursor });
+      },
+      close: () => Promise.resolve(),
+    };
+    const context = await setup(bridge);
+    try {
+      const listed = await context.client.callTool({
+        name: "foundry.sessions.list",
+        arguments: { cursor: opaqueCursor, pageSize: 7 },
+      });
+      expect(listed.isError).not.toBe(true);
+      expect(listed.structuredContent).toEqual({ sessions: [], nextCursor: opaqueCursor });
+      expect(calls).toEqual([
+        {
+          method: "sessions.list",
+          params: { cursor: opaqueCursor, pageSize: 7 },
+        },
+      ]);
+
+      const rejected = await context.client.callTool({
+        name: "foundry.sessions.list",
+        arguments: { cursor: "v1.2" },
+      });
+      expect(rejected.isError).toBe(true);
+      expect(calls).toHaveLength(1);
+    } finally {
+      await context.close();
+    }
+  });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { OperationResult } from "@foundry-mcp/protocol";
+import type { JsonObject, OperationResult, SessionMetadata } from "@foundry-mcp/protocol";
 import { FoundryDocumentService } from "../src/documents.js";
 import { FoundrySessionService, sanitizeJournalHtml } from "../src/sessions.js";
 import { createRichFakeRuntime } from "./fake-runtime/index.js";
@@ -8,6 +8,21 @@ import { createRichFakeRuntime } from "./fake-runtime/index.js";
 function unwrap<T>(result: OperationResult<T>): T {
   if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
   return result.value;
+}
+
+function sessionMetadata(sessionId: string, updatedAt: string): SessionMetadata & JsonObject {
+  return {
+    sessionId,
+    journalUuid: `JournalEntry.${sessionId}`,
+    title: sessionId,
+    purpose: `Pagination fixture for ${sessionId}`,
+    tags: [],
+    participants: [],
+    linkedUuids: [],
+    status: "open",
+    startedAt: "2026-08-29T09:00:00.000Z",
+    updatedAt,
+  } as SessionMetadata & JsonObject;
 }
 
 describe("FoundrySessionService", () => {
@@ -340,6 +355,228 @@ describe("FoundrySessionService", () => {
       "flags.foundryMcp.sessionPage.uuid",
       incompleteAppend.uuid,
     );
+  });
+
+  it("uses opaque list keysets without skips or duplicates across inserts and updates", async () => {
+    const runtime = createRichFakeRuntime();
+    const documents = new FoundryDocumentService(runtime);
+    const metadataA = sessionMetadata("session-a", "2026-08-29T12:00:00.000Z");
+    const metadataB = sessionMetadata("session-b", "2026-08-29T11:00:00.000Z");
+    const metadataC = sessionMetadata("session-c", "2026-08-29T10:00:00.000Z");
+    const journalA = runtime.seedDocument("JournalEntry", {
+      name: metadataA.title,
+      flags: { foundryMcp: { session: metadataA } },
+    });
+    const journalB = runtime.seedDocument("JournalEntry", {
+      name: metadataB.title,
+      flags: { foundryMcp: { session: metadataB } },
+    });
+    runtime.seedDocument("JournalEntry", {
+      name: metadataC.title,
+      flags: { foundryMcp: { session: metadataC } },
+    });
+    const sessions = new FoundrySessionService(documents);
+
+    const first = unwrap(await sessions.list({ pageSize: 1 }));
+    expect(first.sessions.map((session) => session.sessionId)).toEqual(["session-a"]);
+    expect(first.nextCursor).toMatch(/^sc1\./);
+    expect(first.nextCursor).not.toContain("session-a");
+    expect(
+      unwrap(await sessions.list({ cursor: "v1.0", pageSize: 1 })).sessions.map(
+        (session) => session.sessionId,
+      ),
+    ).toEqual(["session-a"]);
+    expect(await sessions.list({ cursor: "v1.1", pageSize: 1 })).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_DATA" },
+    });
+
+    const cursor = first.nextCursor ?? "";
+    const tamperedCursor = `${cursor.slice(0, -1)}${cursor.endsWith("0") ? "1" : "0"}`;
+    expect(await sessions.list({ cursor: tamperedCursor, pageSize: 1 })).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_DATA" },
+    });
+    expect(await sessions.list({ cursor, status: "open", pageSize: 1 })).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_DATA" },
+    });
+
+    const currentA = unwrap(await documents.get({ uuid: journalA.uuid }));
+    unwrap(
+      await documents.update({
+        uuid: journalA.uuid,
+        data: {
+          flags: {
+            foundryMcp: {
+              session: { ...metadataA, updatedAt: "2026-08-29T14:00:00.000Z" },
+            },
+          },
+        },
+        expectedHash: currentA.sourceHash,
+      }),
+    );
+    const currentB = unwrap(await documents.get({ uuid: journalB.uuid }));
+    unwrap(
+      await documents.update({
+        uuid: journalB.uuid,
+        data: {
+          flags: {
+            foundryMcp: {
+              session: { ...metadataB, updatedAt: "2026-08-29T11:30:00.000Z" },
+            },
+          },
+        },
+        expectedHash: currentB.sourceHash,
+      }),
+    );
+    const inserted = sessionMetadata("session-new", "2026-08-29T13:00:00.000Z");
+    runtime.seedDocument("JournalEntry", {
+      name: inserted.title,
+      flags: { foundryMcp: { session: inserted } },
+    });
+
+    const secondService = new FoundrySessionService(new FoundryDocumentService(runtime));
+    const second = unwrap(await secondService.list({ cursor, pageSize: 1 }));
+    const secondCursor = second.nextCursor;
+    if (!secondCursor) throw new Error("Expected a second list cursor");
+    const third = unwrap(await sessions.list({ cursor: secondCursor, pageSize: 1 }));
+    expect(
+      [...first.sessions, ...second.sessions, ...third.sessions].map(
+        (session) => session.sessionId,
+      ),
+    ).toEqual(["session-a", "session-b", "session-c"]);
+    expect(third.nextCursor).toBeUndefined();
+  });
+
+  it("uses chronological timeline keysets across backfills, edits, and appends", async () => {
+    const runtime = createRichFakeRuntime();
+    const documents = new FoundryDocumentService(runtime);
+    const timestamps = [
+      "2026-08-29T10:00:00.000Z",
+      "2026-08-29T10:10:00.000Z",
+      "2026-08-29T10:20:00.000Z",
+      "2026-08-29T10:30:00.000Z",
+    ];
+    const fallbackTimestamp = timestamps.at(-1) ?? "2026-08-29T10:30:00.000Z";
+    let timestampIndex = 0;
+    const sessions = new FoundrySessionService(documents, {
+      now: () => new Date(timestamps[timestampIndex++] ?? fallbackTimestamp),
+      idFactory: () => "timeline-session",
+    });
+    const started = unwrap(
+      await sessions.start({
+        title: "Timeline",
+        purpose: "Stable pagination",
+        idempotencyKey: "timeline-start-key",
+      }),
+    );
+    const firstAppend = unwrap(
+      await sessions.append({
+        sessionId: started.session.sessionId,
+        kind: "note",
+        html: "First append",
+        attribution: "GM",
+        idempotencyKey: "timeline-append-one",
+      }),
+    );
+    const secondAppend = unwrap(
+      await sessions.append({
+        sessionId: started.session.sessionId,
+        kind: "note",
+        html: "Second append",
+        attribution: "GM",
+        idempotencyKey: "timeline-append-two",
+      }),
+    );
+
+    const first = unwrap(await sessions.get({ sessionId: started.session.sessionId, pageSize: 1 }));
+    expect(first.pages.map((page) => page.uuid)).toEqual([started.page.uuid]);
+    expect(first.nextCursor).toMatch(/^sc1\./);
+    const cursor = first.nextCursor ?? "";
+
+    runtime.seedDocument(
+      "JournalEntryPage",
+      {
+        name: "Backfilled page",
+        flags: {
+          foundryMcp: {
+            sessionPage: {
+              uuid: "backfilled-page",
+              timestamp: "2026-08-29T09:59:00.000Z",
+              kind: "note",
+              attribution: "GM",
+              html: "Backfill",
+              linkedUuids: [],
+              private: false,
+            },
+          },
+        },
+      },
+      { parentUuid: started.journal.uuid },
+    );
+    const currentFirstAppend = unwrap(await documents.get({ uuid: firstAppend.page.uuid }));
+    unwrap(
+      await documents.update({
+        uuid: firstAppend.page.uuid,
+        data: {
+          flags: {
+            foundryMcp: {
+              sessionPage: {
+                ...firstAppend.page,
+                timestamp: "2026-08-29T10:15:00.000Z",
+              },
+            },
+          },
+        },
+        expectedHash: currentFirstAppend.sourceHash,
+      }),
+    );
+    const concurrentAppend = unwrap(
+      await sessions.append({
+        sessionId: started.session.sessionId,
+        kind: "note",
+        html: "Concurrent append",
+        attribution: "GM",
+        idempotencyKey: "timeline-append-three",
+      }),
+    );
+
+    const second = unwrap(
+      await sessions.get({ sessionId: started.session.sessionId, cursor, pageSize: 1 }),
+    );
+    const secondCursor = second.nextCursor;
+    if (!secondCursor) throw new Error("Expected a second timeline cursor");
+    const third = unwrap(
+      await sessions.get({
+        sessionId: started.session.sessionId,
+        cursor: secondCursor,
+        pageSize: 1,
+      }),
+    );
+    const thirdCursor = third.nextCursor;
+    if (!thirdCursor) throw new Error("Expected a third timeline cursor");
+    const fourth = unwrap(
+      await sessions.get({
+        sessionId: started.session.sessionId,
+        cursor: thirdCursor,
+        pageSize: 1,
+      }),
+    );
+    expect(
+      [...first.pages, ...second.pages, ...third.pages, ...fourth.pages].map((page) => page.uuid),
+    ).toEqual([
+      started.page.uuid,
+      firstAppend.page.uuid,
+      secondAppend.page.uuid,
+      concurrentAppend.page.uuid,
+    ]);
+    expect(fourth.nextCursor).toBeUndefined();
+
+    const tamperedCursor = `${cursor.slice(0, -1)}${cursor.endsWith("0") ? "1" : "0"}`;
+    expect(
+      await sessions.get({ sessionId: started.session.sessionId, cursor: tamperedCursor }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
   });
 
   it("sanitizes unsafe active content", () => {

@@ -77,23 +77,40 @@ export type SessionsAppendInput = z.infer<typeof SessionsAppendInput>;
 export const SessionsAppendOutput = z.object({ session: SessionMetadata, page: SessionPage });
 export type SessionsAppendOutput = z.infer<typeof SessionsAppendOutput>;
 
+/**
+ * An opaque, request-bound keyset cursor. Clients must pass this value back
+ * unchanged and must not derive offsets or ordering keys from it. `v1.0` is
+ * retained only as a safe legacy alias for the beginning of a result set;
+ * non-zero legacy offsets are intentionally rejected because concurrent
+ * changes can make them skip or duplicate records.
+ */
+export const SessionCursor = z
+  .string()
+  .min(1)
+  .max(4096)
+  .regex(
+    /^(?:v1\.0|sc1\.[A-Za-z0-9_-]+\.[0-9a-f]{8})$/,
+    "Session cursor must be an opaque cursor returned by this server",
+  );
+export type SessionCursor = z.infer<typeof SessionCursor>;
+
 export const SessionsListInput = ConnectionSelector.extend({
   status: SessionStatus.optional(),
   query: z.string().min(1).max(200).optional(),
-  cursor: z.string().min(1).max(4096).optional(),
+  cursor: SessionCursor.optional(),
   pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).default(50),
 }).strict();
 export type SessionsListInput = z.infer<typeof SessionsListInput>;
 
 export const SessionsListOutput = z.object({
   sessions: z.array(SessionMetadata),
-  nextCursor: z.string().min(1).optional(),
+  nextCursor: SessionCursor.optional(),
 });
 export type SessionsListOutput = z.infer<typeof SessionsListOutput>;
 
 export const SessionsGetInput = ConnectionSelector.extend({
   sessionId: z.string().min(1),
-  cursor: z.string().min(1).max(4096).optional(),
+  cursor: SessionCursor.optional(),
   pageSize: z.number().int().min(1).max(MAX_PAGE_SIZE).default(50),
 }).strict();
 export type SessionsGetInput = z.infer<typeof SessionsGetInput>;
@@ -101,7 +118,7 @@ export type SessionsGetInput = z.infer<typeof SessionsGetInput>;
 export const SessionsGetOutput = z.object({
   session: SessionMetadata,
   pages: z.array(SessionPage),
-  nextCursor: z.string().min(1).optional(),
+  nextCursor: SessionCursor.optional(),
 });
 export type SessionsGetOutput = z.infer<typeof SessionsGetOutput>;
 

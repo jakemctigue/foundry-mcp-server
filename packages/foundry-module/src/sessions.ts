@@ -99,14 +99,120 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
-function cursorEncode(offset: number): string {
-  return `v1.${offset}`;
+interface SessionListCursorPayload {
+  kind: "list";
+  updatedAt: string;
+  sessionId: string;
+  status: "open" | "ended" | null;
+  query: string | null;
+  connectionId: string | null;
 }
 
-function cursorDecode(value: string | undefined): number | null {
-  if (!value) return 0;
-  const match = /^v1\.(\d+)$/.exec(value);
-  return match?.[1] ? Number.parseInt(match[1], 10) : null;
+interface SessionTimelineCursorPayload {
+  kind: "timeline";
+  timestamp: string;
+  pageUuid: string;
+  sessionId: string;
+  connectionId: string | null;
+}
+
+type SessionCursorPayload = SessionListCursorPayload | SessionTimelineCursorPayload;
+
+interface SessionCursorState {
+  readonly entries: Map<string, SessionCursorPayload>;
+  readonly order: string[];
+}
+
+const CURSOR_START = Symbol("session-cursor-start");
+const BASE64_URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const MAX_ACTIVE_SESSION_CURSORS = 4096;
+
+function cursorChecksum(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function base64UrlEncodeAscii(value: string): string {
+  let output = "";
+  let buffer = 0;
+  let bits = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    buffer = (buffer << 8) | value.charCodeAt(index);
+    bits += 8;
+    while (bits >= 6) {
+      bits -= 6;
+      output += BASE64_URL_ALPHABET[(buffer >>> bits) & 0x3f];
+      buffer &= (1 << bits) - 1;
+    }
+  }
+  if (bits > 0) output += BASE64_URL_ALPHABET[(buffer << (6 - bits)) & 0x3f];
+  return output;
+}
+
+function secureCursorNonce(): string | null {
+  const cryptoValue = (
+    globalThis as unknown as {
+      crypto?: { getRandomValues?: (values: Uint8Array) => Uint8Array };
+    }
+  ).crypto;
+  if (!cryptoValue?.getRandomValues) return null;
+  const bytes = cryptoValue.getRandomValues(new Uint8Array(18));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return base64UrlEncodeAscii(binary);
+}
+
+function cursorEncode(state: SessionCursorState, payload: SessionCursorPayload): string | null {
+  let nonce: string | null;
+  let cursor: string;
+  do {
+    nonce = secureCursorNonce();
+    if (!nonce) return null;
+    cursor = `sc1.${nonce}.${cursorChecksum(nonce)}`;
+  } while (state.entries.has(cursor));
+  state.entries.set(cursor, payload);
+  state.order.push(cursor);
+  while (state.order.length > MAX_ACTIVE_SESSION_CURSORS) {
+    const expired = state.order.shift();
+    if (expired) state.entries.delete(expired);
+  }
+  return cursor;
+}
+
+function cursorDecode(
+  state: SessionCursorState,
+  value: string | undefined,
+): SessionCursorPayload | typeof CURSOR_START | null {
+  if (!value || value === "v1.0") return CURSOR_START;
+  const match = /^sc1\.([A-Za-z0-9_-]+)\.([0-9a-f]{8})$/.exec(value);
+  const nonce = match?.[1];
+  const checksum = match?.[2];
+  if (!nonce || !checksum || cursorChecksum(nonce) !== checksum) return null;
+  return state.entries.get(value) ?? null;
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function compareSessionOrder(
+  left: Pick<SessionMetadata, "updatedAt" | "sessionId">,
+  right: Pick<SessionMetadata, "updatedAt" | "sessionId">,
+): number {
+  return (
+    compareText(right.updatedAt, left.updatedAt) || compareText(left.sessionId, right.sessionId)
+  );
+}
+
+function compareTimelineOrder(
+  left: Pick<SessionPage, "timestamp" | "uuid">,
+  right: Pick<SessionPage, "timestamp" | "uuid">,
+): number {
+  return compareText(left.timestamp, right.timestamp) || compareText(left.uuid, right.uuid);
 }
 
 function failure<T>(error: ErrorEnvelope): OperationResult<T> {
@@ -114,6 +220,7 @@ function failure<T>(error: ErrorEnvelope): OperationResult<T> {
 }
 
 const sessionLocksByRuntime = new WeakMap<object, Map<string, Promise<void>>>();
+const sessionCursorsByRuntime = new WeakMap<object, SessionCursorState>();
 
 export interface FoundrySessionServiceOptions {
   now?: () => Date;
@@ -126,6 +233,7 @@ export class FoundrySessionService {
   readonly #idFactory: () => string;
   readonly #journalFolderName: string | null;
   readonly #locks: Map<string, Promise<void>>;
+  readonly #cursors: SessionCursorState;
 
   constructor(
     readonly documents: FoundryDocumentService,
@@ -147,6 +255,9 @@ export class FoundrySessionService {
     const existingLocks = sessionLocksByRuntime.get(runtimeKey);
     this.#locks = existingLocks ?? new Map<string, Promise<void>>();
     if (!existingLocks) sessionLocksByRuntime.set(runtimeKey, this.#locks);
+    const existingCursors = sessionCursorsByRuntime.get(runtimeKey);
+    this.#cursors = existingCursors ?? { entries: new Map(), order: [] };
+    if (!existingCursors) sessionCursorsByRuntime.set(runtimeKey, this.#cursors);
   }
 
   async start(input: unknown): Promise<OperationResult<SessionsStartOutput>> {
@@ -371,17 +482,44 @@ export class FoundrySessionService {
           `${session.title}\n${session.purpose}\n${session.tags.join(" ")}`.toLocaleLowerCase();
         return haystack.includes(parsed.data.query.toLocaleLowerCase());
       })
-      .sort(
-        (left, right) =>
-          right.updatedAt.localeCompare(left.updatedAt) ||
-          left.sessionId.localeCompare(right.sessionId),
+      .sort(compareSessionOrder);
+    const decodedCursor = cursorDecode(this.#cursors, parsed.data.cursor);
+    if (
+      decodedCursor === null ||
+      (decodedCursor !== CURSOR_START &&
+        (decodedCursor.kind !== "list" ||
+          decodedCursor.status !== (parsed.data.status ?? null) ||
+          decodedCursor.query !== (parsed.data.query ?? null) ||
+          decodedCursor.connectionId !== (parsed.data.connectionId ?? null)))
+    )
+      return failure(
+        makeError(
+          "INVALID_DATA",
+          "Session cursor is malformed, tampered, or does not match this request",
+        ),
       );
-    const offset = cursorDecode(parsed.data.cursor);
-    if (offset === null) return failure(makeError("INVALID_DATA", "Session cursor is malformed"));
-    const page = sessions.slice(offset, offset + parsed.data.pageSize);
+    const remaining =
+      decodedCursor === CURSOR_START
+        ? sessions
+        : sessions.filter((session) => compareSessionOrder(session, decodedCursor) > 0);
+    const page = remaining.slice(0, parsed.data.pageSize);
     const output: SessionsListOutput = { sessions: page };
-    if (offset + page.length < sessions.length)
-      output.nextCursor = cursorEncode(offset + page.length);
+    const last = page.at(-1);
+    if (last && page.length < remaining.length) {
+      const nextCursor = cursorEncode(this.#cursors, {
+        kind: "list",
+        updatedAt: last.updatedAt,
+        sessionId: last.sessionId,
+        status: parsed.data.status ?? null,
+        query: parsed.data.query ?? null,
+        connectionId: parsed.data.connectionId ?? null,
+      });
+      if (!nextCursor)
+        return failure(
+          makeError("FOUNDRY_ERROR", "Secure session cursor generation is unavailable"),
+        );
+      output.nextCursor = nextCursor;
+    }
     return { ok: true, value: output };
   }
 
@@ -404,15 +542,48 @@ export class FoundrySessionService {
         const page = pageFromDocument(document);
         return page ? [page] : [];
       })
-      .sort(
-        (left, right) =>
-          left.timestamp.localeCompare(right.timestamp) || left.uuid.localeCompare(right.uuid),
+      .sort(compareTimelineOrder);
+    const decodedCursor = cursorDecode(this.#cursors, parsed.data.cursor);
+    if (
+      decodedCursor === null ||
+      (decodedCursor !== CURSOR_START &&
+        (decodedCursor.kind !== "timeline" ||
+          decodedCursor.sessionId !== parsed.data.sessionId ||
+          decodedCursor.connectionId !== (parsed.data.connectionId ?? null)))
+    )
+      return failure(
+        makeError(
+          "INVALID_DATA",
+          "Session cursor is malformed, tampered, or does not match this request",
+        ),
       );
-    const offset = cursorDecode(parsed.data.cursor);
-    if (offset === null) return failure(makeError("INVALID_DATA", "Session cursor is malformed"));
-    const page = pages.slice(offset, offset + parsed.data.pageSize);
+    const remaining =
+      decodedCursor === CURSOR_START
+        ? pages
+        : pages.filter(
+            (page) =>
+              compareTimelineOrder(page, {
+                timestamp: decodedCursor.timestamp,
+                uuid: decodedCursor.pageUuid,
+              }) > 0,
+          );
+    const page = remaining.slice(0, parsed.data.pageSize);
     const output: SessionsGetOutput = { session: metadata, pages: page };
-    if (offset + page.length < pages.length) output.nextCursor = cursorEncode(offset + page.length);
+    const last = page.at(-1);
+    if (last && page.length < remaining.length) {
+      const nextCursor = cursorEncode(this.#cursors, {
+        kind: "timeline",
+        timestamp: last.timestamp,
+        pageUuid: last.uuid,
+        sessionId: parsed.data.sessionId,
+        connectionId: parsed.data.connectionId ?? null,
+      });
+      if (!nextCursor)
+        return failure(
+          makeError("FOUNDRY_ERROR", "Secure session cursor generation is unavailable"),
+        );
+      output.nextCursor = nextCursor;
+    }
     return { ok: true, value: output };
   }
 
