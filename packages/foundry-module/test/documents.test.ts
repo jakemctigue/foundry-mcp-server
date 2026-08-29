@@ -1,0 +1,636 @@
+import { describe, expect, it } from "vitest";
+
+import { MAX_PAGE_SIZE, makeError, type OperationResult } from "@foundry-mcp/protocol";
+import { FoundryDocumentService } from "../src/documents.js";
+import { BrowserFoundryRuntime } from "../src/runtime.js";
+import { FakeFoundryRuntime, FakeRole, createRichFakeRuntime } from "./fake-runtime/index.js";
+
+function unwrap<T>(result: OperationResult<T>): T {
+  if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`);
+  return result.value;
+}
+
+async function allPages(
+  service: FoundryDocumentService,
+  type: string,
+  pageSize: number,
+): Promise<string[]> {
+  const uuids: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = unwrap(
+      await service.list({
+        type,
+        pageSize,
+        ...(cursor ? { cursor } : {}),
+      }),
+    );
+    uuids.push(...page.items.map((item) => item.uuid));
+    cursor = page.nextCursor;
+  } while (cursor);
+  return uuids;
+}
+
+describe("FoundryDocumentService type discovery", () => {
+  it("adapts Foundry globals structurally without a compiled-in Document registry", async () => {
+    const rawDocument = {
+      id: "actor-a",
+      uuid: "Actor.actor-a",
+      documentName: "Actor",
+      type: "stellar",
+      ownership: { default: 1 },
+      toObject: () => ({
+        _id: "actor-a",
+        name: "Stellar Actor",
+        type: "stellar",
+        system: { runtimeOnly: 9 },
+      }),
+      testUserPermission: () => true,
+      canUserModify: () => true,
+      update: async () => rawDocument,
+      delete: async () => undefined,
+    };
+    const documentClass = {
+      documentName: "Actor",
+      metadata: { name: "Actor", collection: "actors", schemaVersion: "14" },
+      canUserCreate: () => true,
+      create: async () => rawDocument,
+    };
+    const globals = {
+      game: {
+        ready: true,
+        user: { isGM: true },
+        documentTypes: { Actor: ["stellar", "voidborn"] },
+        collections: new Map([
+          ["Actor", { documentName: "Actor", documentClass, contents: [rawDocument] }],
+        ]),
+        packs: new Map(),
+        system: { version: "1.2.3" },
+      },
+      CONFIG: { Actor: { documentClass } },
+      foundry: { utils: { parseUuid: (uuid: string) => ({ uuid }) } },
+      fromUuid: async (uuid: string) => (uuid === rawDocument.uuid ? rawDocument : null),
+      Hooks: { callAll: () => undefined },
+    };
+    const service = new FoundryDocumentService(new BrowserFoundryRuntime(globals));
+    const types = unwrap(await service.types()).types;
+    expect(types).toHaveLength(1);
+    expect(types[0]?.subtypes.map((subtype) => subtype.subtype)).toEqual(["stellar", "voidborn"]);
+    expect(unwrap(await service.list({ type: "Actor" })).items[0]).toMatchObject({
+      uuid: "Actor.actor-a",
+      subtype: "stellar",
+    });
+    expect(unwrap(await service.get({ uuid: "Actor.actor-a" })).data.system).toEqual({
+      runtimeOnly: 9,
+    });
+  });
+
+  it("reports empty and single-type runtimes without a built-in type list", async () => {
+    expect(
+      unwrap(await new FoundryDocumentService(new FakeFoundryRuntime()).types()).types,
+    ).toEqual([]);
+
+    const runtime = new FakeFoundryRuntime().registerDocumentType("Constellation", {
+      collection: "constellations",
+      subtypes: { aurora: { label: "Aurora" } },
+    });
+    const output = unwrap(await new FoundryDocumentService(runtime).types());
+    expect(output.types.map((entry) => entry.type)).toEqual(["Constellation"]);
+    expect(output.types[0]?.subtypes.map((entry) => entry.subtype)).toEqual(["aurora"]);
+  });
+
+  it("reports every runtime Actor and Item subtype, including forbidden reasons", async () => {
+    const runtime = new FakeFoundryRuntime(FakeRole.PLAYER)
+      .registerDocumentType("Actor", {
+        collection: "actors",
+        subtypes: {
+          "system-alpha": {},
+          "system-beta": { minCreateRole: FakeRole.GAMEMASTER },
+        },
+      })
+      .registerDocumentType("Item", {
+        collection: "items",
+        embedded: true,
+        parentTypes: ["Actor"],
+        subtypes: { "system-gamma": {}, "system-delta": {} },
+      });
+    const types = unwrap(await new FoundryDocumentService(runtime).types()).types;
+    expect(
+      types.find((entry) => entry.type === "Actor")?.subtypes.map((entry) => entry.subtype),
+    ).toEqual(["system-alpha", "system-beta"]);
+    expect(types.find((entry) => entry.type === "Item")?.subtypes).toHaveLength(2);
+    for (const type of types) {
+      expect(type.creatable).toBe(false);
+      expect(type.reason).toBeTypeOf("string");
+      for (const subtype of type.subtypes) {
+        expect(subtype.creatable).toBe(false);
+        expect(subtype.reason).toBeTypeOf("string");
+      }
+    }
+  });
+});
+
+describe("FoundryDocumentService listing and UUID reads", () => {
+  it("walks stable cursor pages without gaps or duplicates and supports projection/filter/sort", async () => {
+    const runtime = createRichFakeRuntime();
+    for (let index = 0; index < 7; index += 1) {
+      runtime.seedDocument("Actor", {
+        name: `Actor ${String.fromCharCode(71 - index)}`,
+        type: index % 2 === 0 ? "stormborn" : "clockwork",
+        folder: index < 4 ? "folder-a" : null,
+        system: { unknownField: { index, preserved: true } },
+      });
+    }
+    const service = new FoundryDocumentService(runtime);
+    const uuids = await allPages(service, "Actor", 2);
+    expect(uuids).toHaveLength(7);
+    expect(new Set(uuids).size).toBe(7);
+    expect(uuids).toEqual([...uuids].sort());
+
+    const filtered = unwrap(
+      await service.list({
+        type: "Actor",
+        subtype: "stormborn",
+        folder: "folder-a",
+        nameFilter: "actor",
+        fields: ["system.unknownField.index"],
+        sort: { field: "name", direction: "asc" },
+      }),
+    );
+    expect(filtered.items).toHaveLength(2);
+    expect(filtered.items[0]?.data).toEqual({ system: { unknownField: { index: 2 } } });
+
+    const invalid = await service.list({ type: "Actor", pageSize: MAX_PAGE_SIZE + 1 });
+    expect(invalid).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+  });
+
+  it("reads root and embedded UUIDs through runtime parseUuid/fromUuid and never returns prototypes", async () => {
+    const runtime = createRichFakeRuntime();
+    const actor = runtime.seedDocument("Actor", {
+      name: "Root",
+      type: "stormborn",
+      system: { custom: { value: 42 } },
+    });
+    const item = runtime.seedDocument(
+      "Item",
+      { name: "Embedded", type: "rune", system: { arbitrary: "kept" } },
+      { parentUuid: actor.uuid },
+    );
+    const service = new FoundryDocumentService(runtime);
+    const root = unwrap(await service.get({ uuid: actor.uuid }));
+    const embedded = unwrap(await service.get({ uuid: item.uuid }));
+    expect(root.parent).toBeUndefined();
+    expect(embedded.parent).toEqual({ uuid: actor.uuid, type: "Actor" });
+    expect(embedded.data.system).toEqual({ arbitrary: "kept" });
+    expect(Object.getPrototypeOf(embedded.data)).toBe(Object.prototype);
+    expect(await service.get({ uuid: "Actor.missing" })).toMatchObject({
+      ok: false,
+      error: { code: "NOT_FOUND" },
+    });
+  });
+
+  it("honors Foundry visibility for Player, Trusted, Assistant, and GM fixtures", async () => {
+    for (const role of [
+      FakeRole.PLAYER,
+      FakeRole.TRUSTED,
+      FakeRole.ASSISTANT,
+      FakeRole.GAMEMASTER,
+    ]) {
+      const runtime = createRichFakeRuntime(role);
+      runtime.seedDocument(
+        "Actor",
+        { name: "Public", type: "stormborn" },
+        { minReadRole: FakeRole.PLAYER },
+      );
+      runtime.seedDocument(
+        "Actor",
+        { name: "GM Secret", type: "clockwork" },
+        { minReadRole: FakeRole.GAMEMASTER },
+      );
+      const listed = unwrap(await new FoundryDocumentService(runtime).list({ type: "Actor" }));
+      expect(listed.items.map((item) => item.name)).toEqual(
+        role === FakeRole.GAMEMASTER ? ["Public", "GM Secret"] : ["Public"],
+      );
+    }
+  });
+});
+
+describe("FoundryDocumentService generic create and update", () => {
+  it("creates every discovered Actor/Item subtype, world Items, and Actor embedded Items", async () => {
+    const runtime = createRichFakeRuntime();
+    const service = new FoundryDocumentService(runtime);
+    const types = unwrap(await service.types()).types;
+    const actorType = types.find((entry) => entry.type === "Actor");
+    const itemType = types.find((entry) => entry.type === "Item");
+    expect(actorType?.subtypes).toHaveLength(2);
+    expect(itemType?.subtypes).toHaveLength(2);
+
+    const actorUuids: string[] = [];
+    for (const subtype of actorType?.subtypes ?? []) {
+      const created = unwrap(
+        await service.create({
+          type: "Actor",
+          data: {
+            name: `Actor ${subtype.subtype}`,
+            type: subtype.subtype,
+            system: { arbitrary: { subtype: subtype.subtype } },
+          },
+        }),
+      );
+      const result = created.results[0];
+      expect(result?.status).toBe("created");
+      if (result?.status === "created") actorUuids.push(result.document.uuid);
+    }
+    for (const subtype of itemType?.subtypes ?? []) {
+      const world = unwrap(
+        await service.create({
+          type: "Item",
+          data: {
+            name: `World ${subtype.subtype}`,
+            type: subtype.subtype,
+            system: { opaque: "world" },
+          },
+        }),
+      );
+      expect(world.results[0]?.status).toBe("created");
+      const embedded = unwrap(
+        await service.create({
+          type: "Item",
+          parentUuid: actorUuids[0],
+          data: {
+            name: `Embedded ${subtype.subtype}`,
+            type: subtype.subtype,
+            system: { opaque: "embedded" },
+          },
+        }),
+      );
+      expect(embedded.results[0]?.status).toBe("created");
+    }
+    expect(unwrap(await service.list({ type: "Actor" })).items).toHaveLength(2);
+    expect(unwrap(await service.list({ type: "Item" })).items).toHaveLength(2);
+    expect(
+      unwrap(
+        await service.embeddedList({
+          parentUuid: actorUuids[0],
+          embeddedType: "Item",
+          maxDepth: 1,
+        }),
+      ).items,
+    ).toHaveLength(2);
+  });
+
+  it("reports partial batch results explicitly and rolls back an atomic runtime failure", async () => {
+    const runtime = createRichFakeRuntime();
+    const service = new FoundryDocumentService(runtime);
+    const partial = unwrap(
+      await service.create({
+        items: [
+          { type: "Actor", data: { name: "Valid", type: "stormborn" } },
+          { type: "NotRegistered", data: { name: "Invalid" } },
+        ],
+      }),
+    );
+    expect(partial).toMatchObject({
+      atomic: false,
+      committed: false,
+      results: [{ status: "created" }, { status: "error", error: { code: "UNSUPPORTED_TYPE" } }],
+    });
+    expect(unwrap(await service.list({ type: "Actor" })).items.map((item) => item.name)).toContain(
+      "Valid",
+    );
+
+    const before = unwrap(await service.list({ type: "Actor" })).items.length;
+    runtime.failCreateOnCall(2);
+    const atomic = unwrap(
+      await service.create({
+        atomic: true,
+        items: [
+          { type: "Actor", data: { name: "Atomic A", type: "stormborn" } },
+          { type: "Actor", data: { name: "Atomic B", type: "clockwork" } },
+        ],
+      }),
+    );
+    expect(atomic.committed).toBe(false);
+    expect(atomic.results[0]?.status).toBe("rolled_back");
+    expect(unwrap(await service.list({ type: "Actor" })).items).toHaveLength(before);
+  });
+
+  it("enforces optimistic hashes, records forced waivers, and preserves unknown fields", async () => {
+    const runtime = createRichFakeRuntime();
+    const actor = runtime.seedDocument("Actor", {
+      name: "Before",
+      type: "clockwork",
+      system: { unknown: { nested: 7 }, untouched: true },
+    });
+    const item = runtime.seedDocument("Item", {
+      name: "World Item",
+      type: "relic",
+      system: { unknownWorldItem: "keep" },
+    });
+    const embedded = runtime.seedDocument(
+      "Item",
+      { name: "Embedded Item", type: "rune", system: { unknownEmbedded: "keep" } },
+      { parentUuid: actor.uuid },
+    );
+    const service = new FoundryDocumentService(runtime);
+
+    for (const uuid of [actor.uuid, item.uuid, embedded.uuid]) {
+      const before = unwrap(await service.get({ uuid }));
+      const updated = unwrap(
+        await service.update({
+          uuid,
+          data: { name: `${before.name} Updated` },
+          expectedHash: before.sourceHash,
+        }),
+      );
+      expect(updated.sourceHash).not.toBe(before.sourceHash);
+      expect(updated.document.data.system).toEqual(before.data.system);
+    }
+
+    const current = unwrap(await service.get({ uuid: actor.uuid }));
+    const conflict = await service.update({
+      uuid: actor.uuid,
+      data: { name: "Must Not Apply" },
+      expectedHash: "stale-hash",
+    });
+    expect(conflict).toMatchObject({ ok: false, error: { code: "CONFLICT" } });
+    expect(unwrap(await service.get({ uuid: actor.uuid })).name).toBe(current.name);
+
+    const forced = unwrap(
+      await service.update({
+        uuid: actor.uuid,
+        data: { name: "Forced" },
+        forceOverwrite: true,
+      }),
+    );
+    expect(forced.forced).toBe(true);
+    expect(runtime.auditEvents).toContainEqual({
+      action: "document.update",
+      uuid: actor.uuid,
+      forced: true,
+    });
+  });
+
+  it("denies non-GM mutation without changing the stored object", async () => {
+    const runtime = createRichFakeRuntime(FakeRole.PLAYER);
+    const actor = runtime.seedDocument("Actor", {
+      name: "Original",
+      type: "stormborn",
+      system: { kept: true },
+    });
+    const service = new FoundryDocumentService(runtime);
+    const before = unwrap(await service.get({ uuid: actor.uuid }));
+    expect(
+      await service.create({ type: "Actor", data: { name: "Denied", type: "stormborn" } }),
+    ).toMatchObject({
+      ok: true,
+      value: { results: [{ status: "error", error: { code: "PERMISSION_DENIED" } }] },
+    });
+    expect(
+      await service.update({
+        uuid: actor.uuid,
+        data: { name: "Denied" },
+        expectedHash: before.sourceHash,
+      }),
+    ).toMatchObject({ ok: false, error: { code: "PERMISSION_DENIED" } });
+    expect(unwrap(await service.get({ uuid: actor.uuid })).data).toEqual(before.data);
+  });
+});
+
+describe("FoundryDocumentService embedded and compendium enumeration", () => {
+  it("lists direct embedded types and reports recursive depth truncation", async () => {
+    const runtime = createRichFakeRuntime();
+    const actor = runtime.seedDocument("Actor", { name: "Parent", type: "stormborn" });
+    const item = runtime.seedDocument(
+      "Item",
+      { name: "Child", type: "rune" },
+      { parentUuid: actor.uuid },
+    );
+    const attachment = runtime.seedDocument(
+      "Attachment",
+      { name: "Grandchild" },
+      { parentUuid: item.uuid },
+    );
+    runtime.seedDocument(
+      "Annotation",
+      { name: "Great-grandchild" },
+      { parentUuid: attachment.uuid },
+    );
+    const service = new FoundryDocumentService(runtime);
+
+    const direct = unwrap(
+      await service.embeddedList({
+        parentUuid: actor.uuid,
+        embeddedType: "Item",
+        recursive: false,
+        maxDepth: 1,
+      }),
+    );
+    expect(direct.items).toHaveLength(1);
+    expect(direct.items[0]).toMatchObject({ parentUuid: actor.uuid, subtype: "rune", depth: 1 });
+
+    const bounded = unwrap(
+      await service.embeddedList({
+        parentUuid: actor.uuid,
+        recursive: true,
+        maxDepth: 2,
+      }),
+    );
+    expect(bounded.items.map((entry) => entry.depth)).toEqual([1, 2]);
+    expect(bounded).toMatchObject({
+      truncated: true,
+      truncationReason: expect.stringContaining("maxDepth"),
+    });
+  });
+
+  it("lists accessible Actor/Item packs and switches between index and hydrated output", async () => {
+    const runtime = createRichFakeRuntime()
+      .addCompendium({
+        id: "world.actors",
+        label: "Actors",
+        type: "Actor",
+        documents: [
+          { name: "Packed Stormborn", type: "stormborn", system: { packed: 1 } },
+          { name: "Packed Clockwork", type: "clockwork", system: { packed: 2 } },
+        ],
+      })
+      .addCompendium({
+        id: "world.items",
+        label: "Items",
+        type: "Item",
+        documents: [
+          { name: "Packed Rune", type: "rune" },
+          { name: "Packed Relic", type: "relic" },
+        ],
+      })
+      .addCompendium({
+        id: "world.locked",
+        label: "Locked",
+        type: "Actor",
+        locked: true,
+        documents: [{ name: "Hidden", type: "stormborn" }],
+      });
+    const service = new FoundryDocumentService(runtime);
+    const packs = unwrap(await service.compendiumsList()).packs;
+    expect(packs.map((pack) => pack.id)).toEqual(["world.actors", "world.items"]);
+    expect(packs.map((pack) => pack.documentCount)).toEqual([2, 2]);
+
+    const index = unwrap(
+      await service.compendiumDocumentsList({
+        packId: "world.actors",
+        hydrate: false,
+        pageSize: 1,
+      }),
+    );
+    expect(index.hydrated).toBe(false);
+    expect(index.items[0]).not.toHaveProperty("data");
+    expect(index.nextCursor).toBeTypeOf("string");
+
+    const hydrated = unwrap(
+      await service.compendiumDocumentsList({ packId: "world.actors", hydrate: true }),
+    );
+    expect(hydrated.items).toHaveLength(2);
+    expect(hydrated.items[0]).toHaveProperty("data.system.packed");
+    expect(
+      await service.compendiumDocumentsList({ packId: "world.locked", hydrate: true }),
+    ).toMatchObject({
+      ok: false,
+      error: { code: "PERMISSION_DENIED" },
+    });
+    expect(
+      await service.create({
+        type: "Actor",
+        parentUuid: "Compendium.world.locked.actor-0001",
+        data: { name: "No write", type: "stormborn" },
+      }),
+    ).toMatchObject({ ok: true, value: { results: [{ status: "error" }] } });
+  });
+});
+
+describe("FoundryDocumentService bounded snapshots and complete generic coverage", () => {
+  it("detects UUID cycles, redacts configured paths, and reports each bound", async () => {
+    const runtime = createRichFakeRuntime();
+    runtime.seedDocument(
+      "Actor",
+      {
+        name: "A",
+        type: "stormborn",
+        system: { related: "Actor.b", secret: "remove-me", large: "x".repeat(1_000) },
+      },
+      { id: "a" },
+    );
+    runtime.seedDocument(
+      "Actor",
+      { name: "B", type: "clockwork", system: { related: "Actor.a" } },
+      { id: "b" },
+    );
+    const service = new FoundryDocumentService(runtime, ["system.secret"]);
+    const full = unwrap(
+      await service.snapshot({
+        uuids: ["Actor.a"],
+        maxDepth: 6,
+        maxItems: 10,
+        maxBytes: 10_000,
+        redactionPaths: [],
+      }),
+    );
+    expect(JSON.stringify(full.snapshot)).toContain('"$cycle":true');
+    expect(JSON.stringify(full.snapshot)).not.toContain("remove-me");
+    expect(full.redactedPaths).toContain("Actor.a:system.secret");
+
+    const depth = unwrap(
+      await service.snapshot({ uuids: ["Actor.a"], maxDepth: 1, maxItems: 10, maxBytes: 10_000 }),
+    );
+    expect(depth.truncationReasons).toContain("maxDepth");
+    const items = unwrap(
+      await service.snapshot({ uuids: ["Actor.a"], maxDepth: 6, maxItems: 1, maxBytes: 10_000 }),
+    );
+    expect(items.truncationReasons).toContain("maxItems");
+    const bytes = unwrap(
+      await service.snapshot({ uuids: ["Actor.a"], maxDepth: 6, maxItems: 10, maxBytes: 256 }),
+    );
+    expect(bytes.truncationReasons).toContain("maxBytes");
+    expect(bytes.byteCount).toBeLessThanOrEqual(256);
+  });
+
+  it("uses the same generic path for scenes, tables, playlists, cards, and macros", async () => {
+    const runtime = createRichFakeRuntime();
+    const service = new FoundryDocumentService(runtime);
+    for (const type of ["Scene", "RollTable", "Playlist", "Cards", "Macro"]) {
+      const created = unwrap(
+        await service.create({
+          type,
+          data: { name: `${type} Fixture`, system: { moduleSpecific: { type } } },
+        }),
+      );
+      const result = created.results[0];
+      expect(result?.status).toBe("created");
+      if (result?.status !== "created") continue;
+      expect(unwrap(await service.get({ uuid: result.document.uuid })).data.system).toEqual({
+        moduleSpecific: { type },
+      });
+      expect(unwrap(await service.list({ type })).items.map((item) => item.uuid)).toContain(
+        result.document.uuid,
+      );
+    }
+  });
+
+  it("maps runtime failures and operational guards to the structured taxonomy", async () => {
+    const offlineRuntime = createRichFakeRuntime();
+    offlineRuntime.online = false;
+    expect(await new FoundryDocumentService(offlineRuntime).types()).toMatchObject({
+      ok: false,
+      error: { code: "OFFLINE_BRIDGE" },
+    });
+
+    const runtime = createRichFakeRuntime(FakeRole.PLAYER);
+    const actor = runtime.seedDocument("Actor", { name: "Fixture", type: "stormborn" });
+    const service = new FoundryDocumentService(runtime);
+    expect(await service.list({ type: "Nope" })).toMatchObject({
+      ok: false,
+      error: { code: "UNSUPPORTED_TYPE" },
+    });
+    expect(await service.list({ type: "Actor", pageSize: 0 })).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_DATA" },
+    });
+    expect(await service.get({ uuid: "Actor.missing" })).toMatchObject({
+      ok: false,
+      error: { code: "NOT_FOUND" },
+    });
+    expect(
+      await service.create({ type: "Actor", data: { name: "Denied", type: "stormborn" } }),
+    ).toMatchObject({
+      ok: true,
+      value: { results: [{ error: { code: "PERMISSION_DENIED" } }] },
+    });
+    expect(
+      await service.update({ uuid: actor.uuid, data: { name: "Conflict" }, expectedHash: "wrong" }),
+    ).toMatchObject({ ok: false, error: { code: "PERMISSION_DENIED" } });
+
+    runtime.role = FakeRole.GAMEMASTER;
+    expect(
+      await service.update({ uuid: actor.uuid, data: { name: "Conflict" }, expectedHash: "wrong" }),
+    ).toMatchObject({ ok: false, error: { code: "CONFLICT" } });
+    expect(await service.types({}, { deadline: Date.now() - 1 })).toMatchObject({
+      ok: false,
+      error: { code: "TIMEOUT" },
+    });
+    const controller = new AbortController();
+    controller.abort();
+    expect(await service.types({}, { signal: controller.signal })).toMatchObject({
+      ok: false,
+      error: { code: "CANCELLED" },
+    });
+
+    const failingRuntime = createRichFakeRuntime();
+    failingRuntime.listRootDocuments = async () => {
+      throw new Error("Injected Foundry failure");
+    };
+    expect(await new FoundryDocumentService(failingRuntime).list({ type: "Actor" })).toMatchObject({
+      ok: false,
+      error: { code: "FOUNDRY_ERROR" },
+    });
+    expect(makeError("AMBIGUOUS_CONNECTION", "multiple worlds").code).toBe("AMBIGUOUS_CONNECTION");
+  });
+});
