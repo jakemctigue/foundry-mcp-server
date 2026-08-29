@@ -87,3 +87,63 @@ jobs:
           name: foundry-mcp-pipe-broker-${{ matrix.rid }}
           path: packages/host/native/bin/${{ matrix.rid }}/
           if-no-files-found: error
+
+  foundry-module-release:
+    name: Foundry v14 module package
+    needs: build-test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "9"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build release inputs
+        run: pnpm build
+
+      - name: Build and inspect Foundry v14 module ZIP
+        id: module-package
+        shell: pwsh
+        run: |
+          $releaseRoot = Join-Path -Path $PWD -ChildPath 'artifacts/foundry-module'
+          $version = [string](Get-Content -LiteralPath 'packages/foundry-module/package.json' -Raw | ConvertFrom-Json).version
+          node packages/cli/dist/bin.js build-module --output $releaseRoot --version $version --json
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Foundry module package command failed.'
+          }
+          $zipFiles = @(Get-ChildItem -LiteralPath $releaseRoot -Filter '*.zip' -File)
+          if ($zipFiles.Count -ne 1) {
+            throw "Expected exactly one Foundry module ZIP, found $($zipFiles.Count)."
+          }
+          $verification = & ./scripts/windows/verify-module-package.ps1 -ZipPath $zipFiles[0].FullName
+          $relativeZip = [System.IO.Path]::GetRelativePath($PWD.Path, $zipFiles[0].FullName).Replace('\', '/')
+          "zip-path=$relativeZip" | Out-File -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "sha256=$($verification.sha256)" | Out-File -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Foundry v14 module ZIP: $relativeZip"
+          Write-Host "SHA-256: $($verification.sha256)"
+          @(
+            '### Foundry v14 module package'
+            "- ZIP: ``$relativeZip``"
+            "- SHA-256: ``$($verification.sha256)``"
+            "- Allowlisted entries: $($verification.entries -join ', ')"
+          ) | Out-File -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload Foundry v14 module ZIP only
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundry-mcp-module-v14-${{ github.sha }}
+          path: ${{ steps.module-package.outputs.zip-path }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

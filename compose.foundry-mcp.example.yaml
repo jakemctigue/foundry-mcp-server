@@ -1,0 +1,15 @@
+name: foundry-mcp-example
+
+services:
+  foundry:
+    image: "${FOUNDRY_IMAGE:?Set FOUNDRY_IMAGE to an image you are licensed to use}"
+    restart: unless-stopped
+    ports:
+      - "${FOUNDRY_HTTP_BIND:-127.0.0.1:30000}:${FOUNDRY_CONTAINER_PORT:-30000}"
+    volumes:
+      - type: bind
+        source: "${FOUNDRY_USER_DATA:?Set FOUNDRY_USER_DATA to an absolute host path}"
+        target: "${FOUNDRY_CONTAINER_USER_DATA:?Set the User Data path expected by your image}"
+        read_only: false
+        bind:
+          create_host_path: false
