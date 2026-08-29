@@ -1,5 +1,5 @@
 import { connectPipeClient, type PipeClient } from "@foundry-mcp/host";
-import { PROTOCOL_VERSION } from "@foundry-mcp/protocol";
+import { BRIDGE_PROTOCOL_VERSION } from "@foundry-mcp/protocol";
 
 export interface BridgeConnection {
   request: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
@@ -15,9 +15,9 @@ export async function negotiateProtocolVersion(
   bridge: BridgeConnection,
 ): Promise<InitializeResult> {
   const result = (await bridge.request("initialize")) as InitializeResult;
-  if (result.protocolVersion !== PROTOCOL_VERSION) {
+  if (result.protocolVersion !== BRIDGE_PROTOCOL_VERSION) {
     throw new Error(
-      `bridge protocol version mismatch: expected ${PROTOCOL_VERSION}, got ${result.protocolVersion}`,
+      `bridge protocol version mismatch: expected ${BRIDGE_PROTOCOL_VERSION}, got ${result.protocolVersion}`,
     );
   }
   return result;

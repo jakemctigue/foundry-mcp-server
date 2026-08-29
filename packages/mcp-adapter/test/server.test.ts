@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { PROTOCOL_VERSION } from "@foundry-mcp/protocol";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import {
+  BRIDGE_PROTOCOL_VERSION,
+  LEGACY_MCP_PROTOCOL_VERSIONS,
+  MCP_PROTOCOL_VERSION,
+} from "@foundry-mcp/protocol";
 import { createFoundryMcpServer } from "../src/server.js";
 import { createStubBridgeConnection, type BridgeConnection } from "../src/bridge-connection.js";
 
@@ -57,16 +60,21 @@ describe("foundry.connections.list", () => {
 });
 
 describe("foundry.capabilities.get", () => {
-  it("returns the protocol version and a capabilities list", async () => {
+  it("reports MCP and private bridge revisions independently", async () => {
     const { client, cleanup } = await setup();
     try {
       const result = await client.callTool({ name: "foundry.capabilities.get", arguments: {} });
       expect(result.isError).not.toBe(true);
       const structured = result.structuredContent as {
-        protocolVersion: string;
+        mcpProtocolVersion: string;
+        legacyMcpProtocolVersions: string[];
+        bridgeProtocolVersion: string;
         capabilities: unknown[];
       };
-      expect(structured.protocolVersion).toBe(PROTOCOL_VERSION);
+      expect(structured.mcpProtocolVersion).toBe(MCP_PROTOCOL_VERSION);
+      expect(structured.legacyMcpProtocolVersions).toEqual(LEGACY_MCP_PROTOCOL_VERSIONS);
+      expect(structured.bridgeProtocolVersion).toBe(BRIDGE_PROTOCOL_VERSION);
+      expect(structured.bridgeProtocolVersion).not.toBe(structured.mcpProtocolVersion);
       expect(structured.capabilities.length).toBeGreaterThan(0);
     } finally {
       await cleanup();

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { serveStdio, type StdioServerHandle } from "@modelcontextprotocol/server/stdio";
 import { resolvePipePath, defaultUserIdentifier, resolveAppDataDir } from "@foundry-mcp/host";
 import {
   connectToDaemon,
@@ -23,9 +23,26 @@ async function resolveBridge(): Promise<BridgeConnection> {
 
 async function main(): Promise<void> {
   const bridge = await resolveBridge();
-  const server = createFoundryMcpServer({ bridge });
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  const buildServer = () => createFoundryMcpServer({ bridge });
+  let stdio: StdioServerHandle | undefined;
+  let shuttingDown = false;
+
+  const shutdown = async (): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await stdio?.close();
+    await bridge.close();
+  };
+
+  stdio = serveStdio(() => buildServer(), {
+    onerror: (error) => {
+      process.stderr.write(`foundry-mcp-adapter stdio error: ${error.message}\n`);
+    },
+  });
+
+  process.once("SIGINT", () => void shutdown());
+  process.once("SIGTERM", () => void shutdown());
+  process.stdin.once("end", () => void shutdown());
 }
 
 main().catch((err: unknown) => {

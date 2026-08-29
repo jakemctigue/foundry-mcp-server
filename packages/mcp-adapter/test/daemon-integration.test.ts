@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { startDaemon, type Daemon } from "@foundry-mcp/host";
-import { PROTOCOL_VERSION } from "@foundry-mcp/protocol";
+import { BRIDGE_PROTOCOL_VERSION } from "@foundry-mcp/protocol";
 import { connectToDaemon, negotiateProtocolVersion } from "../src/bridge-connection.js";
 
 describe("mcp-adapter <-> real host daemon", () => {
@@ -26,7 +26,7 @@ describe("mcp-adapter <-> real host daemon", () => {
 
     const bridge = await connectToDaemon(daemon.pipePath);
     const negotiated = await negotiateProtocolVersion(bridge);
-    expect(negotiated.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(negotiated.protocolVersion).toBe(BRIDGE_PROTOCOL_VERSION);
 
     const listResult = (await bridge.request("connections.list")) as { connections: unknown[] };
     expect(listResult.connections).toEqual([]);

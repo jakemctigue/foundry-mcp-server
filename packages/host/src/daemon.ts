@@ -1,6 +1,6 @@
 import path from "node:path";
 import fs from "node:fs";
-import { PROTOCOL_VERSION } from "@foundry-mcp/protocol";
+import { BRIDGE_PROTOCOL_VERSION } from "@foundry-mcp/protocol";
 import { resolveConfig, type HostConfig } from "./config.js";
 import { resolveAppDataDir } from "./paths.js";
 import { createLogger, stderrSink, type Logger } from "./logger.js";
@@ -15,7 +15,7 @@ export interface Daemon {
   db: Database.Database;
   pipe: PipeServerHandle;
   pipePath: string;
-  protocolVersion: typeof PROTOCOL_VERSION;
+  protocolVersion: typeof BRIDGE_PROTOCOL_VERSION;
   shutdown: () => Promise<void>;
 }
 
@@ -27,7 +27,7 @@ export interface StartDaemonOptions {
 function handleBridgeMessage(message: unknown, respond: (response: unknown) => void): void {
   const request = message as { id?: string; method?: string };
   if (request.method === "initialize") {
-    respond({ id: request.id, result: { protocolVersion: PROTOCOL_VERSION } });
+    respond({ id: request.id, result: { protocolVersion: BRIDGE_PROTOCOL_VERSION } });
     return;
   }
   if (request.method === "connections.list") {
@@ -63,7 +63,7 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
     db,
     pipe,
     pipePath,
-    protocolVersion: PROTOCOL_VERSION,
+    protocolVersion: BRIDGE_PROTOCOL_VERSION,
     shutdown: async () => {
       await pipe.close();
       db.close();

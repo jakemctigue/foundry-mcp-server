@@ -1,4 +1,4 @@
-import { PROTOCOL_VERSION } from "@foundry-mcp/protocol";
+import { BRIDGE_PROTOCOL_VERSION } from "@foundry-mcp/protocol";
 
 export interface HelloMessage {
   type: "hello";
@@ -7,9 +7,9 @@ export interface HelloMessage {
 }
 
 export function createHelloMessage(worldId: string): HelloMessage {
-  return { type: "hello", protocolVersion: PROTOCOL_VERSION, worldId };
+  return { type: "hello", protocolVersion: BRIDGE_PROTOCOL_VERSION, worldId };
 }
 
 export function isCompatibleHello(message: HelloMessage): boolean {
-  return message.protocolVersion === PROTOCOL_VERSION;
+  return message.protocolVersion === BRIDGE_PROTOCOL_VERSION;
 }

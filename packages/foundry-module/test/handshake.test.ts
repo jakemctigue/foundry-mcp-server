@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { PROTOCOL_VERSION } from "@foundry-mcp/protocol";
+import { BRIDGE_PROTOCOL_VERSION } from "@foundry-mcp/protocol";
 import { createHelloMessage, isCompatibleHello } from "../src/handshake.js";
 
 describe("module handshake hello message", () => {
   it("stamps the current protocol version", () => {
     const hello = createHelloMessage("world-1");
-    expect(hello.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(hello.protocolVersion).toBe(BRIDGE_PROTOCOL_VERSION);
     expect(hello.worldId).toBe("world-1");
   });
 

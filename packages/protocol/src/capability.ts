@@ -11,7 +11,9 @@ export const CapabilitiesGetInput = z.object({}).strict();
 export type CapabilitiesGetInput = z.infer<typeof CapabilitiesGetInput>;
 
 export const CapabilitiesGetOutput = z.object({
-  protocolVersion: z.string(),
+  mcpProtocolVersion: z.string(),
+  legacyMcpProtocolVersions: z.array(z.string()),
+  bridgeProtocolVersion: z.string(),
   capabilities: z.array(Capability),
 });
 export type CapabilitiesGetOutput = z.infer<typeof CapabilitiesGetOutput>;

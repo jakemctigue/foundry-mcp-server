@@ -1,9 +1,11 @@
 import { z } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
 import {
-  PROTOCOL_VERSION,
-  ConnectionsListOutput,
+  BRIDGE_PROTOCOL_VERSION,
   CapabilitiesGetOutput,
+  ConnectionsListOutput,
+  LEGACY_MCP_PROTOCOL_VERSIONS,
+  MCP_PROTOCOL_VERSION,
   makeError,
   type CapabilitiesGetOutput as CapabilitiesGetOutputData,
 } from "@foundry-mcp/protocol";
@@ -77,12 +79,14 @@ export function createFoundryMcpServer(options: CreateServerOptions): McpServer 
     {
       title: "Get bridge capabilities",
       description:
-        "Returns the negotiated MCP protocol version and the set of capabilities the bridge daemon currently exposes. Read-only, no side effects.",
+        "Returns the MCP wire revisions, private Foundry bridge revision, and capabilities the bridge daemon currently exposes. Read-only, no side effects.",
       inputSchema: {},
     },
     () => {
       const data: CapabilitiesGetOutputData = {
-        protocolVersion: PROTOCOL_VERSION,
+        mcpProtocolVersion: MCP_PROTOCOL_VERSION,
+        legacyMcpProtocolVersions: [...LEGACY_MCP_PROTOCOL_VERSIONS],
+        bridgeProtocolVersion: BRIDGE_PROTOCOL_VERSION,
         capabilities: [
           { name: "documents", version: "0.1.0", readOnly: true },
           { name: "connections", version: "0.1.0", readOnly: true },
@@ -93,7 +97,7 @@ export function createFoundryMcpServer(options: CreateServerOptions): McpServer 
         content: [
           {
             type: "text" as const,
-            text: `Protocol ${parsed.protocolVersion}; ${parsed.capabilities.length.toString()} capabilities available.`,
+            text: `MCP ${parsed.mcpProtocolVersion}; bridge ${parsed.bridgeProtocolVersion}; ${parsed.capabilities.length.toString()} capabilities available.`,
           },
         ],
         structuredContent: parsed,

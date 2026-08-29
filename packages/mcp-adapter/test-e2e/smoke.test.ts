@@ -2,9 +2,8 @@ import { describe, expect, it, afterEach } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { PROTOCOL_VERSION } from "@foundry-mcp/protocol";
+import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
+import { BRIDGE_PROTOCOL_VERSION } from "@foundry-mcp/protocol";
 import { startDaemon, type Daemon } from "@foundry-mcp/host";
 import {
   connectToDaemon,
@@ -41,7 +40,7 @@ describe("end-to-end smoke: adapter boots, lists zero connections", () => {
     // Real mcp-adapter bridge connection over the real named pipe.
     bridge = await connectToDaemon(daemon.pipePath);
     const negotiated = await negotiateProtocolVersion(bridge);
-    expect(negotiated.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(negotiated.protocolVersion).toBe(BRIDGE_PROTOCOL_VERSION);
 
     // Real MCP server wired against the real bridge; MCP client<->server
     // transport is in-memory (equivalent wiring to stdio, no separate process
