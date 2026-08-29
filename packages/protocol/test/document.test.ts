@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  DocumentSourceHash,
   DocumentsCreateInput,
   DocumentsListInput,
   DocumentsSnapshotInput,
@@ -9,6 +10,15 @@ import {
 } from "../src/document.js";
 
 describe("generic document protocol schemas", () => {
+  it("identifies the current versioned SHA-256 document source hash", () => {
+    expect(
+      DocumentSourceHash.safeParse(
+        "fmcp-v2-44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      ).success,
+    ).toBe(true);
+    expect(DocumentSourceHash.safeParse("fmcp-v1-deadbeef").success).toBe(false);
+  });
+
   it("enforces bounded list pages and supplies deterministic defaults", () => {
     const parsed = DocumentsListInput.parse({ type: "Actor" });
     expect(parsed.pageSize).toBe(50);

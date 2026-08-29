@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { MAX_PAGE_SIZE, makeError, type OperationResult } from "@foundry-mcp/protocol";
-import { FoundryDocumentService } from "../src/documents.js";
+import { FoundryDocumentService, sourceHash } from "../src/documents.js";
 import { BrowserFoundryRuntime } from "../src/runtime.js";
 import { FakeFoundryRuntime, FakeRole, createRichFakeRuntime } from "./fake-runtime/index.js";
 
@@ -216,6 +216,33 @@ describe("FoundryDocumentService listing and UUID reads", () => {
 });
 
 describe("FoundryDocumentService generic create and update", () => {
+  it("uses a versioned SHA-256 source hash and requires legacy clients to refresh", async () => {
+    expect(sourceHash({})).toBe(
+      "fmcp-v2-44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    );
+
+    const runtime = createRichFakeRuntime();
+    const actor = runtime.seedDocument("Actor", { name: "Hash fixture", type: "stormborn" });
+    const service = new FoundryDocumentService(runtime);
+    const before = unwrap(await service.get({ uuid: actor.uuid }));
+    expect(before.sourceHash).toMatch(/^fmcp-v2-[0-9a-f]{64}$/);
+
+    expect(
+      await service.update({
+        uuid: actor.uuid,
+        data: { name: "Must refetch" },
+        expectedHash: "fmcp-v1-00000000",
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: {
+        code: "CONFLICT",
+        details: { reason: "hash_algorithm_upgraded", actual: before.sourceHash },
+      },
+    });
+    expect(unwrap(await service.get({ uuid: actor.uuid })).name).toBe("Hash fixture");
+  });
+
   it("creates every discovered Actor/Item subtype, world Items, and Actor embedded Items", async () => {
     const runtime = createRichFakeRuntime();
     const service = new FoundryDocumentService(runtime);
@@ -313,6 +340,75 @@ describe("FoundryDocumentService generic create and update", () => {
     expect(atomic.committed).toBe(false);
     expect(atomic.results[0]?.status).toBe("rolled_back");
     expect(unwrap(await service.list({ type: "Actor" })).items).toHaveLength(before);
+  });
+
+  it("rejects atomic browser batches before any create when transactions are unsupported", async () => {
+    const create = vi.fn(async () => {
+      throw new Error("must not create");
+    });
+    const documentClass = {
+      documentName: "Actor",
+      metadata: { name: "Actor", collection: "actors", schemaVersion: "14" },
+      canUserCreate: () => true,
+      create,
+    };
+    const runtime = new BrowserFoundryRuntime({
+      game: {
+        ready: true,
+        user: { isGM: true },
+        documentTypes: { Actor: ["stellar"] },
+        collections: new Map([
+          ["Actor", { documentName: "Actor", documentClass, contents: [] }],
+        ]),
+        packs: new Map(),
+      },
+      CONFIG: { Actor: { documentClass } },
+    });
+
+    expect(
+      await new FoundryDocumentService(runtime).create({
+        atomic: true,
+        items: [
+          { type: "Actor", data: { name: "Atomic A", type: "stellar" } },
+          { type: "Actor", data: { name: "Atomic B", type: "stellar" } },
+        ],
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { code: "UNSUPPORTED_TYPE", message: expect.stringContaining("Atomic") },
+    });
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("returns structured detail when a supported atomic rollback fails", async () => {
+    const runtime = createRichFakeRuntime();
+    runtime.failCreateOnCall(2);
+    runtime.restoreState = () => {
+      throw new Error("Injected rollback failure");
+    };
+    const service = new FoundryDocumentService(runtime);
+
+    expect(
+      await service.create({
+        atomic: true,
+        items: [
+          { type: "Actor", data: { name: "Atomic A", type: "stormborn" } },
+          { type: "Actor", data: { name: "Atomic B", type: "clockwork" } },
+        ],
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: {
+        code: "FOUNDRY_ERROR",
+        message: "Atomic batch rollback failed",
+        details: {
+          partialSideEffectsPossible: true,
+          createdIndexes: [0],
+          createError: { code: "FOUNDRY_ERROR", message: "Injected create failure" },
+          rollbackError: { code: "FOUNDRY_ERROR", message: "Injected rollback failure" },
+        },
+      },
+    });
   });
 
   it("enforces optimistic hashes, records forced waivers, and preserves unknown fields", async () => {
@@ -528,6 +624,59 @@ describe("FoundryDocumentService embedded and compendium enumeration", () => {
 });
 
 describe("FoundryDocumentService bounded snapshots and complete generic coverage", () => {
+  it("walks every stable query cursor when maxItems exceeds the list page limit", async () => {
+    const runtime = createRichFakeRuntime();
+    const expectedUuids: string[] = [];
+    for (let index = 0; index < 250; index += 1) {
+      expectedUuids.push(
+        runtime.seedDocument("Actor", {
+          name: `Snapshot ${index.toString().padStart(3, "0")}`,
+          type: "stormborn",
+        }).uuid,
+      );
+    }
+    const service = new FoundryDocumentService(runtime);
+    const output = unwrap(
+      await service.snapshot({
+        query: { type: "Actor" },
+        maxDepth: 4,
+        maxItems: 500,
+        maxBytes: 2_000_000,
+      }),
+    );
+    const actualUuids = output.snapshot.map((item) =>
+      item && typeof item === "object" && !Array.isArray(item) ? item.uuid : undefined,
+    );
+
+    expect(actualUuids).toEqual(expectedUuids);
+    expect(output.itemCount).toBe(250);
+    expect(output.truncated).toBe(false);
+    expect(output.truncationReasons).not.toContain("maxItems");
+  });
+
+  it("stops query pagination at maxItems and reports the remaining stable page", async () => {
+    const runtime = createRichFakeRuntime();
+    for (let index = 0; index < 250; index += 1) {
+      runtime.seedDocument("Actor", {
+        name: `Snapshot ${index.toString().padStart(3, "0")}`,
+        type: "stormborn",
+      });
+    }
+    const output = unwrap(
+      await new FoundryDocumentService(runtime).snapshot({
+        query: { type: "Actor" },
+        maxDepth: 4,
+        maxItems: 225,
+        maxBytes: 2_000_000,
+      }),
+    );
+
+    expect(output.snapshot).toHaveLength(225);
+    expect(output.itemCount).toBe(225);
+    expect(output.truncated).toBe(true);
+    expect(output.truncationReasons).toContain("maxItems");
+  });
+
   it("detects UUID cycles, redacts configured paths, and reports each bound", async () => {
     const runtime = createRichFakeRuntime();
     runtime.seedDocument(

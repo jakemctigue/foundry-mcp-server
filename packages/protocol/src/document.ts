@@ -10,6 +10,8 @@ export const MAX_SNAPSHOT_DEPTH = 12;
 export const MAX_SNAPSHOT_BYTES = 2_000_000;
 export const MAX_SNAPSHOT_ITEMS = 500;
 
+export const DocumentSourceHash = z.string().regex(/^fmcp-v2-[0-9a-f]{64}$/);
+
 export type JsonPrimitive = boolean | number | string | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
@@ -90,6 +92,8 @@ export const DocumentSummary = z.object({
   parentUuid: z.string().min(1).optional(),
   packId: z.string().min(1).optional(),
   data: JsonObjectSchema.optional(),
+  // Keep bridge decoding compatible with pre-v2 producers during rolling upgrades.
+  // Current producers validate against DocumentSourceHash and emit fmcp-v2 SHA-256 values.
   sourceHash: z.string().min(1),
   sourceVersion: z.union([z.string(), z.number()]),
 });
