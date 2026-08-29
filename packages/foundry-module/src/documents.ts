@@ -65,6 +65,213 @@ function utf8Length(value: string): number {
   return bytes;
 }
 
+const POISON_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
+const MAX_SNAPSHOT_SOURCE_DEPTH = 64;
+const MAX_SNAPSHOT_WORK_NODES = 50_000;
+const MAX_SNAPSHOT_SOURCE_BYTES = 8_000_000;
+
+interface SnapshotSourceWork {
+  nodes: number;
+  bytes: number;
+}
+
+interface SnapshotCloneBudget {
+  nodes: number;
+  bytes: number;
+  maxBytes: number;
+  reasons: Set<"maxDepth" | "maxBytes" | "maxItems">;
+}
+
+function utf8LengthAtMost(value: string, maximum: number): number | undefined {
+  let bytes = 0;
+  for (const character of value) {
+    const point = character.codePointAt(0) ?? 0;
+    bytes += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+    if (bytes > maximum) return undefined;
+  }
+  return bytes;
+}
+
+function safePathSegments(path: string): string[] {
+  const segments = path
+    .replace(/^\//, "")
+    .split(path.startsWith("/") ? "/" : ".")
+    .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"))
+    .filter(Boolean);
+  const unsafe = segments.find((segment) => POISON_PATH_SEGMENTS.has(segment));
+  if (unsafe) operationError("INVALID_DATA", `Unsafe path segment ${unsafe}`);
+  return segments;
+}
+
+function consumeSourceBytes(work: SnapshotSourceWork, value: string): void {
+  const remaining = MAX_SNAPSHOT_SOURCE_BYTES - work.bytes;
+  const bytes = utf8LengthAtMost(value, remaining);
+  if (bytes === undefined) {
+    operationError("INVALID_DATA", "Snapshot source exceeds the byte safety limit");
+  }
+  work.bytes += bytes;
+}
+
+/**
+ * Iterative, fail-closed preflight over raw Foundry data. It stops before
+ * recursive cloning/UUID expansion can consume unbounded stack, memory, or
+ * accessor work.
+ */
+function assertSnapshotSourceBounded(value: unknown, work: SnapshotSourceWork): void {
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  const seen = new WeakSet<object>();
+  while (stack.length > 0) {
+    const next = stack.pop();
+    if (!next) break;
+    work.nodes += 1;
+    if (work.nodes > MAX_SNAPSHOT_WORK_NODES) {
+      operationError("INVALID_DATA", "Snapshot source exceeds the node safety limit");
+    }
+    if (next.depth > MAX_SNAPSHOT_SOURCE_DEPTH) {
+      operationError("INVALID_DATA", "Snapshot source exceeds the depth safety limit");
+    }
+
+    const current = next.value;
+    if (typeof current === "string") {
+      consumeSourceBytes(work, current);
+      continue;
+    }
+    if (typeof current === "number" || typeof current === "bigint") {
+      consumeSourceBytes(work, String(current));
+      continue;
+    }
+    if (current instanceof Date) {
+      consumeSourceBytes(work, current.toISOString());
+      continue;
+    }
+    if (current === null || typeof current !== "object") continue;
+    if (seen.has(current)) continue;
+    seen.add(current);
+
+    if (Array.isArray(current)) {
+      if (current.length + work.nodes + stack.length > MAX_SNAPSHOT_WORK_NODES) {
+        operationError("INVALID_DATA", "Snapshot source exceeds the node safety limit");
+      }
+      for (let index = 0; index < current.length; index += 1) {
+        if (Object.hasOwn(current, index)) {
+          stack.push({ value: current[index], depth: next.depth + 1 });
+        }
+      }
+      continue;
+    }
+
+    for (const key in current) {
+      if (!Object.hasOwn(current, key)) continue;
+      if (POISON_PATH_SEGMENTS.has(key)) {
+        operationError("INVALID_DATA", `Snapshot source contains unsafe key ${key}`);
+      }
+      consumeSourceBytes(work, key);
+      if (work.nodes + stack.length >= MAX_SNAPSHOT_WORK_NODES) {
+        operationError("INVALID_DATA", "Snapshot source exceeds the node safety limit");
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (!descriptor) continue;
+      if (descriptor.get || descriptor.set) {
+        operationError("INVALID_DATA", "Snapshot source contains an accessor property");
+      }
+      stack.push({ value: descriptor.value, depth: next.depth + 1 });
+    }
+  }
+}
+
+function reserveSnapshotBytes(budget: SnapshotCloneBudget, value: string): boolean {
+  const remaining = budget.maxBytes - budget.bytes;
+  const bytes = utf8LengthAtMost(value, remaining);
+  if (bytes === undefined) {
+    budget.reasons.add("maxBytes");
+    return false;
+  }
+  budget.bytes += bytes;
+  return true;
+}
+
+function cloneSnapshotValue(
+  value: unknown,
+  budget: SnapshotCloneBudget,
+  depth: number,
+  maxDepth: number,
+  seen = new WeakSet<object>(),
+): JsonValue | undefined {
+  budget.nodes += 1;
+  if (budget.nodes > MAX_SNAPSHOT_WORK_NODES) {
+    operationError("INVALID_DATA", "Snapshot expansion exceeds the node safety limit");
+  }
+  if (value === null || typeof value === "boolean") {
+    reserveSnapshotBytes(budget, String(value));
+    return value;
+  }
+  if (typeof value === "string") {
+    return reserveSnapshotBytes(budget, value) ? value : "[Truncated:maxBytes]";
+  }
+  if (typeof value === "number") {
+    const normalized = Number.isFinite(value) ? value : String(value);
+    reserveSnapshotBytes(budget, String(normalized));
+    return normalized;
+  }
+  if (typeof value === "bigint") {
+    const normalized = value.toString();
+    reserveSnapshotBytes(budget, normalized);
+    return normalized;
+  }
+  if (typeof value === "undefined" || typeof value === "function" || typeof value === "symbol") {
+    return undefined;
+  }
+  if (value instanceof Date) {
+    const normalized = value.toISOString();
+    return reserveSnapshotBytes(budget, normalized) ? normalized : "[Truncated:maxBytes]";
+  }
+  if (depth >= maxDepth) {
+    budget.reasons.add("maxDepth");
+    return { $truncated: "maxDepth" };
+  }
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const output: JsonValue[] = [];
+      for (let index = 0; index < value.length; index += 1) {
+        if (!Object.hasOwn(value, index)) continue;
+        if (budget.bytes >= budget.maxBytes) {
+          budget.reasons.add("maxBytes");
+          output.push("[Truncated:maxBytes]");
+          break;
+        }
+        const cloned = cloneSnapshotValue(value[index], budget, depth + 1, maxDepth, seen);
+        if (cloned !== undefined) output.push(cloned);
+      }
+      return output;
+    }
+
+    const output = Object.create(null) as JsonObject;
+    for (const key in value) {
+      if (!Object.hasOwn(value, key)) continue;
+      if (POISON_PATH_SEGMENTS.has(key)) {
+        operationError("INVALID_DATA", `Snapshot source contains unsafe key ${key}`);
+      }
+      if (!reserveSnapshotBytes(budget, key)) {
+        output.$truncated = "maxBytes";
+        break;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor) continue;
+      const cloned = cloneSnapshotValue(descriptor.value, budget, depth + 1, maxDepth, seen);
+      if (cloned !== undefined) output[key] = cloned;
+      if (budget.bytes >= budget.maxBytes) {
+        budget.reasons.add("maxBytes");
+        break;
+      }
+    }
+    return output;
+  } finally {
+    seen.delete(value);
+  }
+}
+
 function cloneJsonValue(value: unknown, seen = new WeakSet<object>()): JsonValue | undefined {
   if (value === null || typeof value === "string" || typeof value === "boolean") return value;
   if (typeof value === "number") return Number.isFinite(value) ? value : String(value);
@@ -85,6 +292,7 @@ function cloneJsonValue(value: unknown, seen = new WeakSet<object>()): JsonValue
   }
   const output: Record<string, JsonValue> = {};
   for (const [key, entry] of Object.entries(value)) {
+    if (POISON_PATH_SEGMENTS.has(key)) continue;
     const cloned = cloneJsonValue(entry, seen);
     if (cloned !== undefined) output[key] = cloned;
   }
@@ -166,8 +374,9 @@ function decodeCursor(value: string | undefined, expectedKind: string): CursorVa
 
 function getPath(source: JsonObject, path: string): JsonValue | undefined {
   let current: JsonValue = source;
-  for (const segment of path.split(".").filter(Boolean)) {
+  for (const segment of safePathSegments(path)) {
     if (!current || typeof current !== "object" || Array.isArray(current)) return undefined;
+    if (!Object.hasOwn(current, segment)) return undefined;
     const next: JsonValue | undefined = current[segment];
     if (next === undefined) return undefined;
     current = next;
@@ -176,12 +385,14 @@ function getPath(source: JsonObject, path: string): JsonValue | undefined {
 }
 
 function setPath(target: JsonObject, path: string, value: JsonValue): void {
-  const segments = path.split(".").filter(Boolean);
+  const segments = safePathSegments(path);
   if (segments.length === 0) return;
   let current = target;
   for (const segment of segments.slice(0, -1)) {
-    const existing = current[segment];
-    if (!existing || typeof existing !== "object" || Array.isArray(existing)) current[segment] = {};
+    const existing = Object.hasOwn(current, segment) ? current[segment] : undefined;
+    if (!existing || typeof existing !== "object" || Array.isArray(existing)) {
+      current[segment] = Object.create(null) as JsonObject;
+    }
     current = current[segment] as JsonObject;
   }
   const last = segments.at(-1);
@@ -190,7 +401,7 @@ function setPath(target: JsonObject, path: string, value: JsonValue): void {
 
 function projectedData(data: JsonObject, fields: string[] | undefined): JsonObject | undefined {
   if (!fields) return undefined;
-  const projected: JsonObject = {};
+  const projected = Object.create(null) as JsonObject;
   for (const field of fields) {
     const value = getPath(data, field);
     if (value !== undefined) setPath(projected, field, value);
@@ -422,6 +633,12 @@ export class FoundryDocumentService {
           "PERMISSION_DENIED",
           permission.reason ?? "The connected user cannot update this Document",
         );
+      if (document.pack) {
+        const pack = await this.runtime.getCompendium(document.pack);
+        if (!pack || !pack.accessible || pack.locked) {
+          operationError("PERMISSION_DENIED", "The containing compendium is not writable");
+        }
+      }
       const before = cloneJsonObject(document.toObject());
       const actualHash = sourceHash(before);
       const actualVersion = sourceVersion(document, before);
@@ -516,7 +733,7 @@ export class FoundryDocumentService {
       this.#parse(CompendiumsListInput, input);
       this.#guard(options);
       const packs = (await this.runtime.listCompendiums())
-        .filter((pack) => pack.accessible && !pack.locked)
+        .filter((pack) => pack.accessible)
         .map((pack) => ({
           id: pack.id,
           label: pack.label,
@@ -538,7 +755,7 @@ export class FoundryDocumentService {
       this.#guard(options);
       const pack = await this.runtime.getCompendium(parsed.packId);
       if (!pack) operationError("NOT_FOUND", `Compendium ${parsed.packId} was not found`);
-      if (!pack.accessible || pack.locked)
+      if (!pack.accessible)
         operationError("PERMISSION_DENIED", `Compendium ${parsed.packId} is not accessible`);
       const cursorKind = `compendium:${parsed.packId}:${parsed.hydrate ? "hydrated" : "index"}`;
       const cursor = decodeCursor(parsed.cursor, cursorKind);
@@ -562,7 +779,10 @@ export class FoundryDocumentService {
         const output: CompendiumDocumentsListOutput = {
           packId: pack.id,
           hydrated: true,
-          items: page.map((document) => this.#view(document)),
+          items: page.map((document) => ({
+            ...this.#view(document),
+            pack: { id: pack.id, label: pack.label, locked: pack.locked },
+          })),
         };
         const last = page.at(-1);
         if (last && after.length > page.length) {
@@ -621,6 +841,13 @@ export class FoundryDocumentService {
       const reasons = new Set<"maxDepth" | "maxBytes" | "maxItems">();
       const redactedPaths: string[] = [];
       const state = { itemCount: 0 };
+      const sourceWork: SnapshotSourceWork = { nodes: 0, bytes: 0 };
+      const cloneBudget: SnapshotCloneBudget = {
+        nodes: 0,
+        bytes: 0,
+        maxBytes: parsed.maxBytes,
+        reasons,
+      };
       const redactions = [...this.defaultRedactionPaths, ...parsed.redactionPaths];
       const snapshot: JsonValue[] = [];
       for (const uuid of uuids) {
@@ -640,6 +867,8 @@ export class FoundryDocumentService {
             reasons,
             redactions,
             redactedPaths,
+            sourceWork,
+            cloneBudget,
           ),
         );
       }
@@ -655,6 +884,10 @@ export class FoundryDocumentService {
           const uuid = typeof first.uuid === "string" ? first.uuid : "unknown";
           snapshot[0] = { uuid, $truncated: "maxBytes" };
           byteCount = utf8Length(JSON.stringify(snapshot));
+          if (byteCount > parsed.maxBytes) {
+            snapshot[0] = { $truncated: "maxBytes" };
+            byteCount = utf8Length(JSON.stringify(snapshot));
+          }
         }
       }
       return {
@@ -856,17 +1089,13 @@ export class FoundryDocumentService {
 
   #redact(data: JsonObject, paths: readonly string[], uuid: string, reported: string[]): void {
     for (const configuredPath of paths) {
-      const segments = configuredPath
-        .replace(/^\//, "")
-        .split(configuredPath.startsWith("/") ? "/" : ".")
-        .map((segment) => segment.replace(/~1/g, "/").replace(/~0/g, "~"))
-        .filter(Boolean);
+      const segments = safePathSegments(configuredPath);
       if (segments.length === 0) continue;
       let current: JsonObject = data;
       for (const segment of segments.slice(0, -1)) {
-        const child = current[segment];
+        const child = Object.hasOwn(current, segment) ? current[segment] : undefined;
         if (!child || typeof child !== "object" || Array.isArray(child)) {
-          current = {};
+          current = Object.create(null) as JsonObject;
           break;
         }
         current = child;
@@ -889,6 +1118,8 @@ export class FoundryDocumentService {
     reasons: Set<"maxDepth" | "maxBytes" | "maxItems">,
     redactions: readonly string[],
     redactedPaths: string[],
+    sourceWork: SnapshotSourceWork,
+    cloneBudget: SnapshotCloneBudget,
   ): Promise<JsonValue> {
     if (ancestry.has(uuid)) return { $ref: uuid, $cycle: true };
     if (depth >= maxDepth) {
@@ -902,7 +1133,13 @@ export class FoundryDocumentService {
     const document = await this.#resolve(uuid);
     if (!this.runtime.canRead(document)) return { $ref: uuid, $redacted: "permission" };
     state.itemCount += 1;
-    const data = cloneJsonObject(document.toObject());
+    const source = document.toObject();
+    assertSnapshotSourceBounded(source, sourceWork);
+    const cloned = cloneSnapshotValue(source, cloneBudget, depth, maxDepth);
+    const data =
+      cloned && typeof cloned === "object" && !Array.isArray(cloned)
+        ? cloned
+        : (Object.create(null) as JsonObject);
     this.#redact(data, redactions, uuid, redactedPaths);
     const nextAncestry = new Set(ancestry).add(uuid);
     const expandValue = async (value: JsonValue, currentDepth: number): Promise<JsonValue> => {
@@ -924,18 +1161,29 @@ export class FoundryDocumentService {
               reasons,
               redactions,
               redactedPaths,
+              sourceWork,
+              cloneBudget,
             ),
           };
         } catch {
           return value;
         }
       }
-      if (Array.isArray(value))
-        return Promise.all(value.map((entry) => expandValue(entry, currentDepth)));
+      if (Array.isArray(value)) {
+        if (currentDepth >= maxDepth) {
+          reasons.add("maxDepth");
+          return { $truncated: "maxDepth" };
+        }
+        return Promise.all(value.map((entry) => expandValue(entry, currentDepth + 1)));
+      }
       if (value && typeof value === "object") {
-        const output: JsonObject = {};
+        if (currentDepth >= maxDepth) {
+          reasons.add("maxDepth");
+          return { $truncated: "maxDepth" };
+        }
+        const output = Object.create(null) as JsonObject;
         for (const [key, entry] of Object.entries(value))
-          output[key] = await expandValue(entry, currentDepth);
+          output[key] = await expandValue(entry, currentDepth + 1);
         return output;
       }
       return value;

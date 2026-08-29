@@ -48,6 +48,34 @@ export async function connectToDaemon(pipePath: string): Promise<BridgeConnectio
   };
 }
 
+export interface NegotiatedBridgeDependencies {
+  connect?: (pipePath: string) => Promise<BridgeConnection>;
+  negotiate?: (bridge: BridgeConnection) => Promise<InitializeResult>;
+}
+
+/** Opens and negotiates a real daemon bridge, closing it on any handshake failure. */
+export async function connectNegotiatedBridge(
+  pipePath: string,
+  dependencies: NegotiatedBridgeDependencies = {},
+): Promise<BridgeConnection> {
+  const bridge = await (dependencies.connect ?? connectToDaemon)(pipePath);
+  try {
+    await (dependencies.negotiate ?? negotiateProtocolVersion)(bridge);
+    return bridge;
+  } catch (error) {
+    try {
+      await bridge.close();
+    } catch (closeError) {
+      throw new AggregateError(
+        [error, closeError],
+        "Bridge negotiation failed and the connection could not be closed",
+        { cause: closeError },
+      );
+    }
+    throw error;
+  }
+}
+
 /** In-memory stub used when no real daemon connection is configured yet. */
 export function createStubBridgeConnection(): BridgeConnection {
   return {

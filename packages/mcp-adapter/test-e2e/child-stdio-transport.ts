@@ -1,4 +1,13 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import {
+  resolveAppDataDir,
+  startDaemon,
+  type Daemon,
+  type PlatformEnv,
+} from "@foundry-mcp/host";
 import {
   parseJSONRPCMessage,
   serializeMessage,
@@ -25,6 +34,8 @@ export class CapturingChildStdioTransport implements Transport {
   readonly stderrChunks: string[] = [];
 
   private child: ChildProcessWithoutNullStreams | undefined;
+  private daemon: Daemon | undefined;
+  private tempRoot: string | undefined;
   private buffer = "";
   private exitResult: ChildExit | undefined;
   private readonly exitPromise: Promise<ChildExit>;
@@ -46,26 +57,52 @@ export class CapturingChildStdioTransport implements Transport {
   async start(): Promise<void> {
     if (this.child) throw new Error("child stdio transport already started");
 
-    const child = spawn(process.execPath, [this.entry], {
-      cwd: this.cwd,
-      env: process.env,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    this.child = child;
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "fmcp-adapter-child-"));
+    this.tempRoot = tempRoot;
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (process.platform === "win32") {
+      env["LOCALAPPDATA"] = tempRoot;
+    } else {
+      env["XDG_DATA_HOME"] = tempRoot;
+    }
+    const pipeName = path.basename(tempRoot);
+    env["FOUNDRY_MCP_PIPE_NAME"] = pipeName;
+    const platformEnv: PlatformEnv = {
+      platform: process.platform,
+      env,
+      homedir: () => tempRoot,
+    };
+    try {
+      const appDataDir = resolveAppDataDir(platformEnv);
+      this.daemon = await startDaemon({
+        appDataDir,
+        cliConfig: { dbPath: "child-e2e.db", pipeName },
+      });
 
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => this.consumeStdout(chunk));
-    child.stdout.on("end", () => this.flushStdout());
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => this.stderrChunks.push(chunk));
-    child.once("error", (error) => this.reportError(error));
-    child.once("close", (code, signal) => {
-      const result = { code, signal };
-      this.exitResult = result;
-      this.resolveExit(result);
-      this.onclose?.();
-    });
+      const child = spawn(process.execPath, [this.entry], {
+        cwd: this.cwd,
+        env,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      this.child = child;
+
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk: string) => this.consumeStdout(chunk));
+      child.stdout.on("end", () => this.flushStdout());
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk: string) => this.stderrChunks.push(chunk));
+      child.once("error", (error) => this.reportError(error));
+      child.once("close", (code, signal) => {
+        const result = { code, signal };
+        this.exitResult = result;
+        this.resolveExit(result);
+        this.onclose?.();
+      });
+    } catch (error) {
+      await this.cleanupDaemon();
+      throw error;
+    }
   }
 
   async send(message: JSONRPCMessage): Promise<void> {
@@ -82,15 +119,19 @@ export class CapturingChildStdioTransport implements Transport {
 
   async close(): Promise<void> {
     const child = this.child;
-    if (!child || this.exitResult) return;
-
-    child.stdin.end();
     try {
-      await this.waitForExit(5000);
-    } catch (error) {
-      child.kill();
-      await this.exitPromise;
-      throw error;
+      if (child && !this.exitResult) {
+        child.stdin.end();
+        try {
+          await this.waitForExit(5000);
+        } catch (error) {
+          child.kill();
+          await this.exitPromise;
+          throw error;
+        }
+      }
+    } finally {
+      await this.cleanupDaemon();
     }
   }
 
@@ -146,5 +187,25 @@ export class CapturingChildStdioTransport implements Transport {
 
   private reportError(error: Error): void {
     this.onerror?.(error);
+  }
+
+  private async cleanupDaemon(): Promise<void> {
+    const daemon = this.daemon;
+    const tempRoot = this.tempRoot;
+    this.daemon = undefined;
+    this.tempRoot = undefined;
+    const resolvedRoot = tempRoot ? path.resolve(tempRoot) : undefined;
+    const resolvedTemp = path.resolve(os.tmpdir());
+    const safeToDelete = resolvedRoot?.startsWith(`${resolvedTemp}${path.sep}`) ?? false;
+    try {
+      await daemon?.shutdown();
+    } finally {
+      if (resolvedRoot && safeToDelete) {
+        fs.rmSync(resolvedRoot, { recursive: true, force: true });
+      }
+    }
+    if (resolvedRoot && !safeToDelete) {
+      throw new Error("refusing to remove child-test data outside the temp directory");
+    }
   }
 }

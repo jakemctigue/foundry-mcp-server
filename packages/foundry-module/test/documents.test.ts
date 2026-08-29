@@ -443,7 +443,7 @@ describe("FoundryDocumentService embedded and compendium enumeration", () => {
     });
   });
 
-  it("lists accessible Actor/Item packs and switches between index and hydrated output", async () => {
+  it("lists readable locked packs while preserving their write lock", async () => {
     const runtime = createRichFakeRuntime()
       .addCompendium({
         id: "world.actors",
@@ -472,8 +472,12 @@ describe("FoundryDocumentService embedded and compendium enumeration", () => {
       });
     const service = new FoundryDocumentService(runtime);
     const packs = unwrap(await service.compendiumsList()).packs;
-    expect(packs.map((pack) => pack.id)).toEqual(["world.actors", "world.items"]);
-    expect(packs.map((pack) => pack.documentCount)).toEqual([2, 2]);
+    expect(packs.map((pack) => pack.id)).toEqual([
+      "world.actors",
+      "world.items",
+      "world.locked",
+    ]);
+    expect(packs.map((pack) => pack.documentCount)).toEqual([2, 2, 1]);
 
     const index = unwrap(
       await service.compendiumDocumentsList({
@@ -491,12 +495,28 @@ describe("FoundryDocumentService embedded and compendium enumeration", () => {
     );
     expect(hydrated.items).toHaveLength(2);
     expect(hydrated.items[0]).toHaveProperty("data.system.packed");
-    expect(
+    const locked = unwrap(
       await service.compendiumDocumentsList({ packId: "world.locked", hydrate: true }),
-    ).toMatchObject({
-      ok: false,
-      error: { code: "PERMISSION_DENIED" },
+    );
+    expect(locked.items).toHaveLength(1);
+    const lockedDocument = locked.items[0];
+    expect(lockedDocument).toBeDefined();
+    if (!lockedDocument || !("sourceHash" in lockedDocument)) {
+      throw new Error("Expected the hydrated locked pack fixture");
+    }
+    expect(lockedDocument.pack).toEqual({
+      id: "world.locked",
+      label: "Locked",
+      locked: true,
     });
+    expect(
+      await service.update({
+        uuid: lockedDocument.uuid,
+        data: { name: "Must remain hidden" },
+        expectedHash: lockedDocument.sourceHash,
+      }),
+    ).toMatchObject({ ok: false, error: { code: "PERMISSION_DENIED" } });
+    expect(unwrap(await service.get({ uuid: lockedDocument.uuid })).name).toBe("Hidden");
     expect(
       await service.create({
         type: "Actor",
@@ -551,6 +571,69 @@ describe("FoundryDocumentService bounded snapshots and complete generic coverage
     );
     expect(bytes.truncationReasons).toContain("maxBytes");
     expect(bytes.byteCount).toBeLessThanOrEqual(256);
+  });
+
+  it("rejects poison redaction paths without mutating global prototypes", async () => {
+    const runtime = createRichFakeRuntime();
+    const actor = runtime.seedDocument("Actor", {
+      name: "Prototype fixture",
+      type: "stormborn",
+    });
+    const service = new FoundryDocumentService(runtime);
+    const originalToString = Object.prototype.toString;
+
+    expect(
+      await service.snapshot({
+        uuids: [actor.uuid],
+        maxDepth: 6,
+        maxItems: 10,
+        maxBytes: 10_000,
+        redactionPaths: ["/__proto__/toString"],
+      }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+    expect(Object.prototype.toString).toBe(originalToString);
+  });
+
+  it("rejects deeply nested and huge source graphs before recursive expansion", async () => {
+    const runtime = createRichFakeRuntime();
+    const actor = runtime.seedDocument("Actor", {
+      name: "Bound fixture",
+      type: "stormborn",
+    });
+    const service = new FoundryDocumentService(runtime);
+
+    const deep: Record<string, unknown> = {};
+    let cursor = deep;
+    for (let depth = 0; depth < 70; depth += 1) {
+      const next: Record<string, unknown> = {};
+      cursor["next"] = next;
+      cursor = next;
+    }
+    actor.toObject = () => deep as never;
+    expect(
+      await service.snapshot({
+        uuids: [actor.uuid],
+        maxDepth: 12,
+        maxItems: 10,
+        maxBytes: 10_000,
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_DATA", message: expect.stringContaining("depth safety limit") },
+    });
+
+    actor.toObject = () => ({ values: new Array(50_001).fill(0) }) as never;
+    expect(
+      await service.snapshot({
+        uuids: [actor.uuid],
+        maxDepth: 12,
+        maxItems: 10,
+        maxBytes: 10_000,
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_DATA", message: expect.stringContaining("node safety limit") },
+    });
   });
 
   it("uses the same generic path for scenes, tables, playlists, cards, and macros", async () => {

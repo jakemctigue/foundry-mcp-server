@@ -1,24 +1,28 @@
 #!/usr/bin/env node
 import { serveStdio, type StdioServerHandle } from "@modelcontextprotocol/server/stdio";
-import { resolvePipePath, defaultUserIdentifier, resolveAppDataDir } from "@foundry-mcp/host";
 import {
-  connectToDaemon,
-  createStubBridgeConnection,
-  negotiateProtocolVersion,
+  DEFAULT_CONFIG,
+  defaultUserIdentifier,
+  resolveAppDataDir,
+  resolveConfig,
+  resolvePipePath,
+} from "@foundry-mcp/host";
+import {
+  connectNegotiatedBridge,
   type BridgeConnection,
 } from "./bridge-connection.js";
 import { createFoundryMcpServer } from "./server.js";
 
 async function resolveBridge(): Promise<BridgeConnection> {
   const appDataDir = resolveAppDataDir();
-  const pipePath = resolvePipePath(defaultUserIdentifier(), appDataDir);
-  try {
-    const bridge = await connectToDaemon(pipePath);
-    await negotiateProtocolVersion(bridge);
-    return bridge;
-  } catch {
-    return createStubBridgeConnection();
-  }
+  const config = resolveConfig({}, process.env);
+  const userIdentifier = defaultUserIdentifier();
+  const pipeIdentifier =
+    config.pipeName === DEFAULT_CONFIG.pipeName
+      ? userIdentifier
+      : `${userIdentifier}:${config.pipeName}`;
+  const pipePath = resolvePipePath(pipeIdentifier, appDataDir);
+  return connectNegotiatedBridge(pipePath);
 }
 
 async function main(): Promise<void> {
