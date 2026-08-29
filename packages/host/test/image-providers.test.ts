@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { inspectImageBytes, type ImageGenerationOptions } from "@foundry-mcp/protocol";
 import type { Logger } from "../src/logger.js";
@@ -49,6 +49,27 @@ describe("deterministic image provider", () => {
 });
 
 describe("OpenAI Images provider", () => {
+  it("refuses to send bearer credentials anywhere except the official HTTPS endpoint", () => {
+    const fetchMock: ImagesFetch = vi.fn(() => Promise.reject(new Error("must not fetch")));
+    for (const endpoint of [
+      "http://api.openai.com/v1/images/generations",
+      "https://evil.example/v1/images/generations",
+      "https://api.openai.com/v1/images/generations?forward=evil",
+      "https://user:password@api.openai.com/v1/images/generations",
+      "https://api.openai.com/v1/other",
+    ]) {
+      expect(
+        () =>
+          new OpenAiImagesProvider({
+            apiKey: "sk-must-not-leak",
+            endpoint,
+            fetch: fetchMock,
+          }),
+      ).toThrow(/official HTTPS Images endpoint/);
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("uses host secret storage, shapes the official Images API request, and returns base64 image bytes", async () => {
     const secrets = new MemorySecrets();
     await saveOpenAiImagesApiKey(secrets, "sk-test-provider-secret");

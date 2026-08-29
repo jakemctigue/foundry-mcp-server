@@ -232,6 +232,8 @@ interface PreparedUpload {
   collision: "created" | "renamed" | "overwritten";
 }
 
+type UploadCompensation = { kind: "delete" } | { kind: "restore"; snapshot: unknown };
+
 export class FoundryAssetService {
   readonly #maxImageBytes: number;
   readonly #maxImagePixels: number;
@@ -439,10 +441,21 @@ export class FoundryAssetService {
         assetPath = prepared.targetPath;
       }
 
-      const assetSnapshot =
-        prepared && this.assets.snapshotState ? await this.assets.snapshotState() : undefined;
+      const compensation = prepared ? await this.#prepareCompensation(prepared) : undefined;
       let uploaded: AssetsImagesUploadOutput | undefined;
+      let documentCommitted = false;
       try {
+        await this.documentRuntime.audit({
+          action: "asset.image.attach",
+          uuid: parsed.data.documentUuid,
+          details: {
+            phase: "attempt",
+            fieldPath: parsed.data.fieldPath,
+            assetPath,
+            source: sourceId,
+            uploaded: prepared !== undefined,
+          },
+        });
         if (prepared) {
           uploaded = await this.#commitUpload(prepared);
           assetPath = uploaded.assetPath;
@@ -453,16 +466,7 @@ export class FoundryAssetService {
           expectedHash: before.value.sourceHash,
         });
         if (!updated.ok) throw new AssetOperationError(updated.error);
-        await this.documentRuntime.audit({
-          action: "asset.image.attach",
-          uuid: parsed.data.documentUuid,
-          details: {
-            fieldPath: parsed.data.fieldPath,
-            assetPath,
-            source: sourceId,
-            uploaded: uploaded !== undefined,
-          },
-        });
+        documentCommitted = true;
         return {
           documentUuid: parsed.data.documentUuid,
           fieldPath: parsed.data.fieldPath,
@@ -471,13 +475,91 @@ export class FoundryAssetService {
           document: updated.value.document.data,
         };
       } catch (error) {
-        if (prepared && assetSnapshot !== undefined && this.assets.restoreState)
-          await this.assets.restoreState(assetSnapshot);
-        else if (prepared && uploaded?.collision === "created" && this.assets.delete)
-          await this.assets.delete(sourceId, assetPath);
+        if (prepared && compensation && !documentCommitted) {
+          try {
+            await this.#compensateUpload(prepared, uploaded, compensation);
+          } catch (rollbackError) {
+            operationError("FOUNDRY_ERROR", "Image attachment and its asset rollback both failed", {
+              attachError: error instanceof Error ? error.message : String(error),
+              rollbackError:
+                rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+            });
+          }
+        }
         throw error;
       }
     });
+  }
+
+  async #prepareCompensation(prepared: PreparedUpload): Promise<UploadCompensation> {
+    if (prepared.collision === "overwritten") {
+      if (!this.assets.snapshotState || !this.assets.restoreState)
+        operationError(
+          "FOUNDRY_ERROR",
+          "Atomic overwrite attachment is unavailable; upload first, then attach by reference",
+        );
+      return { kind: "restore", snapshot: await this.assets.snapshotState() };
+    }
+    if (!this.assets.delete)
+      operationError(
+        "FOUNDRY_ERROR",
+        "Atomic upload attachment is unavailable; upload first, then attach by reference",
+      );
+    if (await this.#assetIsReferenced(prepared.targetPath))
+      operationError(
+        "CONFLICT",
+        `Asset path ${prepared.targetPath} is already referenced and cannot be safely compensated`,
+      );
+    return { kind: "delete" };
+  }
+
+  async #compensateUpload(
+    prepared: PreparedUpload,
+    uploaded: AssetsImagesUploadOutput | undefined,
+    compensation: UploadCompensation,
+  ): Promise<void> {
+    if (compensation.kind === "restore") {
+      const restoreState = this.assets.restoreState;
+      if (!restoreState) throw new Error("Asset restore capability disappeared during rollback");
+      await restoreState.call(this.assets, compensation.snapshot);
+      return;
+    }
+    const path = uploaded?.assetPath ?? prepared.targetPath;
+    if (!(await this.assets.exists(prepared.sourceId, path))) return;
+    // A different operation may have begun referencing the just-created path.
+    // Preserve it rather than turning a failed attachment into broken content.
+    if (await this.#assetIsReferenced(path)) return;
+    const deleteAsset = this.assets.delete;
+    if (!deleteAsset) throw new Error("Asset delete capability disappeared during rollback");
+    await deleteAsset.call(this.assets, prepared.sourceId, path);
+  }
+
+  async #assetIsReferenced(assetPath: string): Promise<boolean> {
+    const normalized = normalizedRuntimePath(assetPath);
+    const types = await this.documents.types({});
+    if (!types.ok)
+      operationError("FOUNDRY_ERROR", "Could not enumerate Document types before compensation", {
+        cause: types.error,
+      });
+    for (const type of types.value.types) {
+      if (type.embedded) continue;
+      // An unreadable root type means absence of references cannot be proven.
+      if (!type.readable) return true;
+      const found = await this.referencesFind({ query: { type: type.type } });
+      if (!found.ok)
+        operationError("FOUNDRY_ERROR", "Could not verify asset references before compensation", {
+          type: type.type,
+          cause: found.error,
+        });
+      if (
+        found.value.references.some((reference) => {
+          const referencedPath = reference.imagePath.split(/[?#]/, 1)[0] ?? "";
+          return normalizedRuntimePath(referencedPath) === normalized;
+        })
+      )
+        return true;
+    }
+    return false;
   }
 
   async #urlSource(url: string): Promise<AssetUploadSource> {

@@ -28,4 +28,17 @@ describe("local image loader", () => {
       "outside configured roots",
     );
   });
+
+  it("rejects a symlink or Windows junction that escapes an allowed root", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "foundry-mcp-image-root-"));
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "foundry-mcp-image-outside-"));
+    temporaryDirectories.push(directory, outside);
+    const image = await new DeterministicImageProvider().generate("junction escape fixture");
+    await fs.writeFile(path.join(outside, "escaped.png"), image.bytes);
+    const link = path.join(directory, "linked");
+    await fs.symlink(outside, link, process.platform === "win32" ? "junction" : "dir");
+
+    const load = createLocalImageLoader({ allowedRoots: [directory] });
+    await expect(load(path.join(link, "escaped.png"))).rejects.toThrow(/symbolic link|junction/);
+  });
 });

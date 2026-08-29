@@ -47,8 +47,15 @@ describe("SSRF-safe image URL import", () => {
       "::1",
       "fe80::1",
       "fd00::1",
+      "::ffff:127.0.0.1",
+      "::ffff:7f00:1",
+      "::7f00:1",
+      "64:ff9b::7f00:1",
+      "2002:7f00:1::",
+      "2001:db8::1",
     ])
       expect(isPublicNetworkAddress(address)).toBe(false);
+    expect(isPublicNetworkAddress("::ffff:5db8:d822")).toBe(true);
   });
 
   it("blocks loopback, link-local, private DNS answers, and credential-bearing URLs before fetch", async () => {

@@ -180,6 +180,168 @@ describe("FoundrySessionService", () => {
     expect(external.document.data.flags).toHaveProperty("anotherModule.untouched", true);
   });
 
+  it("serializes duplicate starts and appends across service instances sharing one runtime", async () => {
+    const runtime = createRichFakeRuntime();
+    const documentsA = new FoundryDocumentService(runtime);
+    const documentsB = new FoundryDocumentService(runtime);
+    let idsCreated = 0;
+    const options = {
+      now: () => new Date("2026-08-29T14:00:00.000Z"),
+      idFactory: () => `concurrent-${(++idsCreated).toString()}`,
+    };
+    const sessionsA = new FoundrySessionService(documentsA, options);
+    const sessionsB = new FoundrySessionService(documentsB, options);
+    const startInput = {
+      title: "Concurrent Session",
+      purpose: "Prove idempotency",
+      idempotencyKey: "concurrent-start-key",
+    };
+
+    const [firstStart, secondStart] = await Promise.all([
+      sessionsA.start(startInput),
+      sessionsB.start(startInput),
+    ]);
+    const first = unwrap(firstStart);
+    const second = unwrap(secondStart);
+    expect(second.journal.uuid).toBe(first.journal.uuid);
+    expect(second.page.uuid).toBe(first.page.uuid);
+    expect(idsCreated).toBe(1);
+    expect(unwrap(await documentsA.list({ type: "JournalEntry" })).items).toHaveLength(1);
+    expect(unwrap(await documentsA.list({ type: "Folder" })).items).toHaveLength(1);
+
+    const appendInput = {
+      sessionId: first.session.sessionId,
+      kind: "note" as const,
+      html: "Exactly once",
+      attribution: "GM",
+      idempotencyKey: "concurrent-append-key",
+    };
+    const [firstAppend, secondAppend] = await Promise.all([
+      sessionsA.append(appendInput),
+      sessionsB.append(appendInput),
+    ]);
+    expect(unwrap(secondAppend).page.uuid).toBe(unwrap(firstAppend).page.uuid);
+    expect(
+      unwrap(
+        await documentsA.embeddedList({
+          parentUuid: first.journal.uuid,
+          embeddedType: "JournalEntryPage",
+          maxDepth: 1,
+        }),
+      ).items,
+    ).toHaveLength(2);
+  });
+
+  it("repairs pending journal and page UUIDs plus an incomplete append on retry", async () => {
+    const runtime = createRichFakeRuntime();
+    const documents = new FoundryDocumentService(runtime);
+    const startedAt = "2026-08-29T15:00:00.000Z";
+    const journal = runtime.seedDocument("JournalEntry", {
+      name: "Recoverable Session",
+      flags: {
+        foundryMcp: {
+          session: {
+            sessionId: "recoverable-session",
+            journalUuid: "pending",
+            title: "Recoverable Session",
+            purpose: "Recover partial writes",
+            tags: [],
+            participants: [],
+            linkedUuids: [],
+            status: "open",
+            startedAt,
+            updatedAt: startedAt,
+          },
+          idempotency: { startKeys: ["recover-start-key"], statusKeys: [] },
+        },
+      },
+    });
+    const initialPage = runtime.seedDocument(
+      "JournalEntryPage",
+      {
+        name: "Session Overview",
+        type: "text",
+        text: { content: "<p>Recover partial writes</p>", format: 1 },
+        flags: {
+          foundryMcp: {
+            sessionId: "recoverable-session",
+            sessionPage: {
+              uuid: "pending",
+              timestamp: startedAt,
+              kind: "summary",
+              attribution: "foundry-mcp",
+              html: "<p>Recover partial writes</p>",
+              linkedUuids: [],
+              private: false,
+            },
+            sessionInitialPage: true,
+            idempotencyKey: "recover-start-key",
+            excludeFromIntelligence: false,
+          },
+        },
+      },
+      { parentUuid: journal.uuid },
+    );
+    const sessions = new FoundrySessionService(documents, {
+      now: () => new Date("2026-08-29T15:05:00.000Z"),
+      idFactory: () => "must-not-create-a-new-session",
+    });
+
+    const recovered = unwrap(
+      await sessions.start({
+        title: "Recoverable Session",
+        purpose: "Recover partial writes",
+        idempotencyKey: "recover-start-key",
+      }),
+    );
+    expect(recovered.journal.uuid).toBe(journal.uuid);
+    expect(recovered.session.journalUuid).toBe(journal.uuid);
+    expect(recovered.session.initialPageUuid).toBe(initialPage.uuid);
+    expect(recovered.page.uuid).toBe(initialPage.uuid);
+
+    const appendTimestamp = "2026-08-29T15:04:00.000Z";
+    const incompleteAppend = runtime.seedDocument(
+      "JournalEntryPage",
+      {
+        name: `${appendTimestamp} — note`,
+        type: "text",
+        text: { content: "Recovered append", format: 1 },
+        flags: {
+          foundryMcp: {
+            sessionId: "recoverable-session",
+            sessionPage: {
+              uuid: "pending",
+              timestamp: appendTimestamp,
+              kind: "note",
+              attribution: "GM",
+              html: "Recovered append",
+              linkedUuids: [],
+              private: false,
+            },
+            idempotencyKey: "recover-append-key",
+            excludeFromIntelligence: false,
+          },
+        },
+      },
+      { parentUuid: journal.uuid },
+    );
+    const appended = unwrap(
+      await sessions.append({
+        sessionId: "recoverable-session",
+        kind: "note",
+        html: "Recovered append",
+        attribution: "GM",
+        idempotencyKey: "recover-append-key",
+      }),
+    );
+    expect(appended.page.uuid).toBe(incompleteAppend.uuid);
+    expect(appended.session.updatedAt).toBe(appendTimestamp);
+    expect(unwrap(await documents.get({ uuid: incompleteAppend.uuid })).data).toHaveProperty(
+      "flags.foundryMcp.sessionPage.uuid",
+      incompleteAppend.uuid,
+    );
+  });
+
   it("sanitizes unsafe active content", () => {
     expect(
       sanitizeJournalHtml(

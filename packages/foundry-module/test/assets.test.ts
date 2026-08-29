@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { OperationResult } from "@foundry-mcp/protocol";
+import type { FoundryAssetRuntimeAdapter } from "../src/asset-runtime.js";
 import { FoundryAssetService, validateAssetPath } from "../src/assets.js";
 import { FoundryDocumentService } from "../src/documents.js";
 import { createFakeAssetRuntime, VALID_PNG } from "./fake-runtime/assets.js";
@@ -185,6 +186,60 @@ describe("FoundryAssetService upload", () => {
 });
 
 describe("FoundryAssetService attach", () => {
+  it("fails before upload or Document mutation when audit recording fails", async () => {
+    const { runtime, assets, documents, service } = createService();
+    const actor = runtime.seedDocument("Actor", { name: "Audit Guard", type: "stormborn" });
+    vi.spyOn(runtime, "audit").mockImplementation(() => {
+      throw new Error("Injected audit failure");
+    });
+
+    expect(
+      await service.attach({
+        documentUuid: actor.uuid,
+        asset: {
+          kind: "upload",
+          destinationPath: "tokens/audit-guard.png",
+          source: { kind: "base64", data: encode(VALID_PNG), mimeType: "image/png" },
+        },
+      }),
+    ).toMatchObject({ ok: false, error: { code: "FOUNDRY_ERROR" } });
+    expect(assets.uploadCalls).toBe(0);
+    expect(assets.get("data", "tokens/audit-guard.png")).toBeUndefined();
+    expect(unwrap(await documents.get({ uuid: actor.uuid })).data.img).toBeUndefined();
+  });
+
+  it("refuses combined upload before side effects when the runtime cannot compensate", async () => {
+    const runtime = createRichFakeRuntime();
+    const backing = createFakeAssetRuntime();
+    const assets: FoundryAssetRuntimeAdapter = {
+      isOnline: () => backing.isOnline(),
+      listSources: () => backing.listSources(),
+      browse: (sourceId, path, extensions) => backing.browse(sourceId, path, extensions),
+      exists: (sourceId, path) => backing.exists(sourceId, path),
+      upload: (sourceId, path, bytes, mimeType, options) =>
+        backing.upload(sourceId, path, bytes, mimeType, options),
+    };
+    const documents = new FoundryDocumentService(runtime);
+    const service = new FoundryAssetService(assets, documents, runtime);
+    const actor = runtime.seedDocument("Actor", { name: "No Rollback", type: "stormborn" });
+
+    expect(
+      await service.attach({
+        documentUuid: actor.uuid,
+        asset: {
+          kind: "upload",
+          destinationPath: "tokens/no-rollback.png",
+          source: { kind: "base64", data: encode(VALID_PNG), mimeType: "image/png" },
+        },
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { code: "FOUNDRY_ERROR", message: expect.stringContaining("upload first") },
+    });
+    expect(backing.uploadCalls).toBe(0);
+    expect(unwrap(await documents.get({ uuid: actor.uuid })).data.img).toBeUndefined();
+  });
+
   it("attaches to runtime Actor/Item subtypes while preserving unknown system data and ownership", async () => {
     const { runtime, assets, documents, service } = createService();
     assets.seed("public", "icons/reference.webp", VALID_PNG, "image/webp");
@@ -282,6 +337,60 @@ describe("FoundryAssetService attach", () => {
       }),
     ).toMatchObject({ ok: false, error: { code: "PERMISSION_DENIED" } });
     expect(assets.get("data", "tokens/denied.png")).toBeUndefined();
+  });
+
+  it("restores overwritten bytes when the Document update loses an optimistic race", async () => {
+    const runtime = createRichFakeRuntime();
+    const assets = createFakeAssetRuntime();
+    const documents = new FoundryDocumentService(runtime);
+    const actor = runtime.seedDocument("Actor", { name: "Overwrite Race", type: "clockwork" });
+    const original = Uint8Array.from(VALID_PNG);
+    original[original.length - 1] = 0x83;
+    assets.seed("data", "tokens/existing.png", original, "image/png");
+    const upload = assets.upload.bind(assets);
+    vi.spyOn(assets, "upload").mockImplementation(async (...args) => {
+      const stored = await upload(...args);
+      await runtime.updateDocument(actor, { system: { raced: true } });
+      return stored;
+    });
+    const service = new FoundryAssetService(assets, documents, runtime);
+
+    expect(
+      await service.attach({
+        documentUuid: actor.uuid,
+        asset: {
+          kind: "upload",
+          destinationPath: "tokens/existing.png",
+          onCollision: "overwrite",
+          source: { kind: "base64", data: encode(VALID_PNG), mimeType: "image/png" },
+        },
+      }),
+    ).toMatchObject({ ok: false, error: { code: "CONFLICT" } });
+    expect(assets.get("data", "tokens/existing.png")?.bytes).toEqual(original);
+    expect(unwrap(await documents.get({ uuid: actor.uuid })).data.img).toBeUndefined();
+  });
+
+  it("does not upload into a missing path already referenced by another Document", async () => {
+    const { runtime, assets, service } = createService();
+    runtime.seedDocument("Actor", {
+      name: "Existing Reference",
+      type: "stormborn",
+      img: "tokens/referenced.png",
+    });
+    const target = runtime.seedDocument("Actor", { name: "Target", type: "clockwork" });
+
+    expect(
+      await service.attach({
+        documentUuid: target.uuid,
+        asset: {
+          kind: "upload",
+          destinationPath: "tokens/referenced.png",
+          source: { kind: "base64", data: encode(VALID_PNG), mimeType: "image/png" },
+        },
+      }),
+    ).toMatchObject({ ok: false, error: { code: "CONFLICT" } });
+    expect(assets.uploadCalls).toBe(0);
+    expect(assets.get("data", "tokens/referenced.png")).toBeUndefined();
   });
 
   it("routes URL attachments through the injected host-side guarded importer", async () => {

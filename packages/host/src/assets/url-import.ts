@@ -54,13 +54,18 @@ export interface ImportImageUrlOptions {
   maxRedirects?: number;
 }
 
+function ipv4Octets(address: string): number[] | undefined {
+  const parts = address.split(".");
+  if (parts.length !== 4 || parts.some((part) => !/^(?:0|[1-9]\d{0,2})$/.test(part)))
+    return undefined;
+  const octets = parts.map(Number);
+  if (octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return undefined;
+  return octets;
+}
+
 function blockedIpv4(address: string): boolean {
-  const octets = address.split(".").map((part) => Number.parseInt(part, 10));
-  if (
-    octets.length !== 4 ||
-    octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
-  )
-    return true;
+  const octets = ipv4Octets(address);
+  if (!octets) return true;
   const [a = 0, b = 0] = octets;
   return (
     a === 0 ||
@@ -78,17 +83,73 @@ function blockedIpv4(address: string): boolean {
   );
 }
 
+function ipv6Words(address: string): number[] | undefined {
+  let normalized = address.toLocaleLowerCase().split("%")[0] ?? "";
+  if (normalized.includes(".")) {
+    const separator = normalized.lastIndexOf(":");
+    if (separator < 0) return undefined;
+    const octets = ipv4Octets(normalized.slice(separator + 1));
+    if (!octets) return undefined;
+    normalized = `${normalized.slice(0, separator)}:${(((octets[0] ?? 0) << 8) | (octets[1] ?? 0)).toString(16)}:${(((octets[2] ?? 0) << 8) | (octets[3] ?? 0)).toString(16)}`;
+  }
+  const compression = normalized.indexOf("::");
+  if (compression >= 0 && normalized.indexOf("::", compression + 2) >= 0) return undefined;
+  const leftText = compression >= 0 ? normalized.slice(0, compression) : normalized;
+  const rightText = compression >= 0 ? normalized.slice(compression + 2) : "";
+  const parse = (value: string): number[] | undefined => {
+    if (!value) return [];
+    const parts = value.split(":");
+    if (parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))) return undefined;
+    return parts.map((part) => Number.parseInt(part, 16));
+  };
+  const left = parse(leftText);
+  const right = parse(rightText);
+  if (!left || !right) return undefined;
+  if (compression < 0) return left.length === 8 ? left : undefined;
+  const omitted = 8 - left.length - right.length;
+  if (omitted < 1) return undefined;
+  return [...left, ...Array.from({ length: omitted }, () => 0), ...right];
+}
+
+function embeddedIpv4(words: number[]): string {
+  const high = words[6] ?? 0;
+  const low = words[7] ?? 0;
+  return `${(high >>> 8).toString()}.${(high & 0xff).toString()}.${(low >>> 8).toString()}.${(low & 0xff).toString()}`;
+}
+
 function blockedIpv6(address: string): boolean {
-  const normalized = address.toLocaleLowerCase().split("%")[0] ?? "";
-  const mapped = /^(?:::ffff:)?(\d+\.\d+\.\d+\.\d+)$/.exec(normalized)?.[1];
-  if (mapped) return blockedIpv4(mapped);
+  const words = ipv6Words(address);
+  if (!words) return true;
+  const [a = 0, b = 0, c = 0, d = 0, e = 0, f = 0] = words;
+  const h = words[7] ?? 0;
+  if (words.every((word) => word === 0)) return true;
+  if (words.slice(0, 7).every((word) => word === 0) && h === 1) return true;
+
+  // IPv4-compatible, IPv4-mapped, and IPv4-translatable forms must be
+  // classified using their embedded address even when it is written in hex.
+  if (a === 0 && b === 0 && c === 0 && d === 0 && e === 0 && f === 0)
+    return blockedIpv4(embeddedIpv4(words));
+  if (a === 0 && b === 0 && c === 0 && d === 0 && e === 0 && f === 0xffff)
+    return blockedIpv4(embeddedIpv4(words));
+  if (a === 0 && b === 0 && c === 0 && d === 0 && e === 0xffff && f === 0)
+    return blockedIpv4(embeddedIpv4(words));
+
   return (
-    normalized === "::" ||
-    normalized === "::1" ||
-    /^f[cd]/.test(normalized) ||
-    /^fe[89ab]/.test(normalized) ||
-    normalized.startsWith("ff") ||
-    normalized.startsWith("2001:db8:")
+    (a & 0xfe00) === 0xfc00 ||
+    (a & 0xffc0) === 0xfe80 ||
+    (a & 0xffc0) === 0xfec0 ||
+    (a & 0xff00) === 0xff00 ||
+    // Translation/transition prefixes can tunnel private IPv4 destinations.
+    (a === 0x0064 && b === 0xff9b && c === 0 && d === 0 && e === 0 && f === 0) ||
+    (a === 0x0064 && b === 0xff9b && c === 1) ||
+    (a === 0x0100 && b === 0 && c === 0 && d === 0) ||
+    (a === 0x2001 && b === 0) ||
+    (a === 0x2001 && b === 2 && c === 0) ||
+    (a === 0x2001 && b === 0x0db8) ||
+    (a === 0x2001 && ((b & 0xfff0) === 0x0010 || (b & 0xfff0) === 0x0020)) ||
+    a === 0x2002 ||
+    a === 0x3ffe ||
+    a === 0x5f00
   );
 }
 

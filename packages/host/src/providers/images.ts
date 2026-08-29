@@ -140,6 +140,36 @@ export interface OpenAiImagesProviderOptions {
   maxImagePixels?: number;
 }
 
+const OFFICIAL_OPENAI_IMAGES_ENDPOINT = "https://api.openai.com/v1/images/generations";
+
+function validateOpenAiImagesEndpoint(value: string): string {
+  let endpoint: URL;
+  try {
+    endpoint = new URL(value);
+  } catch {
+    throw new ImageProviderError(
+      "PROVIDER_UNAVAILABLE",
+      "OpenAI Images endpoint is not a valid URL",
+    );
+  }
+  if (
+    endpoint.protocol !== "https:" ||
+    endpoint.hostname !== "api.openai.com" ||
+    endpoint.port !== "" ||
+    endpoint.username !== "" ||
+    endpoint.password !== "" ||
+    endpoint.pathname !== "/v1/images/generations" ||
+    endpoint.search !== "" ||
+    endpoint.hash !== ""
+  ) {
+    throw new ImageProviderError(
+      "PROVIDER_UNAVAILABLE",
+      "OpenAI Images credentials may only be sent to the official HTTPS Images endpoint",
+    );
+  }
+  return OFFICIAL_OPENAI_IMAGES_ENDPOINT;
+}
+
 function strictBase64(value: string, maxBytes: number): Uint8Array {
   if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value))
     throw new ImageProviderError(
@@ -169,7 +199,9 @@ export class OpenAiImagesProvider implements ImageGenerationProvider {
       throw new ImageProviderError("PROVIDER_UNAVAILABLE", "OpenAI Images is not configured");
     this.#apiKey = options.apiKey;
     this.#model = options.model ?? "gpt-image-2";
-    this.#endpoint = options.endpoint ?? "https://api.openai.com/v1/images/generations";
+    this.#endpoint = validateOpenAiImagesEndpoint(
+      options.endpoint ?? OFFICIAL_OPENAI_IMAGES_ENDPOINT,
+    );
     const fetchValue = options.fetch ?? (globalThis.fetch as unknown as ImagesFetch | undefined);
     if (!fetchValue)
       throw new ImageProviderError("PROVIDER_UNAVAILABLE", "HTTP fetch is unavailable");

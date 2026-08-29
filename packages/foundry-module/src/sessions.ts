@@ -113,6 +113,8 @@ function failure<T>(error: ErrorEnvelope): OperationResult<T> {
   return { ok: false, error };
 }
 
+const sessionLocksByRuntime = new WeakMap<object, Map<string, Promise<void>>>();
+
 export interface FoundrySessionServiceOptions {
   now?: () => Date;
   idFactory?: () => string;
@@ -123,6 +125,7 @@ export class FoundrySessionService {
   readonly #now: () => Date;
   readonly #idFactory: () => string;
   readonly #journalFolderName: string | null;
+  readonly #locks: Map<string, Promise<void>>;
 
   constructor(
     readonly documents: FoundryDocumentService,
@@ -140,9 +143,26 @@ export class FoundrySessionService {
         );
       });
     this.#journalFolderName = options.journalFolderName ?? "Foundry MCP Sessions";
+    const runtimeKey = documents.runtime as object;
+    const existingLocks = sessionLocksByRuntime.get(runtimeKey);
+    this.#locks = existingLocks ?? new Map<string, Promise<void>>();
+    if (!existingLocks) sessionLocksByRuntime.set(runtimeKey, this.#locks);
   }
 
   async start(input: unknown): Promise<OperationResult<SessionsStartOutput>> {
+    const parsed = SessionsStartInput.safeParse(input);
+    if (!parsed.success)
+      return failure(
+        makeError("INVALID_DATA", "Input validation failed", false, {
+          issues: parsed.error.issues,
+        }),
+      );
+    return this.#withLock(`start:${parsed.data.idempotencyKey}`, () =>
+      this.#startUnlocked(parsed.data),
+    );
+  }
+
+  async #startUnlocked(input: unknown): Promise<OperationResult<SessionsStartOutput>> {
     const parsed = SessionsStartInput.safeParse(input);
     if (!parsed.success)
       return failure(
@@ -156,9 +176,11 @@ export class FoundrySessionService {
       const metadata = metadataFromDocument(existing.value);
       if (!metadata)
         return failure(makeError("FOUNDRY_ERROR", "Stored session metadata is invalid"));
+      const repaired = await this.#repairJournalIdentity(existing.value, metadata);
+      if (!repaired.ok) return repaired;
       const page = await this.#ensureInitialPage(
-        existing.value,
-        metadata,
+        repaired.value.journal,
+        repaired.value.metadata,
         parsed.data.idempotencyKey,
         parsed.data.initialHtml,
       );
@@ -240,13 +262,31 @@ export class FoundrySessionService {
           issues: parsed.error.issues,
         }),
       );
+    return this.#withLock(`session:${parsed.data.sessionId}`, () =>
+      this.#appendUnlocked(parsed.data),
+    );
+  }
+
+  async #appendUnlocked(input: unknown): Promise<OperationResult<SessionsAppendOutput>> {
+    const parsed = SessionsAppendInput.safeParse(input);
+    if (!parsed.success)
+      return failure(
+        makeError("INVALID_DATA", "Input validation failed", false, {
+          issues: parsed.error.issues,
+        }),
+      );
     const found = await this.#findSession(parsed.data.sessionId);
     if (!found.ok) return found;
-    const metadata = metadataFromDocument(found.value);
-    if (!metadata) return failure(makeError("FOUNDRY_ERROR", "Stored session metadata is invalid"));
+    const storedMetadata = metadataFromDocument(found.value);
+    if (!storedMetadata)
+      return failure(makeError("FOUNDRY_ERROR", "Stored session metadata is invalid"));
+    const repaired = await this.#repairJournalIdentity(found.value, storedMetadata);
+    if (!repaired.ok) return repaired;
+    const journal = repaired.value.journal;
+    const metadata = repaired.value.metadata;
     if (metadata.status !== "open")
       return failure(makeError("CONFLICT", "Cannot append to an ended session"));
-    const existingPages = await this.#allPages(found.value.uuid);
+    const existingPages = await this.#allPages(journal.uuid);
     if (!existingPages.ok) return existingPages;
     const duplicate = existingPages.value.find(
       (document) => foundryMcpFlags(document.data).idempotencyKey === parsed.data.idempotencyKey,
@@ -255,7 +295,7 @@ export class FoundrySessionService {
       const page = pageFromDocument(duplicate);
       if (!page)
         return failure(makeError("FOUNDRY_ERROR", "Stored session page metadata is invalid"));
-      return { ok: true, value: { session: metadata, page } };
+      return this.#completeExistingAppend(journal, metadata, duplicate, page);
     }
     const timestamp = this.#now().toISOString();
     const pageMetadata: SessionPage = {
@@ -269,7 +309,7 @@ export class FoundrySessionService {
     };
     const created = await this.documents.create({
       type: "JournalEntryPage",
-      parentUuid: found.value.uuid,
+      parentUuid: journal.uuid,
       data: {
         name: `${timestamp} — ${parsed.data.kind}`,
         type: "text",
@@ -298,10 +338,10 @@ export class FoundrySessionService {
     });
     if (!pageUpdated.ok) return pageUpdated;
     const finalMetadata = { ...metadata, updatedAt: timestamp };
-    const currentJournal = await this.documents.get({ uuid: found.value.uuid });
+    const currentJournal = await this.documents.get({ uuid: journal.uuid });
     if (!currentJournal.ok) return currentJournal;
     const journalUpdated = await this.documents.update({
-      uuid: found.value.uuid,
+      uuid: journal.uuid,
       data: { flags: { foundryMcp: { session: finalMetadata } } },
       expectedHash: currentJournal.value.sourceHash,
     });
@@ -395,13 +435,34 @@ export class FoundrySessionService {
           issues: parsed.error.issues,
         }),
       );
+    return this.#withLock(`session:${parsed.data.sessionId}`, () =>
+      this.#setStatusUnlocked(parsed.data, status),
+    );
+  }
+
+  async #setStatusUnlocked(
+    input: unknown,
+    status: "open" | "ended",
+  ): Promise<OperationResult<SessionsStatusOutput>> {
+    const parsed = SessionsStatusInput.safeParse(input);
+    if (!parsed.success)
+      return failure(
+        makeError("INVALID_DATA", "Input validation failed", false, {
+          issues: parsed.error.issues,
+        }),
+      );
     const found = await this.#findSession(parsed.data.sessionId);
     if (!found.ok) return found;
-    const metadata = metadataFromDocument(found.value);
-    if (!metadata) return failure(makeError("FOUNDRY_ERROR", "Stored session metadata is invalid"));
-    const priorKeys = idempotencyKeys(found.value, "statusKeys");
+    const storedMetadata = metadataFromDocument(found.value);
+    if (!storedMetadata)
+      return failure(makeError("FOUNDRY_ERROR", "Stored session metadata is invalid"));
+    const repaired = await this.#repairJournalIdentity(found.value, storedMetadata);
+    if (!repaired.ok) return repaired;
+    const journal = repaired.value.journal;
+    const metadata = repaired.value.metadata;
+    const priorKeys = idempotencyKeys(journal, "statusKeys");
     if (priorKeys.includes(parsed.data.idempotencyKey)) {
-      return { ok: true, value: { session: metadata, journalData: found.value.data } };
+      return { ok: true, value: { session: metadata, journalData: journal.data } };
     }
     const timestamp = this.#now().toISOString();
     const nextMetadata: SessionMetadata = {
@@ -412,25 +473,94 @@ export class FoundrySessionService {
     };
     if (status === "open") delete nextMetadata.endedAt;
     const updated = await this.documents.update({
-      uuid: found.value.uuid,
+      uuid: journal.uuid,
       data: {
         flags: {
           foundryMcp: {
             session: nextMetadata,
             idempotency: {
-              startKeys: idempotencyKeys(found.value, "startKeys"),
+              startKeys: idempotencyKeys(journal, "startKeys"),
               statusKeys: [...priorKeys, parsed.data.idempotencyKey],
             },
           },
         },
       },
-      expectedHash: found.value.sourceHash,
+      expectedHash: journal.sourceHash,
     });
     if (!updated.ok) return updated;
     return { ok: true, value: { session: nextMetadata, journalData: updated.value.document.data } };
   }
 
+  async #repairJournalIdentity(
+    journal: DocumentView,
+    metadata: SessionMetadata,
+  ): Promise<OperationResult<{ journal: DocumentView; metadata: SessionMetadata }>> {
+    if (metadata.journalUuid === journal.uuid) return { ok: true, value: { journal, metadata } };
+    const repairedMetadata: SessionMetadata = { ...metadata, journalUuid: journal.uuid };
+    const updated = await this.documents.update({
+      uuid: journal.uuid,
+      data: { flags: { foundryMcp: { session: repairedMetadata } } },
+      expectedHash: journal.sourceHash,
+    });
+    if (!updated.ok) return updated;
+    return {
+      ok: true,
+      value: { journal: updated.value.document, metadata: repairedMetadata },
+    };
+  }
+
+  async #completeExistingAppend(
+    journal: DocumentView,
+    metadata: SessionMetadata,
+    pageDocument: DocumentView,
+    page: SessionPage,
+  ): Promise<OperationResult<SessionsAppendOutput>> {
+    let finalPage = page;
+    if (page.uuid !== pageDocument.uuid) {
+      finalPage = { ...page, uuid: pageDocument.uuid };
+      const repairedPage = await this.documents.update({
+        uuid: pageDocument.uuid,
+        data: { flags: { foundryMcp: { sessionPage: finalPage } } },
+        expectedHash: pageDocument.sourceHash,
+      });
+      if (!repairedPage.ok) return repairedPage;
+    }
+    if (metadata.updatedAt.localeCompare(finalPage.timestamp) >= 0)
+      return { ok: true, value: { session: metadata, page: finalPage } };
+    const nextMetadata: SessionMetadata = { ...metadata, updatedAt: finalPage.timestamp };
+    const currentJournal = await this.documents.get({ uuid: journal.uuid });
+    if (!currentJournal.ok) return currentJournal;
+    const updated = await this.documents.update({
+      uuid: journal.uuid,
+      data: { flags: { foundryMcp: { session: nextMetadata } } },
+      expectedHash: currentJournal.value.sourceHash,
+    });
+    if (!updated.ok) return updated;
+    return { ok: true, value: { session: nextMetadata, page: finalPage } };
+  }
+
+  async #withLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.#locks.get(key) ?? Promise.resolve();
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    this.#locks.set(key, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.#locks.get(key) === tail) this.#locks.delete(key);
+    }
+  }
+
   async #ensureFolder(name: string): Promise<OperationResult<{ uuid: string }>> {
+    return this.#withLock(`folder:${name}`, () => this.#ensureFolderUnlocked(name));
+  }
+
+  async #ensureFolderUnlocked(name: string): Promise<OperationResult<{ uuid: string }>> {
     let cursor: string | undefined;
     do {
       const listed = await this.documents.list({
@@ -474,11 +604,20 @@ export class FoundrySessionService {
       (document) => foundryMcpFlags(document.data).sessionInitialPage === true,
     );
     if (existing) {
-      const page = pageFromDocument(existing);
+      let page = pageFromDocument(existing);
       if (!page)
         return failure(
           makeError("FOUNDRY_ERROR", "Stored initial session page metadata is invalid"),
         );
+      if (page.uuid !== existing.uuid) {
+        page = { ...page, uuid: existing.uuid };
+        const repairedPage = await this.documents.update({
+          uuid: existing.uuid,
+          data: { flags: { foundryMcp: { sessionPage: page } } },
+          expectedHash: existing.sourceHash,
+        });
+        if (!repairedPage.ok) return repairedPage;
+      }
       if (metadata.initialPageUuid === page.uuid)
         return { ok: true, value: { session: metadata, journal, page } };
       const nextMetadata: SessionMetadata = { ...metadata, initialPageUuid: page.uuid };
