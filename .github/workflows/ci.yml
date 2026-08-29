@@ -26,8 +26,64 @@ jobs:
         with:
           version: "9"
 
+      - name: Setup .NET for the Windows pipe broker
+        if: runner.os == 'Windows'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Publish the native broker used by Windows tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./packages/host/native/publish.ps1 -RuntimeIdentifiers win-x64
+
       - name: Build, typecheck, lint, test
         run: pnpm exec turbo run build typecheck lint test
+
+  windows-broker-artifacts:
+    name: Windows broker (${{ matrix.rid }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-x64, win-arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Publish deterministic self-contained broker
+        shell: pwsh
+        run: ./packages/host/native/publish.ps1 -RuntimeIdentifiers ${{ matrix.rid }}
+
+      - name: Verify PE machine architecture and manifest hash
+        shell: pwsh
+        run: |
+          $artifact = 'packages/host/native/bin/${{ matrix.rid }}/foundry-mcp-pipe-broker.exe'
+          $manifestPath = 'packages/host/native/bin/${{ matrix.rid }}/manifest.json'
+          $bytes = [IO.File]::ReadAllBytes($artifact)
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          $expectedMachine = if ('${{ matrix.rid }}' -eq 'win-x64') { 0x8664 } else { 0xaa64 }
+          if ($machine -ne $expectedMachine) {
+            throw ('Unexpected PE machine 0x{0:x4}; expected 0x{1:x4}' -f $machine, $expectedMachine)
+          }
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          $actualHash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($manifest.sha256 -ne $actualHash) {
+            throw 'Broker SHA-256 does not match manifest.json'
+          }
+
+      - name: Upload broker artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: foundry-mcp-pipe-broker-${{ matrix.rid }}
+          path: packages/host/native/bin/${{ matrix.rid }}/
+          if-no-files-found: error

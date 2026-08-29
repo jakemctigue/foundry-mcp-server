@@ -6,6 +6,8 @@ import { connectPipeClient } from "../src/bridge/pipe-client.js";
 import { createLogger, stderrSink } from "../src/logger.js";
 import { userSidHash, resolvePipePath, defaultUserIdentifier } from "../src/bridge/pipe-path.js";
 
+const AUTH_KEY = Buffer.alloc(32, 0x42);
+
 function testPipePath(name: string): string {
   if (process.platform === "win32") {
     return `\\\\.\\pipe\\foundry-mcp-test-${name}`;
@@ -21,12 +23,15 @@ describe("named pipe bridge", () => {
     const server = await startPipeServer({
       pipePath,
       logger,
+      authKey: AUTH_KEY,
       onMessage: (message, respond) => {
         respond({ echo: message });
       },
     });
     expect(server.ready).toBe(true);
 
+    // In-process integration resolves the same registered key that separate
+    // production processes load from the per-user protected secret store.
     const client = await connectPipeClient(pipePath);
     const received = await new Promise((resolve) => {
       client.onMessage(resolve);
@@ -54,6 +59,7 @@ describe("named pipe bridge", () => {
     const server = await startPipeServer({
       pipePath,
       logger: spyingLogger,
+      authKey: AUTH_KEY,
       aclCheck: () => Promise.resolve(false),
       onMessage: () => {
         /* unreachable */

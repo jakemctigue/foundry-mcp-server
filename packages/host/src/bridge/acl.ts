@@ -1,15 +1,25 @@
 import type { Logger } from "../logger.js";
+import { inspectWindowsPipeDescriptor } from "./windows-pipe-broker.js";
 
 export type AclCheck = (pipePath: string) => Promise<boolean>;
 
 /**
- * Default ACL check: on non-Windows platforms Unix domain socket
- * permissions are enforced by the filesystem mode set at creation time, so
- * this always passes. On Windows a real implementation would inspect the
- * pipe's security descriptor to confirm it is restricted to the current
- * user; that check is injected as `AclCheck` so tests can simulate failure.
+ * The Windows broker owns the pipe handle, and this independent probe opens
+ * that live handle and validates its protected DACL against the probe's
+ * current TokenUser and logon SID. Any missing helper/API failure denies
+ * readiness. Non-Windows uses a 0600 Unix-domain socket, so the filesystem
+ * enforces the equivalent per-user boundary and this check is a passthrough.
  */
-export const defaultAclCheck: AclCheck = () => Promise.resolve(true);
+export const defaultAclCheck: AclCheck = async (pipePath) => {
+  if (process.platform !== "win32") {
+    return true;
+  }
+  try {
+    return await inspectWindowsPipeDescriptor(pipePath);
+  } catch {
+    return false;
+  }
+};
 
 export async function enforceAcl(
   pipePath: string,

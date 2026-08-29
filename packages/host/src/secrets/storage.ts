@@ -13,15 +13,20 @@ const DEV_FALLBACK_WARNING =
 
 interface DpapiModule {
   protectData: (
-    data: Buffer,
-    entropy: Buffer | null,
+    data: Uint8Array,
+    entropy: Uint8Array | null,
     scope: "CurrentUser" | "LocalMachine",
-  ) => Buffer;
+  ) => Uint8Array;
   unprotectData: (
-    data: Buffer,
-    entropy: Buffer | null,
+    data: Uint8Array,
+    entropy: Uint8Array | null,
     scope: "CurrentUser" | "LocalMachine",
-  ) => Buffer;
+  ) => Uint8Array;
+}
+
+interface DpapiImport {
+  Dpapi?: DpapiModule;
+  default?: DpapiModule | { Dpapi?: DpapiModule };
 }
 
 async function loadDpapi(): Promise<DpapiModule | undefined> {
@@ -29,8 +34,13 @@ async function loadDpapi(): Promise<DpapiModule | undefined> {
     return undefined;
   }
   try {
-    const mod = (await import("@primno/dpapi")) as unknown as DpapiModule;
-    return mod;
+    const mod = (await import("@primno/dpapi")) as unknown as DpapiImport;
+    const nestedDefault = mod.default && "Dpapi" in mod.default ? mod.default.Dpapi : undefined;
+    const directDefault =
+      mod.default && "protectData" in mod.default && "unprotectData" in mod.default
+        ? mod.default
+        : undefined;
+    return mod.Dpapi ?? nestedDefault ?? directDefault;
   } catch {
     return undefined;
   }
@@ -91,9 +101,15 @@ export function createSecretStorage(options: CreateSecretStorageOptions): Secret
       fs.mkdirSync(dir, { recursive: true });
       const dpapi = await resolveDpapi();
       if (dpapi) {
-        const protectedData = dpapi.protectData(value, null, "CurrentUser");
-        fs.writeFileSync(filePath, protectedData);
-        return;
+        try {
+          const protectedData = dpapi.protectData(value, null, "CurrentUser");
+          fs.writeFileSync(filePath, Buffer.from(protectedData));
+          return;
+        } catch {
+          // A package can import successfully while lacking a prebuild for the
+          // current Node ABI. That is unavailable DPAPI, not authorization to
+          // write an unprotected secret; continue into the encrypted fallback.
+        }
       }
       logger.warn(DEV_FALLBACK_WARNING, { key });
       fs.writeFileSync(filePath, encryptFallback(value));
@@ -106,7 +122,12 @@ export function createSecretStorage(options: CreateSecretStorageOptions): Secret
       const blob = fs.readFileSync(filePath);
       const dpapi = await resolveDpapi();
       if (dpapi) {
-        return dpapi.unprotectData(blob, null, "CurrentUser");
+        try {
+          return Buffer.from(dpapi.unprotectData(blob, null, "CurrentUser"));
+        } catch {
+          // See the save path above. The fallback decrypt remains
+          // authenticated and throws if this was not a fallback-format blob.
+        }
       }
       logger.warn(DEV_FALLBACK_WARNING, { key });
       return decryptFallback(blob);

@@ -1,12 +1,13 @@
 import path from "node:path";
 import fs from "node:fs";
 import { BRIDGE_PROTOCOL_VERSION } from "@foundry-mcp/protocol";
-import { resolveConfig, type HostConfig } from "./config.js";
+import { DEFAULT_CONFIG, resolveConfig, type HostConfig } from "./config.js";
 import { resolveAppDataDir } from "./paths.js";
 import { createLogger, stderrSink, type Logger } from "./logger.js";
 import { openDatabase, runMigrations } from "./db/index.js";
 import { startPipeServer, type PipeServerHandle } from "./bridge/pipe-server.js";
 import { resolvePipePath, defaultUserIdentifier } from "./bridge/pipe-path.js";
+import { loadOrCreateBridgeAuthKey } from "./bridge/bridge-auth.js";
 import type Database from "better-sqlite3";
 
 export interface Daemon {
@@ -50,10 +51,17 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
   const db = openDatabase(dbPath);
   runMigrations(db);
 
-  const pipePath = resolvePipePath(defaultUserIdentifier(), appDataDir);
+  const userIdentifier = defaultUserIdentifier();
+  const pipeIdentifier =
+    config.pipeName === DEFAULT_CONFIG.pipeName
+      ? userIdentifier
+      : `${userIdentifier}:${config.pipeName}`;
+  const pipePath = resolvePipePath(pipeIdentifier, appDataDir);
+  const bridgeAuthKey = await loadOrCreateBridgeAuthKey(appDataDir, logger);
   const pipe = await startPipeServer({
     pipePath,
     logger,
+    authKey: bridgeAuthKey,
     onMessage: handleBridgeMessage,
   });
 

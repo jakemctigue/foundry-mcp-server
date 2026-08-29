@@ -8,8 +8,18 @@
   "exports": {
     ".": "./dist/index.js"
   },
+  "files": [
+    "dist/",
+    "native/bin/win-x64/foundry-mcp-pipe-broker.exe",
+    "native/bin/win-x64/manifest.json",
+    "native/bin/win-arm64/foundry-mcp-pipe-broker.exe",
+    "native/bin/win-arm64/manifest.json",
+    "native/README.md"
+  ],
   "scripts": {
     "build": "tsup src/index.ts --format esm --dts --sourcemap --clean",
+    "native:build": "dotnet build native/windows-pipe-broker/FoundryMcp.WindowsPipeBroker.csproj --configuration Release --nologo",
+    "native:publish": "pwsh -NoProfile -File native/publish.ps1",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint src test",
     "test": "vitest run --coverage",

@@ -21,7 +21,10 @@ describe("mcp-adapter <-> real host daemon", () => {
 
   it("connects over the named pipe and negotiates the bridge protocol version", async () => {
     appDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fmcp-adapter-it-"));
-    daemon = await startDaemon({ appDataDir, cliConfig: { dbPath: "test.db" } });
+    daemon = await startDaemon({
+      appDataDir,
+      cliConfig: { dbPath: "test.db", pipeName: "foundry-mcp-daemon-integration" },
+    });
     expect(daemon.pipe.ready).toBe(true);
 
     const bridge = await connectToDaemon(daemon.pipePath);

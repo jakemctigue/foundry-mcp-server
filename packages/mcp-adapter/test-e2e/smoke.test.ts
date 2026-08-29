@@ -34,7 +34,10 @@ describe("end-to-end smoke: adapter boots, lists zero connections", () => {
   it("performs the initialize handshake and returns zero connections with no hanging handles", async () => {
     // Real host daemon: real SQLite, real named-pipe/socket bridge listener.
     appDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "fmcp-e2e-"));
-    daemon = await startDaemon({ appDataDir, cliConfig: { dbPath: "e2e.db" } });
+    daemon = await startDaemon({
+      appDataDir,
+      cliConfig: { dbPath: "e2e.db", pipeName: "foundry-mcp-e2e-smoke" },
+    });
     expect(daemon.pipe.ready).toBe(true);
 
     // Real mcp-adapter bridge connection over the real named pipe.

@@ -15,3 +15,6 @@ coverage/
 Thumbs.db
 .foundry-mcp/
 artifacts/
+packages/host/native/windows-pipe-broker/bin/
+packages/host/native/windows-pipe-broker/obj/
+packages/host/native/bin/
