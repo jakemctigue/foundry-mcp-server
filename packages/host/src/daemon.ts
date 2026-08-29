@@ -13,6 +13,7 @@ import { startHostCompanionServer, type HostCompanionServer } from "./bridge/com
 import { HostBridgeRouter } from "./bridge/router.js";
 import { createImageProviderRegistry } from "./providers/images.js";
 import { createSecretStorage } from "./secrets/storage.js";
+import { writeHostStatusAtomic } from "./status.js";
 
 export interface Daemon {
   config: HostConfig;
@@ -39,6 +40,17 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
 
   const config = resolveConfig({}, process.env, options.cliConfig ?? {});
   const logger = createLogger({ level: config.logLevel, sinks: [stderrSink()] });
+  const statusPath = path.join(appDataDir, "status.json");
+  let hostState: "running" | "stopped" = "running";
+  const updateStatus = (activeConnections: number): void => {
+    try {
+      writeHostStatusAtomic(statusPath, { state: hostState, activeConnections });
+    } catch (error) {
+      logger.error("host status snapshot write failed", {
+        errorType: error instanceof Error ? error.name : "UnknownError",
+      });
+    }
+  };
 
   const dbPath = path.isAbsolute(config.dbPath)
     ? config.dbPath
@@ -74,6 +86,7 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
       categories: config.eventCategories,
       capturePrivateContent: config.capturePrivateContent,
     },
+    onConnectionsChanged: (connections) => updateStatus(connections.length),
   });
   const companionEndpoint = companion.address().endpoint;
   let companionClosed = false;
@@ -102,6 +115,37 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
     await companion.close();
     companionClosed = true;
   }
+  updateStatus(companion.listConnections().length);
+
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = (): Promise<void> => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      const failures: unknown[] = [];
+      try {
+        await pipe.close();
+      } catch (error) {
+        failures.push(error);
+      }
+      if (!companionClosed) {
+        try {
+          await companion.close();
+          companionClosed = true;
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      try {
+        db.close();
+      } catch (error) {
+        failures.push(error);
+      }
+      hostState = "stopped";
+      updateStatus(0);
+      if (failures.length > 0) throw new AggregateError(failures, "host shutdown failed");
+    })();
+    return shutdownPromise;
+  };
 
   return {
     config,
@@ -112,13 +156,6 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
     companion,
     companionEndpoint,
-    shutdown: async () => {
-      await pipe.close();
-      if (!companionClosed) {
-        await companion.close();
-        companionClosed = true;
-      }
-      db.close();
-    },
+    shutdown,
   };
 }

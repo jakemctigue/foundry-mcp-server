@@ -16,3 +16,8 @@ export async function loadOpenAiImagesApiKey(storage: SecretStorage): Promise<st
   const value = stored.toString("utf8").trim();
   return value.length > 0 ? value : undefined;
 }
+
+export async function removeOpenAiImagesApiKey(storage: SecretStorage): Promise<void> {
+  if (!storage.remove) throw new Error("secret storage does not support secure removal");
+  await storage.remove(OPENAI_IMAGES_API_KEY_SECRET);
+}

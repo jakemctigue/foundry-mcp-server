@@ -6,6 +6,7 @@ import type { Logger } from "../logger.js";
 export interface SecretStorage {
   save: (key: string, value: Buffer) => Promise<void>;
   load: (key: string) => Promise<Buffer | undefined>;
+  remove?: (key: string) => Promise<void>;
 }
 
 const DEV_FALLBACK_WARNING =
@@ -147,6 +148,14 @@ export function createSecretStorage(options: CreateSecretStorageOptions): Secret
       requireDevelopmentFallback(options);
       logger.warn(DEV_FALLBACK_WARNING, { key });
       return decryptFallback(blob);
+    },
+    async remove(key: string): Promise<void> {
+      const filePath = path.join(dir, `${key}.secret`);
+      try {
+        fs.unlinkSync(filePath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
     },
   };
 }

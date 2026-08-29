@@ -1,80 +1,77 @@
 #!/usr/bin/env node
 import { runDoctor, formatDoctorText, formatDoctorJson, type DoctorOptions } from "./doctor.js";
 import { buildFoundryModule } from "./build-module.js";
-
-function optionValue(args: string[], flag: string): string | undefined {
-  const index = args.indexOf(flag);
-  if (index < 0) return undefined;
-  const value = args[index + 1];
-  if (!value || value.startsWith("--")) {
-    throw new Error(`${flag} requires a value`);
-  }
-  return value;
-}
-
-function optionValues(args: string[], flag: string): string[] {
-  const values: string[] = [];
-  for (let index = 0; index < args.length; index += 1) {
-    if (args[index] === flag) {
-      const value = args[index + 1];
-      if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
-      values.push(value);
-    }
-  }
-  return values;
-}
+import { parseCommandLine } from "./command-line.js";
+import { runHostCommand } from "./host-command.js";
+import { formatCapabilityCommandText, runCapabilityCommand } from "./capability-command.js";
+import { formatProviderCommandText, runProviderCommand } from "./provider-command.js";
 
 async function main(): Promise<void> {
-  const [command, ...rest] = process.argv.slice(2);
-  const json = rest.includes("--json");
+  const parsed = parseCommandLine(process.argv.slice(2));
 
-  if (command === "doctor") {
+  if (parsed.command === "doctor") {
+    const options = parsed.options;
     const doctorOptions: DoctorOptions = {};
-    const appDataDir = optionValue(rest, "--app-data");
-    const configPath = optionValue(rest, "--config");
-    const foundryUserDataPath = optionValue(rest, "--foundry-data");
-    const dockerUserDataPath = optionValue(rest, "--docker-data");
-    const bridgeUrl = optionValue(rest, "--bridge-url");
-    const foundryOrigin = optionValue(rest, "--foundry-origin");
-    const moduleId = optionValue(rest, "--module-id");
-    const allowedOrigins = optionValues(rest, "--allow-origin");
-    if (appDataDir) doctorOptions.appDataDir = appDataDir;
-    if (configPath) doctorOptions.configPath = configPath;
-    if (foundryUserDataPath) doctorOptions.foundryUserDataPath = foundryUserDataPath;
-    if (dockerUserDataPath) doctorOptions.dockerUserDataPath = dockerUserDataPath;
-    if (bridgeUrl) doctorOptions.bridgeUrl = bridgeUrl;
-    if (foundryOrigin) doctorOptions.foundryOrigin = foundryOrigin;
-    if (moduleId) doctorOptions.moduleId = moduleId;
-    if (allowedOrigins.length > 0) doctorOptions.allowedOrigins = allowedOrigins;
+    if (options.appDataDir) doctorOptions.appDataDir = options.appDataDir;
+    if (options.configPath) doctorOptions.configPath = options.configPath;
+    if (options.foundryUserDataPath) {
+      doctorOptions.foundryUserDataPath = options.foundryUserDataPath;
+    }
+    if (options.dockerUserDataPath) doctorOptions.dockerUserDataPath = options.dockerUserDataPath;
+    if (options.bridgeUrl) doctorOptions.bridgeUrl = options.bridgeUrl;
+    if (options.foundryOrigin) doctorOptions.foundryOrigin = options.foundryOrigin;
+    if (options.moduleId) doctorOptions.moduleId = options.moduleId;
+    if (options.allowedOrigins.length > 0) doctorOptions.allowedOrigins = options.allowedOrigins;
     const results = await runDoctor(doctorOptions);
-    process.stdout.write((json ? formatDoctorJson(results) : formatDoctorText(results)) + "\n");
+    process.stdout.write(
+      (options.json ? formatDoctorJson(results) : formatDoctorText(results)) + "\n",
+    );
     const hasFail = results.some((r) => r.status === "FAIL");
     process.exitCode = hasFail ? 1 : 0;
     return;
   }
 
-  if (command === "build-module") {
-    const outputDir = optionValue(rest, "--output");
-    const version = optionValue(rest, "--version");
+  if (parsed.command === "build-module") {
+    const options = parsed.options;
     const result = buildFoundryModule({
-      ...(outputDir ? { outputDir } : {}),
-      ...(version ? { version } : {}),
+      ...(options.outputDir ? { outputDir: options.outputDir } : {}),
+      ...(options.version ? { version: options.version } : {}),
     });
     process.stdout.write(
-      json
+      options.json
         ? `${JSON.stringify(result, null, 2)}\n`
         : `Built Foundry v14 module ${result.version}\nDirectory: ${result.moduleDir}\nZIP: ${result.zipPath}\n`,
     );
     return;
   }
 
-  process.stderr.write(
-    `unknown command: ${command ?? "(none)"}\nusage:\n  foundry-mcp doctor [--json] [--config PATH] [--app-data PATH] [--foundry-data PATH | --docker-data PATH] [--bridge-url URL] [--foundry-origin ORIGIN] [--allow-origin ORIGIN]\n  foundry-mcp build-module [--json] [--output DIR] [--version SEMVER]\n`,
-  );
-  process.exitCode = 1;
+  if (parsed.command === "capabilities") {
+    const result = runCapabilityCommand(parsed.options);
+    process.stdout.write(
+      parsed.options.json
+        ? `${JSON.stringify(result, null, 2)}\n`
+        : `${formatCapabilityCommandText(result)}\n`,
+    );
+    return;
+  }
+
+  if (parsed.command === "provider") {
+    const result = await runProviderCommand(parsed.options);
+    process.stdout.write(
+      parsed.options.json
+        ? `${JSON.stringify(result, null, 2)}\n`
+        : `${formatProviderCommandText(result)}\n`,
+    );
+    return;
+  }
+
+  await runHostCommand(parsed.options);
 }
 
 main().catch((err: unknown) => {
-  process.stderr.write(`foundry-mcp cli failed: ${String(err)}\n`);
+  const message = err instanceof Error ? err.message : String(err);
+  process.stderr.write(
+    `foundry-mcp cli failed: ${message}\nusage:\n  foundry-mcp host [--config PATH] [--app-data PATH] [--port PORT] [--pipe-name NAME] [--log-level LEVEL] [--allow-origin ORIGIN]...\n  foundry-mcp capabilities list --connection-id ID [--json] [--config PATH] [--app-data PATH]\n  foundry-mcp capabilities <grant|revoke> --connection-id ID --role ROLE --capability CAPABILITY [--json] [--config PATH] [--app-data PATH]\n  foundry-mcp provider <configure|remove|status> [--json] [--app-data PATH]\n  foundry-mcp doctor [--json] [--config PATH] [--app-data PATH] [--foundry-data PATH | --docker-data PATH] [--bridge-url URL] [--foundry-origin ORIGIN] [--allow-origin ORIGIN]...\n  foundry-mcp build-module [--json] [--output DIR] [--version SEMVER]\n`,
+  );
   process.exitCode = 1;
 });
