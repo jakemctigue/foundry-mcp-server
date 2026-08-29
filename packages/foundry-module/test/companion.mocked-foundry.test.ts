@@ -27,14 +27,18 @@ class MemoryStorage implements CompanionStorage {
 
 class MockSocket implements CompanionSocket {
   readyState = 1;
+  closeCode: number | undefined;
+  closeReason: string | undefined;
   readonly sent: unknown[] = [];
   readonly listeners = new Map<string, Array<(event?: { data: unknown }) => unknown>>();
 
   send(data: string): void {
     this.sent.push(JSON.parse(data) as unknown);
   }
-  close(): void {
+  close(code?: number, reason?: string): void {
     this.readyState = 3;
+    this.closeCode = code;
+    this.closeReason = reason;
   }
   addEventListener(type: "open" | "close", listener: () => void): void;
   addEventListener(type: "message", listener: (event: { data: unknown }) => void): void;
@@ -62,6 +66,7 @@ class MockSocket implements CompanionSocket {
 
 const PAIRING_SECRET = new Uint8Array(32).fill(7);
 const AUTH_CHALLENGE = "A".repeat(43);
+const PAGE_ORIGIN = "https://foundry.test";
 
 function companionHello(connectionId = "world-a"): CompanionHelloMessage {
   return {
@@ -88,6 +93,7 @@ async function authenticate(socket: MockSocket, connectionId = "world-a"): Promi
     type: "auth.challenge",
     protocolVersion: BRIDGE_PROTOCOL_VERSION,
     challenge: AUTH_CHALLENGE,
+    origin: PAGE_ORIGIN,
   });
   await vi.waitFor(() =>
     expect(socket.sent).toEqual([expect.objectContaining({ type: "auth.proof", hello })]),
@@ -96,7 +102,7 @@ async function authenticate(socket: MockSocket, connectionId = "world-a"): Promi
     type: "auth.ready",
     connectionId,
     proof: createHmac("sha256", PAIRING_SECRET)
-      .update(companionAuthReadyPayload(AUTH_CHALLENGE, hello), "utf8")
+      .update(companionAuthReadyPayload(AUTH_CHALLENGE, PAGE_ORIGIN, hello), "utf8")
       .digest("base64url"),
   });
   socket.sent.length = 0;
@@ -175,8 +181,8 @@ describe("browser companion (mocked Foundry global)", () => {
     const handler = vi.fn(async (): Promise<JsonValue> => ({ created: "Actor.a" }));
     const options = {
       endpoint: "ws://127.0.0.1:3210",
-      allowedOrigins: ["http://localhost:30000"],
-      pageOrigin: "http://localhost:30000",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
       ...pairedOptions(),
       storage,
       handleRequest: handler,
@@ -219,8 +225,8 @@ describe("browser companion (mocked Foundry global)", () => {
     );
     const client = new CompanionBridgeClient({
       endpoint: "ws://127.0.0.1:3210",
-      allowedOrigins: ["http://localhost:30000"],
-      pageOrigin: "http://localhost:30000",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
       ...pairedOptions(),
       storage: new MemoryStorage(),
       createSocket: () => socket,
@@ -250,8 +256,8 @@ describe("browser companion (mocked Foundry global)", () => {
     const socket = new MockSocket();
     const client = new CompanionBridgeClient({
       endpoint: "ws://127.0.0.1:3210",
-      allowedOrigins: ["http://localhost:30000"],
-      pageOrigin: "http://localhost:30000",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
       ...pairedOptions(),
       storage,
       createSocket: () => socket,
@@ -298,8 +304,8 @@ describe("browser companion (mocked Foundry global)", () => {
     const neverCompletes = new Promise<JsonValue>(() => undefined);
     const first = new CompanionBridgeClient({
       endpoint: "ws://127.0.0.1:3210",
-      allowedOrigins: ["http://localhost:30000"],
-      pageOrigin: "http://localhost:30000",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
       ...pairedOptions(),
       storage,
       createSocket: () => firstSocket,
@@ -322,8 +328,8 @@ describe("browser companion (mocked Foundry global)", () => {
     const secondSocket = new MockSocket();
     const second = new CompanionBridgeClient({
       endpoint: "ws://127.0.0.1:3210",
-      allowedOrigins: ["http://localhost:30000"],
-      pageOrigin: "http://localhost:30000",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
       ...pairedOptions(),
       storage,
       createSocket: () => secondSocket,
@@ -349,8 +355,8 @@ describe("browser companion (mocked Foundry global)", () => {
     const handler = vi.fn(async () => ({ changed: true }));
     const client = new CompanionBridgeClient({
       endpoint: "ws://127.0.0.1:3210",
-      allowedOrigins: ["http://localhost:30000"],
-      pageOrigin: "http://localhost:30000",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
       ...pairedOptions(),
       storage: new MemoryStorage(),
       createSocket: () => socket,
@@ -361,14 +367,46 @@ describe("browser companion (mocked Foundry global)", () => {
       type: "auth.challenge",
       protocolVersion: BRIDGE_PROTOCOL_VERSION,
       challenge: AUTH_CHALLENGE,
+      origin: PAGE_ORIGIN,
     });
     await socket.emitMessage({
       type: "auth.ready",
       connectionId: "world-a",
       proof: "Z".repeat(43),
     });
-    expect(socket.readyState).toBe(3);
+    expect(socket).toMatchObject({
+      readyState: 3,
+      closeCode: 1008,
+      closeReason: "companion host authentication failed",
+    });
     expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("refuses to sign a challenge bound to a different browser Origin", async () => {
+    const socket = new MockSocket();
+    const client = new CompanionBridgeClient({
+      endpoint: "ws://127.0.0.1:3210",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
+      ...pairedOptions(),
+      storage: new MemoryStorage(),
+      createSocket: () => socket,
+      handleRequest: async () => null,
+    });
+    client.start();
+    await socket.emitMessage({
+      type: "auth.challenge",
+      protocolVersion: BRIDGE_PROTOCOL_VERSION,
+      challenge: AUTH_CHALLENGE,
+      origin: "https://other-foundry.test",
+    });
+
+    expect(socket).toMatchObject({
+      readyState: 3,
+      closeCode: 1008,
+      closeReason: "companion authentication Origin mismatch",
+    });
+    expect(socket.sent).toEqual([]);
   });
 
   it("serializes back-to-back auth-ready and resume frames", async () => {
@@ -376,8 +414,8 @@ describe("browser companion (mocked Foundry global)", () => {
     const hello = companionHello();
     const client = new CompanionBridgeClient({
       endpoint: "ws://127.0.0.1:3210",
-      allowedOrigins: ["http://localhost:30000"],
-      pageOrigin: "http://localhost:30000",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
       ...pairedOptions(),
       storage: new MemoryStorage(),
       createSocket: () => socket,
@@ -393,6 +431,7 @@ describe("browser companion (mocked Foundry global)", () => {
       type: "auth.challenge",
       protocolVersion: BRIDGE_PROTOCOL_VERSION,
       challenge: AUTH_CHALLENGE,
+      origin: PAGE_ORIGIN,
     });
     await vi.waitFor(() =>
       expect(socket.sent).toEqual([expect.objectContaining({ type: "auth.proof", hello })]),
@@ -403,7 +442,7 @@ describe("browser companion (mocked Foundry global)", () => {
       type: "auth.ready",
       connectionId: "world-a",
       proof: createHmac("sha256", PAIRING_SECRET)
-        .update(companionAuthReadyPayload(AUTH_CHALLENGE, hello), "utf8")
+        .update(companionAuthReadyPayload(AUTH_CHALLENGE, PAGE_ORIGIN, hello), "utf8")
         .digest("base64url"),
     });
     socket.emit("message", {

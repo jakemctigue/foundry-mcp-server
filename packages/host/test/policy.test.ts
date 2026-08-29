@@ -54,29 +54,30 @@ describe("permission policy and mutation audit", () => {
     });
     expect(evaluatePolicy(db, trustedAppend)).toMatchObject({
       allowed: false,
-      reason: "missing-grant",
+      reason: "role-restricted",
     });
     setCapabilityGrant(db, trustedAppend, true, new Date("2026-01-01T00:00:00.000Z"));
     expect(evaluatePolicy(db, trustedAppend)).toMatchObject({
-      allowed: true,
-      source: "explicit-grant",
-    });
-
-    const assistantCreate = request({
-      foundryUserRole: "ASSISTANT",
-      requestedCapability: "documents:create",
-    });
-    setCapabilityGrant(db, assistantCreate, true);
-    expect(evaluatePolicy(db, assistantCreate).allowed).toBe(true);
-    const assistantNetwork = request({
-      foundryUserRole: "ASSISTANT",
-      requestedCapability: "ai:network",
-    });
-    setCapabilityGrant(db, assistantNetwork, true);
-    expect(evaluatePolicy(db, assistantNetwork)).toMatchObject({
       allowed: false,
       reason: "role-restricted",
     });
+
+    for (const requestedCapability of [
+      "documents:create",
+      "documents:update",
+      "assets:upload",
+      "assets:attach",
+      "sessions:start",
+      "sessions:append",
+      "ai:network",
+    ] as const) {
+      const assistantMutation = request({ foundryUserRole: "ASSISTANT", requestedCapability });
+      setCapabilityGrant(db, assistantMutation, true);
+      expect(evaluatePolicy(db, assistantMutation)).toMatchObject({
+        allowed: false,
+        reason: "role-restricted",
+      });
+    }
 
     const gmNetwork = request({ requestedCapability: "ai:network" });
     expect(evaluatePolicy(db, gmNetwork).allowed).toBe(false);
@@ -91,7 +92,7 @@ describe("permission policy and mutation audit", () => {
 
   it("returns structured permission errors and audits denied and successful calls exactly once", async () => {
     const operation = vi.fn(() => "changed");
-    const mutation = request({
+    const assistantMutation = request({
       foundryUserRole: "ASSISTANT",
       requestedCapability: "documents:update",
     });
@@ -101,7 +102,7 @@ describe("permission policy and mutation audit", () => {
       await runAuthorizedOperation(
         db,
         {
-          ...mutation,
+          ...assistantMutation,
           tool: "foundry.documents.update",
           correlationId: "denied-1",
           auditDetails: {
@@ -123,12 +124,18 @@ describe("permission policy and mutation audit", () => {
       connectionId: "connection-1",
     });
 
-    setCapabilityGrant(db, mutation, true);
+    setCapabilityGrant(db, assistantMutation, true);
+    expect(evaluatePolicy(db, assistantMutation)).toMatchObject({
+      allowed: false,
+      reason: "role-restricted",
+    });
+    const gmMutation = request({ requestedCapability: "documents:update" });
+    setCapabilityGrant(db, gmMutation, true);
     await expect(
       runAuthorizedOperation(
         db,
         {
-          ...mutation,
+          ...gmMutation,
           tool: "foundry.documents.update",
           correlationId: "success-1",
           auditDetails: { uuid: "Actor.1", authorization: "Bearer raw-value" },

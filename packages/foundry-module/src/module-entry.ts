@@ -38,6 +38,10 @@ function connectedUserRole(user: UnknownRecord): FoundryUserRole {
   return "PLAYER";
 }
 
+function currentUserIsGameMaster(): boolean {
+  return record(record(record(globalThis).game).user).isGM === true;
+}
+
 function notify(level: "error" | "warn", message: string): void {
   const notifications = record(record(record(globalThis).ui).notifications);
   const handler = notifications[level];
@@ -75,11 +79,12 @@ function registerSettings(): void {
   const settings = record(record(record(globalThis).game).settings);
   const register = settings.register;
   if (typeof register !== "function") return;
+  const visibleToCurrentUser = currentUserIsGameMaster();
   register.call(settings, MODULE_ID, ENDPOINT_SETTING, {
     name: "Foundry MCP bridge endpoint",
     hint: "Exact ws:// or wss:// endpoint shown by the Foundry MCP host. HTTPS Foundry requires wss://.",
     scope: "world",
-    config: true,
+    config: visibleToCurrentUser,
     type: String,
     default: "",
   });
@@ -87,7 +92,7 @@ function registerSettings(): void {
     name: "Foundry MCP pairing secret",
     hint: "Paste the one-time Base32 value shown by the local pairing command. It is stored only in this browser and displayed as a password.",
     scope: "client",
-    config: true,
+    config: visibleToCurrentUser,
     requiresReload: true,
     type: pairingSecretField(),
     input: passwordSettingInput,
@@ -116,6 +121,10 @@ async function startCompanion(): Promise<void> {
   const game = record(globals.game);
   const world = record(game.world);
   const user = record(game.user);
+  if (user.isGM !== true) {
+    notify("warn", "Foundry MCP only starts for an authenticated Game Master.");
+    return;
+  }
   const endpoint = configuredEndpoint();
   if (!endpoint) {
     notify("warn", "Foundry MCP is enabled but its exact bridge endpoint is not configured.");

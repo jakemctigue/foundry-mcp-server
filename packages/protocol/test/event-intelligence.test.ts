@@ -71,6 +71,7 @@ describe("event and intelligence protocol schemas", () => {
         type: "auth.challenge",
         protocolVersion: BRIDGE_PROTOCOL_VERSION,
         challenge,
+        origin: "https://foundry.test",
       }).success,
     ).toBe(true);
     expect(
@@ -87,8 +88,14 @@ describe("event and intelligence protocol schemas", () => {
         proof: "C".repeat(43),
       }).success,
     ).toBe(true);
-    expect(companionAuthPayload(challenge, hello)).toContain("world-a:user-a");
-    expect(() => companionAuthPayload("not-canonical-base64url", hello)).toThrow();
+    const alphaPayload = companionAuthPayload(challenge, "https://foundry.test", hello);
+    const betaPayload = companionAuthPayload(challenge, "https://other-foundry.test", hello);
+    expect(alphaPayload).toContain("world-a:user-a");
+    expect(alphaPayload).not.toBe(betaPayload);
+    expect(() =>
+      companionAuthPayload("not-canonical-base64url", "https://foundry.test", hello),
+    ).toThrow();
+    expect(() => companionAuthPayload(challenge, "https://foundry.test/path", hello)).toThrow();
   });
 
   it("requires exactly one changed-since cursor and bounds context packs", () => {

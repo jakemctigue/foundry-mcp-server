@@ -20,17 +20,19 @@ const PAIRING_SECRET = Buffer.alloc(32, 11);
 async function authenticate(socket: WebSocket, hello: CompanionHelloMessage): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     let challenge: string | undefined;
+    let origin: string | undefined;
     let ready = false;
     const onMessage = (data: WebSocket.RawData) => {
       const message = JSON.parse(data.toString()) as Record<string, unknown>;
       if (message["type"] === "auth.challenge" && typeof message["challenge"] === "string") {
         challenge = message["challenge"];
+        origin = message["origin"] as string;
         socket.send(
           JSON.stringify({
             type: "auth.proof",
             hello,
             proof: createHmac("sha256", PAIRING_SECRET)
-              .update(companionAuthPayload(challenge, hello), "utf8")
+              .update(companionAuthPayload(challenge, origin, hello), "utf8")
               .digest("base64url"),
           }),
         );
@@ -39,7 +41,7 @@ async function authenticate(socket: WebSocket, hello: CompanionHelloMessage): Pr
       if (message["type"] === "auth.ready" && typeof message["proof"] === "string") {
         expect(message["proof"]).toBe(
           createHmac("sha256", PAIRING_SECRET)
-            .update(companionAuthReadyPayload(challenge ?? "", hello), "utf8")
+            .update(companionAuthReadyPayload(challenge ?? "", origin ?? "", hello), "utf8")
             .digest("base64url"),
         );
         ready = true;

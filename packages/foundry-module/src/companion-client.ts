@@ -217,6 +217,7 @@ function parseState(raw: string | null, connectionId: string): PersistedState {
 export class CompanionBridgeClient {
   readonly #endpoint: string;
   readonly #storageKey: string;
+  readonly #pageOrigin: string;
   readonly #maxPendingEvents: number;
   readonly #maxCachedResponses: number;
   readonly #schedule: (callback: () => void, delayMs: number) => unknown;
@@ -232,7 +233,7 @@ export class CompanionBridgeClient {
 
   constructor(readonly options: CompanionClientOptions) {
     this.#endpoint = validateEndpoint(options.endpoint);
-    validateOrigin(options.pageOrigin, options.allowedOrigins);
+    this.#pageOrigin = validateOrigin(options.pageOrigin, options.allowedOrigins);
     this.#storageKey = options.storageKey ?? `foundry-mcp:${options.connectionId}:bridge-state`;
     this.#maxPendingEvents = options.maxPendingEvents ?? 500;
     this.#maxCachedResponses = options.maxCachedResponses ?? 500;
@@ -332,6 +333,10 @@ export class CompanionBridgeClient {
         socket.close(1008, "companion hello identity is unavailable");
         return;
       }
+      if (challenge.origin !== this.#pageOrigin) {
+        socket.close(1008, "companion authentication Origin mismatch");
+        return;
+      }
       let proof: CompanionAuthProofMessage;
       try {
         proof = {
@@ -339,7 +344,7 @@ export class CompanionBridgeClient {
           hello,
           proof: await signCompanionProof(
             this.#pairingSecret,
-            companionAuthPayload(challenge.challenge, hello),
+            companionAuthPayload(challenge.challenge, challenge.origin, hello),
           ),
         };
       } catch {
@@ -362,7 +367,7 @@ export class CompanionBridgeClient {
           ready.proof,
           await signCompanionProof(
             this.#pairingSecret,
-            companionAuthReadyPayload(challenge, hello),
+            companionAuthReadyPayload(challenge, this.#pageOrigin, hello),
           ),
         )
       ) {

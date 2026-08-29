@@ -18,16 +18,8 @@ export type RequestedCapability = (typeof REQUESTED_CAPABILITIES)[number];
 
 const ROLE_CEILINGS: Record<FoundryUserRole, ReadonlySet<RequestedCapability>> = {
   PLAYER: new Set(["read"]),
-  TRUSTED: new Set(["read", "sessions:append"]),
-  ASSISTANT: new Set([
-    "read",
-    "documents:create",
-    "documents:update",
-    "assets:upload",
-    "assets:attach",
-    "sessions:start",
-    "sessions:append",
-  ]),
+  TRUSTED: new Set(["read"]),
+  ASSISTANT: new Set(["read"]),
   GAMEMASTER: new Set(REQUESTED_CAPABILITIES),
 };
 

@@ -37,3 +37,44 @@ export function assertAllowedWebSocketOrigin(
   }
   return normalized;
 }
+
+function normalizedHosts(hosts: readonly string[]): ReadonlySet<string> {
+  if (hosts.length === 0) throw new Error("at least one exact WebSocket Host must be configured");
+  const normalized = new Set<string>();
+  for (const host of hosts) {
+    if (host.trim() !== host || host.length === 0 || /[\\/@?#]/.test(host)) {
+      throw new Error(`WebSocket Host must be an exact authority: ${host}`);
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(`ws://${host}`);
+    } catch {
+      throw new Error(`WebSocket Host must be an exact authority: ${host}`);
+    }
+    if (parsed.host !== host.toLowerCase() || parsed.pathname !== "/") {
+      throw new Error(`WebSocket Host must be an exact authority: ${host}`);
+    }
+    normalized.add(parsed.host);
+  }
+  return normalized;
+}
+
+/** Fails closed before upgrade unless the HTTP Host is an explicitly allowed authority. */
+export function assertAllowedWebSocketHost(
+  host: string | undefined,
+  allowedHosts: readonly string[],
+): string {
+  const allowed = normalizedHosts(allowedHosts);
+  if (!host) throw new Error("WebSocket Host header is required");
+  if (host.trim() !== host || /[\\/@?#]/.test(host)) {
+    throw new Error("WebSocket Host header is malformed");
+  }
+  let normalized: string;
+  try {
+    normalized = new URL(`ws://${host}`).host;
+  } catch {
+    throw new Error("WebSocket Host header is malformed");
+  }
+  if (!allowed.has(normalized)) throw new Error(`WebSocket Host is not allowed: ${normalized}`);
+  return normalized;
+}

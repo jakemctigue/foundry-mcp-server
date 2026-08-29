@@ -14,4 +14,4 @@ export const LEGACY_MCP_PROTOCOL_VERSIONS = [
 ] as const;
 
 /** Private Foundry module/host/adapter bridge revision; this is not MCP. */
-export const BRIDGE_PROTOCOL_VERSION = "1" as const;
+export const BRIDGE_PROTOCOL_VERSION = "2" as const;

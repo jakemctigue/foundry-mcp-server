@@ -19,11 +19,29 @@ export type CompanionHelloMessage = z.infer<typeof CompanionHelloMessageSchema>;
 
 const CompanionAuthValueSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 
+export const CompanionOriginSchema = z
+  .string()
+  .max(2_048)
+  .refine(
+    (value) => {
+      try {
+        const parsed = new URL(value);
+        return (
+          (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.origin === value
+        );
+      } catch {
+        return false;
+      }
+    },
+    { message: "companion Origin must be an exact http(s) origin" },
+  );
+
 export const CompanionAuthChallengeMessageSchema = z
   .object({
     type: z.literal("auth.challenge"),
     protocolVersion: z.literal(BRIDGE_PROTOCOL_VERSION),
     challenge: CompanionAuthValueSchema,
+    origin: CompanionOriginSchema,
   })
   .strict();
 export type CompanionAuthChallengeMessage = z.infer<typeof CompanionAuthChallengeMessageSchema>;
@@ -47,12 +65,18 @@ export const CompanionAuthReadyMessageSchema = z
 export type CompanionAuthReadyMessage = z.infer<typeof CompanionAuthReadyMessageSchema>;
 
 /** Stable, domain-separated payload authenticated by the companion pairing secret. */
-export function companionAuthPayload(challenge: string, hello: CompanionHelloMessage): string {
+export function companionAuthPayload(
+  challenge: string,
+  origin: string,
+  hello: CompanionHelloMessage,
+): string {
   const parsedChallenge = CompanionAuthValueSchema.parse(challenge);
+  const parsedOrigin = CompanionOriginSchema.parse(origin);
   const parsedHello = CompanionHelloMessageSchema.parse(hello);
   return JSON.stringify([
-    "foundry-mcp-companion-auth-v1",
+    "foundry-mcp-companion-auth-v2",
     parsedChallenge,
+    parsedOrigin,
     parsedHello.protocolVersion,
     parsedHello.connectionId,
     parsedHello.worldId,
@@ -63,8 +87,12 @@ export function companionAuthPayload(challenge: string, hello: CompanionHelloMes
 }
 
 /** Server proof binds the ready signal to the same challenge and authenticated identity. */
-export function companionAuthReadyPayload(challenge: string, hello: CompanionHelloMessage): string {
-  return `${companionAuthPayload(challenge, hello)}\nserver-ready`;
+export function companionAuthReadyPayload(
+  challenge: string,
+  origin: string,
+  hello: CompanionHelloMessage,
+): string {
+  return `${companionAuthPayload(challenge, origin, hello)}\nserver-ready`;
 }
 
 export const EventEnvelopeSchema = z
