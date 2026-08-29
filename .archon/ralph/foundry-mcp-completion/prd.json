@@ -37,8 +37,8 @@
       "technicalNotes": "packages/protocol/src/version.ts:1-2; consumed by packages/mcp-adapter/src/bridge-connection.ts negotiateProtocolVersion and server.ts:84-101.",
       "dependsOn": ["US-001"],
       "priority": 2,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Implemented in iteration 2. Files: packages/protocol/src/version.ts (PROTOCOL_VERSION corrected from the fictional '2026-07-28' to '2025-11-25', the installed SDK's real LATEST_PROTOCOL_VERSION per US-001's test evidence; LEGACY_PROTOCOL_VERSIONS left as ['2025-06-18'] since it's already a real SDK-supported version; added a comment distinguishing PRD's original target from the actual negotiated value), packages/protocol/test/version.test.ts, packages/mcp-adapter/test/server.test.ts, packages/mcp-adapter/test-e2e/smoke.test.ts, packages/foundry-module/test/handshake.test.ts (all updated to reference the constant instead of a hardcoded '2026-07-28' string)."
     },
     {
       "id": "US-003",

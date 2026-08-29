@@ -40,3 +40,26 @@
 - Ran `npx prettier --write` on the new test file after authoring — this repo's file formatting expects prettier default style; no root `format`/`format:check` script exists, so prettier was invoked ad hoc. Consider checking for a `.prettierrc` before assuming defaults in future stories.
 
 ---
+## 2026-08-29 — US-002: Correct PROTOCOL_VERSION and legacy compatibility list
+
+**Status**: PASSED
+**Files changed**:
+- `packages/protocol/src/version.ts` — `PROTOCOL_VERSION` corrected from the fictional `"2026-07-28"` to `"2025-11-25"` (installed SDK's `LATEST_PROTOCOL_VERSION`, confirmed by US-001's `protocol-negotiation.test.ts`); `LEGACY_PROTOCOL_VERSIONS` left as `["2025-06-18"]` (already a real SDK-supported version); added a comment distinguishing PRD's original `2026-07-28` target from the actual negotiated value and clarifying this constant governs the private host<->adapter bridge protocol (and is also what `foundry.capabilities.get` reports).
+- `packages/protocol/test/version.test.ts` — asserts the corrected constant value.
+- `packages/mcp-adapter/test/server.test.ts`, `packages/mcp-adapter/test-e2e/smoke.test.ts`, `packages/foundry-module/test/handshake.test.ts` — replaced hardcoded `"2026-07-28"` assertions with references to the `PROTOCOL_VERSION` constant so they can't silently drift from it again.
+
+**Acceptance criteria verified**:
+- [x] `PROTOCOL_VERSION`/`LEGACY_PROTOCOL_VERSIONS` set to values confirmed by US-001's test evidence
+- [x] `packages/protocol/test/version.test.ts` updated to assert the corrected constants
+- [x] `2026-07-28` no longer claimed as a currently-negotiated wire version; PRD-target-vs-actual framing preserved as a comment in `version.ts`
+- [x] `foundry.capabilities.get` output reflects the corrected constant with no other behavior change (only the imported constant value changed, `server.ts` itself untouched)
+- [x] Type-check passes (`pnpm exec turbo run typecheck` — 7/7 tasks)
+- [x] Tests pass (`pnpm exec turbo run typecheck lint test test:e2e` — 25/25 tasks green)
+
+**Learnings**:
+- `docs/PRD.md` is the immutable source contract per `spec.md`'s own framing ("Where this spec is silent, docs/PRD.md governs") — left it untouched; the "target vs actual" framing requirement was satisfied with a code comment in `version.ts` instead of editing the PRD doc itself.
+- All 5 files under this repo that hardcoded `"2026-07-28"` were test assertions, not just `version.ts` itself — grep for the literal string across the repo (excluding `node_modules`/`dist`/coverage output) before declaring a version-constant story done, so no stale hardcoded assertion is left behind to silently pass for the wrong reason.
+- `npx prettier --write` reorders import statements (alphabetizes/groups them) in this repo's style even when only a single line changed — run it after any edit that adds a new import, then re-run `pnpm exec turbo run typecheck lint test test:e2e` once more to confirm the reformat didn't break anything.
+- Editing `prd.json` with `JSON.stringify(obj, null, 2)` reformats *every* array in the file (e.g. `"dependsOn": ["US-001"]` becomes 3 lines), producing a huge unrelated diff — edit `prd.json` with a targeted string replacement (Edit tool) instead of a full read/parse/stringify/write round trip.
+
+---
