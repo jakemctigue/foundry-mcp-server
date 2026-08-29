@@ -100,7 +100,12 @@ function deterministicPng(prompt: string): Uint8Array {
 export class DeterministicImageProvider implements ImageGenerationProvider {
   readonly id = "deterministic";
 
-  async generate(prompt: string): Promise<GeneratedImage> {
+  async generate(
+    prompt: string,
+    _options: ImageGenerationOptions = {},
+    signal?: AbortSignal,
+  ): Promise<GeneratedImage> {
+    signal?.throwIfAborted();
     const bytes = deterministicPng(prompt);
     const inspected = inspectImageBytes(bytes, {
       expectedMimeType: "image/png",
@@ -211,7 +216,12 @@ export class OpenAiImagesProvider implements ImageGenerationProvider {
     this.#maxImagePixels = options.maxImagePixels ?? MAX_IMAGE_PIXELS;
   }
 
-  async generate(prompt: string, options: ImageGenerationOptions = {}): Promise<GeneratedImage> {
+  async generate(
+    prompt: string,
+    options: ImageGenerationOptions = {},
+    signal?: AbortSignal,
+  ): Promise<GeneratedImage> {
+    signal?.throwIfAborted();
     const body = {
       model: this.#model,
       prompt,
@@ -229,8 +239,10 @@ export class OpenAiImagesProvider implements ImageGenerationProvider {
           "Content-Type": "application/json",
         },
         body: JSON.stringify(body),
+        ...(signal ? { signal } : {}),
       });
     } catch (error) {
+      signal?.throwIfAborted();
       this.#logger?.error("OpenAI Images network request failed", {
         provider: this.id,
         errorType: error instanceof Error ? error.name : "UnknownError",
@@ -319,6 +331,7 @@ export class ImageProviderRegistry {
     prompt: string,
     options: ImageGenerationOptions = {},
     providerId = "deterministic",
+    signal?: AbortSignal,
   ): Promise<GeneratedImage & { provider: string }> {
     const provider = this.#providers.get(providerId);
     if (!provider) {
@@ -327,7 +340,9 @@ export class ImageProviderRegistry {
         this.#unavailable.get(providerId) ?? `Image provider ${providerId} is unavailable`,
       );
     }
-    const image = await provider.generate(prompt, options);
+    signal?.throwIfAborted();
+    const image = await provider.generate(prompt, options, signal);
+    signal?.throwIfAborted();
     return { ...image, provider: provider.id };
   }
 }

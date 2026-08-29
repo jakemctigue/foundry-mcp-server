@@ -40,12 +40,24 @@ describe("modern MCP negotiation against the built adapter", () => {
       expect.arrayContaining(["foundry.connections.list", "foundry.capabilities.get"]),
     );
 
-    const connections = await client.callTool({
-      name: "foundry.connections.list",
-      arguments: {},
-    });
+    const progress: Array<{
+      progress: number;
+      total?: number | undefined;
+      message?: string | undefined;
+    }> = [];
+    const connections = await client.callTool(
+      {
+        name: "foundry.connections.list",
+        arguments: {},
+      },
+      { onprogress: (update) => progress.push(update) },
+    );
     expect(connections.isError).not.toBe(true);
     expect(connections.structuredContent).toEqual({ connections: [] });
+    expect(progress).toEqual([
+      expect.objectContaining({ progress: 0, total: 1_000 }),
+      expect.objectContaining({ progress: 1_000, total: 1_000 }),
+    ]);
 
     const capabilities = await client.callTool({
       name: "foundry.capabilities.get",

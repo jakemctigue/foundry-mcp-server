@@ -25,6 +25,7 @@ import { mutationContext } from "../mutation-authorization.js";
 import {
   forwardAuthorizedBridgeTool,
   forwardBridgeTool,
+  bridgeRequestOptions,
   type ToolServer,
 } from "./bridge-tool.js";
 
@@ -37,19 +38,35 @@ export function registerDocumentTools(
     "foundry.documents.types",
     {
       title: "List Foundry Document types",
-      description: "Enumerates runtime Document registrations, subtypes, and effective capabilities.",
+      description:
+        "Enumerates runtime Document registrations, subtypes, and effective capabilities.",
       inputSchema: DocumentsTypesInput,
     },
-    (args) => forwardBridgeTool(bridge, "documents.types", args, DocumentsTypesOutput),
+    (args, context) =>
+      forwardBridgeTool(
+        bridge,
+        "documents.types",
+        args,
+        DocumentsTypesOutput,
+        bridgeRequestOptions(context),
+      ),
   );
   server.registerTool(
     "foundry.documents.list",
     {
       title: "List Foundry Documents",
-      description: "Lists any visible world Document type with stable sorting and cursor pagination.",
+      description:
+        "Lists any visible world Document type with stable sorting and cursor pagination.",
       inputSchema: DocumentsListInput,
     },
-    (args) => forwardBridgeTool(bridge, "documents.list", args, DocumentsListOutput),
+    (args, context) =>
+      forwardBridgeTool(
+        bridge,
+        "documents.list",
+        args,
+        DocumentsListOutput,
+        bridgeRequestOptions(context),
+      ),
   );
   server.registerTool(
     "foundry.documents.get",
@@ -58,41 +75,66 @@ export function registerDocumentTools(
       description: "Resolves a world, embedded, or compendium UUID and returns a serialized view.",
       inputSchema: DocumentsGetInput,
     },
-    (args) => forwardBridgeTool(bridge, "documents.get", args, DocumentsGetOutput),
+    (args, context) =>
+      forwardBridgeTool(
+        bridge,
+        "documents.get",
+        args,
+        DocumentsGetOutput,
+        bridgeRequestOptions(context),
+      ),
   );
   server.registerTool(
     "foundry.documents.create",
     {
       title: "Create Foundry Documents",
-      description: "Creates validated root or embedded Documents, with optional atomic batch rollback.",
+      description:
+        "Creates validated root or embedded Documents, with optional atomic batch rollback.",
       inputSchema: DocumentsCreateInput,
     },
-    (args) =>
-      forwardAuthorizedBridgeTool(
+    (args, context) => {
+      const options = bridgeRequestOptions(context);
+      return forwardAuthorizedBridgeTool(
         authorizer,
-        mutationContext("foundry.documents.create", args, "documents:create"),
+        mutationContext(
+          "foundry.documents.create",
+          args,
+          "documents:create",
+          options.correlationId,
+        ),
         bridge,
         "documents.create",
         args,
         DocumentsCreateOutput,
-      ),
+        options,
+      );
+    },
   );
   server.registerTool(
     "foundry.documents.update",
     {
       title: "Update a Foundry Document",
-      description: "Updates a UUID with optimistic concurrency while preserving unknown system fields.",
+      description:
+        "Updates a UUID with optimistic concurrency while preserving unknown system fields.",
       inputSchema: DocumentsUpdateInput,
     },
-    (args) =>
-      forwardAuthorizedBridgeTool(
+    (args, context) => {
+      const options = bridgeRequestOptions(context);
+      return forwardAuthorizedBridgeTool(
         authorizer,
-        mutationContext("foundry.documents.update", args, "documents:update"),
+        mutationContext(
+          "foundry.documents.update",
+          args,
+          "documents:update",
+          options.correlationId,
+        ),
         bridge,
         "documents.update",
         args,
         DocumentsUpdateOutput,
-      ),
+        options,
+      );
+    },
   );
   server.registerTool(
     "foundry.documents.embedded.list",
@@ -101,8 +143,14 @@ export function registerDocumentTools(
       description: "Recursively enumerates embedded Documents with depth and page bounds.",
       inputSchema: EmbeddedDocumentsListInput,
     },
-    (args) =>
-      forwardBridgeTool(bridge, "documents.embedded.list", args, EmbeddedDocumentsListOutput),
+    (args, context) =>
+      forwardBridgeTool(
+        bridge,
+        "documents.embedded.list",
+        args,
+        EmbeddedDocumentsListOutput,
+        bridgeRequestOptions(context),
+      ),
   );
   server.registerTool(
     "foundry.compendiums.list",
@@ -111,7 +159,14 @@ export function registerDocumentTools(
       description: "Lists accessible compendium packs and lock state.",
       inputSchema: CompendiumsListInput,
     },
-    (args) => forwardBridgeTool(bridge, "compendiums.list", args, CompendiumsListOutput),
+    (args, context) =>
+      forwardBridgeTool(
+        bridge,
+        "compendiums.list",
+        args,
+        CompendiumsListOutput,
+        bridgeRequestOptions(context),
+      ),
   );
   server.registerTool(
     "foundry.compendiums.documents.list",
@@ -120,12 +175,13 @@ export function registerDocumentTools(
       description: "Lists or hydrates a compendium index with stable cursor pagination.",
       inputSchema: CompendiumDocumentsListInput,
     },
-    (args) =>
+    (args, context) =>
       forwardBridgeTool(
         bridge,
         "compendiums.documents.list",
         args,
         CompendiumDocumentsListOutput,
+        bridgeRequestOptions(context),
       ),
   );
   server.registerTool(
@@ -135,6 +191,13 @@ export function registerDocumentTools(
       description: "Builds a bounded, redacted JSON snapshot by UUID or query.",
       inputSchema: DocumentsSnapshotInput,
     },
-    (args) => forwardBridgeTool(bridge, "documents.snapshot", args, DocumentsSnapshotOutput),
+    (args, context) =>
+      forwardBridgeTool(
+        bridge,
+        "documents.snapshot",
+        args,
+        DocumentsSnapshotOutput,
+        bridgeRequestOptions(context),
+      ),
   );
 }

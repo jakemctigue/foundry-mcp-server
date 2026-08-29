@@ -659,4 +659,125 @@ describe("real browser companion host (mocked Foundry WebSocket)", () => {
         .all("compound-attach"),
     ).toEqual([{ outcome: "denied" }, { outcome: "success" }]);
   });
+
+  it("forwards progress and correlated cancellation over a real WebSocket without retrying", async () => {
+    const db = openDatabase(":memory:");
+    runMigrations(db);
+    cleanups.push(() => {
+      db.close();
+    });
+    const server = await startHostCompanionServer({
+      db,
+      allowedOrigins: ["http://foundry.test"],
+      requestTimeoutMs: 2_000,
+      pairingSecret: PAIRING_SECRET,
+    });
+    cleanups.push(server.close);
+    const socket = new WebSocket(server.address().endpoint, { origin: "http://foundry.test" });
+    cleanups.push(() => socket.terminate());
+    await authenticate(socket, hello("world-cancel"));
+
+    let requests = 0;
+    socket.on("message", (data) => {
+      const message = JSON.parse(data.toString()) as {
+        type?: string;
+        id?: string;
+        reason?: string;
+      };
+      if (message.type === "request" && message.id === "cancel-op") {
+        requests += 1;
+        socket.send(
+          JSON.stringify({
+            type: "request.progress",
+            id: message.id,
+            progress: {
+              stage: "progress",
+              progress: 350,
+              total: 1_000,
+              message: "snapshot traversal",
+            },
+          }),
+        );
+      }
+      if (message.type === "request.cancel" && message.id === "cancel-op") {
+        socket.send(
+          JSON.stringify({
+            type: "response",
+            id: message.id,
+            ok: false,
+            error: {
+              code: message.reason === "timeout" ? "TIMEOUT" : "CANCELLED",
+              message: "operation stopped",
+              retryable: false,
+            },
+          }),
+        );
+      }
+    });
+    const progress = vi.fn();
+    const controller = new AbortController();
+    const result = server.request("world-cancel", "documents.snapshot", {}, "cancel-op", {
+      signal: controller.signal,
+      deadline: Date.now() + 1_000,
+      correlationId: "mcp-cancel-op",
+      onProgress: progress,
+    });
+    await vi.waitFor(() => expect(progress).toHaveBeenCalledOnce());
+    controller.abort();
+    await expect(result).resolves.toMatchObject({ ok: false, error: { code: "CANCELLED" } });
+    await expect(
+      server.request("world-cancel", "documents.snapshot", {}, "cancel-op"),
+    ).resolves.toMatchObject({ ok: false, error: { code: "CANCELLED" } });
+    expect(progress).toHaveBeenCalledWith(
+      expect.objectContaining({ progress: 350, message: "snapshot traversal" }),
+    );
+    expect(requests).toBe(1);
+  });
+
+  it("rejects pre-dispatch aborts and deadlines, then times out offline work", async () => {
+    const db = openDatabase(":memory:");
+    runMigrations(db);
+    cleanups.push(() => {
+      db.close();
+    });
+    const server = await startHostCompanionServer({
+      db,
+      allowedOrigins: ["http://foundry.test"],
+      requestTimeoutMs: 10,
+      pairingSecret: PAIRING_SECRET,
+    });
+    cleanups.push(server.close);
+
+    const controller = new AbortController();
+    controller.abort("caller cancelled");
+    await expect(
+      server.request("offline-world", "documents.snapshot", {}, "already-cancelled", {
+        signal: controller.signal,
+        correlationId: "pre-abort",
+      }),
+    ).rejects.toMatchObject({ envelope: { code: "CANCELLED" } });
+    await expect(
+      server.request("offline-world", "documents.snapshot", {}, "already-expired", {
+        deadline: Date.now() - 1,
+        correlationId: "pre-timeout",
+      }),
+    ).rejects.toMatchObject({ envelope: { code: "TIMEOUT" } });
+
+    vi.useFakeTimers();
+    try {
+      const offline = server.request("offline-world", "documents.snapshot", {}, "offline-timeout", {
+        correlationId: "offline-timeout",
+      });
+      const rejection = expect(offline).rejects.toMatchObject({
+        envelope: {
+          code: "TIMEOUT",
+          details: { correlationId: "offline-timeout" },
+        },
+      });
+      await vi.advanceTimersByTimeAsync(1_011);
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

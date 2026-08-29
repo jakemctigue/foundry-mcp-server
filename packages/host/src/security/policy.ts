@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { ErrorEnvelope } from "@foundry-mcp/protocol";
 import { redactSecrets, redactSecretText } from "./redaction.js";
 
 export const FOUNDRY_USER_ROLES = ["PLAYER", "TRUSTED", "ASSISTANT", "GAMEMASTER"] as const;
@@ -139,6 +140,12 @@ function reportAuditFailure(
   options.onAuditFailure?.(error instanceof Error ? error : new Error(String(error)), committed);
 }
 
+function structuredOperationError(error: unknown): unknown | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const parsed = ErrorEnvelope.safeParse((error as { envelope?: unknown }).envelope);
+  return parsed.success ? parsed.data : undefined;
+}
+
 function recordAudit(
   db: Database.Database,
   values: {
@@ -198,6 +205,9 @@ export async function runAuthorizedOperation<T>(
         details: {
           request: options.auditDetails,
           error: redactSecretText(error instanceof Error ? error.message : String(error)),
+          ...(structuredOperationError(error)
+            ? { operationOutcome: structuredOperationError(error) }
+            : {}),
         },
       });
     } catch (auditError) {
@@ -245,6 +255,9 @@ export async function runAuthorizedOperation<T>(
         details: {
           request: options.auditDetails,
           error: redactSecretText(error instanceof Error ? error.message : String(error)),
+          ...(structuredOperationError(error)
+            ? { operationOutcome: structuredOperationError(error) }
+            : {}),
         },
       });
     } catch (auditError) {

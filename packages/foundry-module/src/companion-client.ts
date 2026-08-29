@@ -1,6 +1,7 @@
 import {
   CompanionAuthChallengeMessageSchema,
   CompanionAuthReadyMessageSchema,
+  CompanionRequestCancelMessageSchema,
   CompanionRequestMessageSchema,
   CompanionWireMessageSchema,
   EventEnvelopeSchema,
@@ -8,12 +9,18 @@ import {
   EventResumeMessageSchema,
   companionAuthPayload,
   companionAuthReadyPayload,
+  MAX_OPERATION_DURATION_MS,
+  MAX_OPERATION_PROGRESS_UPDATES,
+  makeError,
   type CompanionAuthProofMessage,
   type CompanionResponseMessage,
+  type CompanionRequestProgressMessage,
   type CompanionHelloMessage,
   type EventEnvelope,
   type EventPublishMessage,
   type JsonValue,
+  type OperationExecutionOptions,
+  type OperationProgress,
 } from "@foundry-mcp/protocol";
 
 export interface CompanionStorage {
@@ -36,7 +43,11 @@ export interface CompanionClientOptions {
   connectionId: string;
   storage: CompanionStorage;
   createSocket: (endpoint: string) => CompanionSocket;
-  handleRequest: (method: string, params: Record<string, JsonValue>) => Promise<JsonValue>;
+  handleRequest: (
+    method: string,
+    params: Record<string, JsonValue>,
+    options: OperationExecutionOptions,
+  ) => Promise<JsonValue>;
   hello?: CompanionHelloMessage;
   /** Base32 value shown by the pairing command, or the equivalent raw 32 bytes. */
   pairingSecret?: string | Uint8Array;
@@ -52,6 +63,18 @@ interface PersistedState {
   pendingEvents: EventPublishMessage[];
   responses: CompanionResponseMessage[];
   inFlightMutations: Array<{ id: string; method: string }>;
+}
+
+interface InFlightRequest {
+  controller: AbortController;
+  correlationId: string;
+  deadline: number;
+  promise: Promise<CompanionResponseMessage>;
+  timer?: ReturnType<typeof setTimeout> | undefined;
+  committed: boolean;
+  committedDetails?: string | undefined;
+  progressUpdates: number;
+  waiters: number;
 }
 
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -229,7 +252,7 @@ export class CompanionBridgeClient {
   #authenticated = false;
   #challenge: string | undefined;
   #receiveQueue: Promise<void> = Promise.resolve();
-  readonly #inFlightRequests = new Map<string, Promise<CompanionResponseMessage>>();
+  readonly #inFlightRequests = new Map<string, InFlightRequest>();
 
   constructor(readonly options: CompanionClientOptions) {
     this.#endpoint = validateEndpoint(options.endpoint);
@@ -256,6 +279,7 @@ export class CompanionBridgeClient {
     this.#resumed = false;
     this.#authenticated = false;
     this.#challenge = undefined;
+    for (const request of this.#inFlightRequests.values()) request.controller.abort("cancelled");
   }
 
   publish(event: Omit<EventEnvelope, "sequenceId">): EventEnvelope {
@@ -410,8 +434,20 @@ export class CompanionBridgeClient {
       this.#persist();
       return;
     }
+    if (CompanionRequestCancelMessageSchema.safeParse(parsed.data).success) {
+      const cancellation = CompanionRequestCancelMessageSchema.parse(parsed.data);
+      const inFlight = this.#inFlightRequests.get(cancellation.id);
+      if (inFlight?.correlationId === cancellation.correlationId) {
+        inFlight.controller.abort(cancellation.reason);
+      }
+      return;
+    }
     if (!CompanionRequestMessageSchema.safeParse(parsed.data).success) return;
     const request = CompanionRequestMessageSchema.parse(parsed.data);
+    this.#beginRequest(request);
+  }
+
+  #beginRequest(request: ReturnType<typeof CompanionRequestMessageSchema.parse>): void {
     const cached = this.#state.responses.find((response) => response.id === request.id);
     if (cached) {
       this.#send(cached);
@@ -419,7 +455,7 @@ export class CompanionBridgeClient {
     }
     const inFlight = this.#inFlightRequests.get(request.id);
     if (inFlight) {
-      this.#send(await inFlight);
+      inFlight.waiters += 1;
       return;
     }
     const recoveredMutation = this.#state.inFlightMutations.find(
@@ -433,6 +469,8 @@ export class CompanionBridgeClient {
         error: {
           code: "INDETERMINATE_MUTATION",
           message: `Mutation ${recoveredMutation.method} may have committed before restart; reconcile state before retrying`,
+          retryable: false,
+          details: { committed: true, indeterminate: true },
         },
       };
       this.#state.inFlightMutations = this.#state.inFlightMutations.filter(
@@ -448,22 +486,41 @@ export class CompanionBridgeClient {
       this.#state.inFlightMutations.push({ id: request.id, method: request.method });
       this.#persist();
     }
-    const execution = this.#executeRequest(request);
-    this.#inFlightRequests.set(request.id, execution);
-    let response: CompanionResponseMessage;
-    try {
-      response = await execution;
-    } finally {
-      this.#inFlightRequests.delete(request.id);
+    const now = Date.now();
+    const deadline = Math.min(
+      request.control?.deadline ?? now + MAX_OPERATION_DURATION_MS,
+      now + MAX_OPERATION_DURATION_MS,
+    );
+    const state: InFlightRequest = {
+      controller: new AbortController(),
+      correlationId: request.control?.correlationId ?? request.id.slice(0, 128),
+      deadline,
+      promise: Promise.resolve({ type: "response", id: request.id, ok: true, value: null }),
+      committed: false,
+      progressUpdates: 0,
+      waiters: 1,
+    };
+    if (deadline <= now) state.controller.abort("timeout");
+    else {
+      state.timer = setTimeout(() => state.controller.abort("timeout"), deadline - now);
     }
-    if (isMutation) {
-      this.#state.inFlightMutations = this.#state.inFlightMutations.filter(
-        (entry) => entry.id !== request.id,
-      );
-    }
-    this.#cacheResponse(response);
-    this.#persist();
-    this.#send(response);
+    const execution = this.#executeRequest(request, state, isMutation);
+    state.promise = execution;
+    this.#inFlightRequests.set(request.id, state);
+    void execution.then((response) => {
+      if (state.timer) clearTimeout(state.timer);
+      if (this.#inFlightRequests.get(request.id) === state) {
+        this.#inFlightRequests.delete(request.id);
+      }
+      if (isMutation) {
+        this.#state.inFlightMutations = this.#state.inFlightMutations.filter(
+          (entry) => entry.id !== request.id,
+        );
+      }
+      this.#cacheResponse(response);
+      this.#persist();
+      for (let index = 0; index < state.waiters; index += 1) this.#send(response);
+    });
   }
 
   #cacheResponse(response: CompanionResponseMessage): void {
@@ -473,12 +530,72 @@ export class CompanionBridgeClient {
 
   async #executeRequest(
     request: ReturnType<typeof CompanionRequestMessageSchema.parse>,
+    state: InFlightRequest,
+    isMutation: boolean,
   ): Promise<CompanionResponseMessage> {
     let response: CompanionResponseMessage;
+    const reportProgress = async (progress: OperationProgress): Promise<void> => {
+      if (!request.control?.progress || state.progressUpdates >= MAX_OPERATION_PROGRESS_UPDATES)
+        return;
+      state.progressUpdates += 1;
+      this.#send({ type: "request.progress", id: request.id, progress });
+    };
     try {
-      const value = await this.options.handleRequest(request.method, request.params);
+      state.controller.signal.throwIfAborted();
+      await reportProgress({
+        stage: "start",
+        progress: 0,
+        total: MAX_OPERATION_PROGRESS_UPDATES,
+        message: `${request.method} started`,
+      });
+      const value = await this.options.handleRequest(request.method, request.params, {
+        signal: state.controller.signal,
+        deadline: state.deadline,
+        correlationId: state.correlationId,
+        reportProgress,
+        markCommitted: (details) => {
+          state.committed = true;
+          state.committedDetails = details;
+        },
+      });
+      state.controller.signal.throwIfAborted();
+      await reportProgress({
+        stage: "complete",
+        progress: MAX_OPERATION_PROGRESS_UPDATES,
+        total: MAX_OPERATION_PROGRESS_UPDATES,
+        message: `${request.method} completed`,
+      });
       response = { type: "response", id: request.id, ok: true, value };
     } catch (error) {
+      if (state.controller.signal.aborted) {
+        const timedOut =
+          Date.now() >= state.deadline || state.controller.signal.reason === "timeout";
+        const envelope =
+          isMutation && state.committed
+            ? makeError(
+                "INDETERMINATE_MUTATION",
+                `Mutation ${request.method} committed before cancellation; reconcile state before retrying`,
+                false,
+                {
+                  committed: true,
+                  indeterminate: true,
+                  correlationId: state.correlationId,
+                  ...(state.committedDetails ? { phase: state.committedDetails } : {}),
+                },
+              )
+            : makeError(
+                timedOut ? "TIMEOUT" : "CANCELLED",
+                timedOut ? "Operation deadline elapsed" : "Operation was cancelled",
+                false,
+                { correlationId: state.correlationId },
+              );
+        return {
+          type: "response",
+          id: request.id,
+          ok: false,
+          error: JSON.parse(JSON.stringify(envelope)) as JsonValue,
+        };
+      }
       response = {
         type: "response",
         id: request.id,
@@ -486,13 +603,16 @@ export class CompanionBridgeClient {
         error: {
           code: "FOUNDRY_ERROR",
           message: error instanceof Error ? error.message : "companion request failed",
+          retryable: false,
         },
       };
     }
     return response;
   }
 
-  #send(message: EventPublishMessage | CompanionResponseMessage): void {
+  #send(
+    message: EventPublishMessage | CompanionResponseMessage | CompanionRequestProgressMessage,
+  ): void {
     if (this.#socket?.readyState === 1) this.#socket.send(JSON.stringify(message));
   }
 

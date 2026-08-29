@@ -601,7 +601,7 @@ describe("MOCKED FOUNDRY v14 full lifecycle E2E", () => {
             connectionId: CONNECTION_ID,
             query: "clockwork",
           })).results,
-        ).toHaveLength(2);
+        ).toHaveLength(4);
 
         const encodedConnectionId = encodeURIComponent(CONNECTION_ID);
         const encodedActorUuid = encodeURIComponent(targetActor);

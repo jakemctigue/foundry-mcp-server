@@ -3,14 +3,21 @@ import {
   AssetsImagesGenerateInput,
   AssetsImagesUploadInput,
   BRIDGE_PROTOCOL_VERSION,
+  BridgeCancelMessageSchema,
+  BridgeRequestMessageSchema,
   ErrorEnvelope,
   IntelligenceChangedSinceInput,
   IntelligenceContextInput,
   IntelligenceSearchInput,
   IntelligenceStatusInput,
   IntelligenceTimelineInput,
+  MAX_OPERATION_DURATION_MS,
+  MAX_OPERATION_PROGRESS_UPDATES,
+  OperationControlSchema,
   makeError,
   type JsonValue,
+  type OperationExecutionOptions,
+  type OperationProgress,
   type RequestedCapability,
 } from "@foundry-mcp/protocol";
 import type Database from "better-sqlite3";
@@ -30,7 +37,7 @@ import {
   ImageProviderRegistry,
 } from "../providers/images.js";
 import { PermissionDeniedError, runAuthorizedOperation } from "../security/policy.js";
-import type { HostCompanionServer } from "./companion-server.js";
+import { CompanionRequestError, type HostCompanionServer } from "./companion-server.js";
 
 const MUTATION_CAPABILITIES = {
   "documents.create": "documents:create",
@@ -61,6 +68,12 @@ const READ_METHODS = new Set([
 type UnknownRecord = Record<string, unknown>;
 type UrlImporter = typeof importImageUrl;
 type AuditFailureReporter = (error: Error, committed: boolean) => void;
+
+interface HostOperationContext extends OperationExecutionOptions {
+  deadline: number;
+  correlationId: string;
+  signal: AbortSignal;
+}
 
 const LOCAL_IMAGE_ERROR_MESSAGES: Record<LocalImageErrorCode, string> = {
   OUTSIDE_ROOT: "Local image path is outside the configured roots",
@@ -130,7 +143,9 @@ function localImageFailure(error: unknown): CompanionOperationError {
 async function resolveLocalImageSource(
   source: { path: string; mimeType?: string | undefined },
   loader?: LocalImageLoader,
+  operation?: HostOperationContext,
 ): Promise<{ kind: "base64"; data: string; mimeType: string }> {
+  assertOperationActive(operation);
   if (!loader) {
     throw new CompanionOperationError(
       makeError("PERMISSION_DENIED", "Local image file access is disabled", false, {
@@ -140,6 +155,7 @@ async function resolveLocalImageSource(
   }
   try {
     const loaded = await loader(source.path);
+    assertOperationActive(operation);
     const declaredMimeType = source.mimeType?.toLowerCase().split(";")[0]?.trim();
     if (declaredMimeType && declaredMimeType !== loaded.mimeType) {
       throw new LocalImageError(
@@ -158,11 +174,40 @@ async function resolveLocalImageSource(
   }
 }
 
+function operationFailure(operation: HostOperationContext): CompanionOperationError | undefined {
+  if (Date.now() >= operation.deadline) {
+    return new CompanionOperationError(
+      makeError("TIMEOUT", "Operation deadline elapsed", false, {
+        correlationId: operation.correlationId,
+      }),
+    );
+  }
+  if (operation.signal.aborted) {
+    return new CompanionOperationError(
+      makeError("CANCELLED", "Operation was cancelled", false, {
+        correlationId: operation.correlationId,
+      }),
+    );
+  }
+  return undefined;
+}
+
+function assertOperationActive(operation?: HostOperationContext): void {
+  if (!operation) return;
+  const failure = operationFailure(operation);
+  if (failure) throw failure;
+}
+
 function defaultImageProviders(): ImageProviderRegistry {
   return new ImageProviderRegistry().register(new DeterministicImageProvider());
 }
 
 export class HostBridgeRouter {
+  readonly #active = new Map<
+    string,
+    { controller: AbortController; correlationId: string; timer: ReturnType<typeof setTimeout> }
+  >();
+
   constructor(
     readonly db: Database.Database,
     readonly companion: HostCompanionServer,
@@ -173,12 +218,84 @@ export class HostBridgeRouter {
   ) {}
 
   handle(message: unknown, respond: (response: unknown) => void): void {
-    const request = record(message);
-    const id = typeof request.id === "string" ? request.id : undefined;
-    const method = typeof request.method === "string" ? request.method : "";
-    const params = record(request.params);
-    void this.dispatch(method, params)
-      .then((result) => respond({ id, result }))
+    const cancel = BridgeCancelMessageSchema.safeParse(message);
+    if (cancel.success) {
+      const active = this.#active.get(cancel.data.id);
+      if (active?.correlationId === cancel.data.correlationId) {
+        active.controller.abort(cancel.data.reason);
+      }
+      return;
+    }
+    const parsed = BridgeRequestMessageSchema.safeParse(message);
+    if (!parsed.success) {
+      const candidate = record(message);
+      respond({
+        id: typeof candidate.id === "string" ? candidate.id : "invalid",
+        error: makeError("INVALID_DATA", "Malformed bridge request"),
+      });
+      return;
+    }
+    const { id, method, params } = parsed.data;
+    const now = Date.now();
+    const legacyAuthorization = record(record(params)["authorization"]);
+    const legacyCorrelationId =
+      method === "mutation.execute" && typeof legacyAuthorization.correlationId === "string"
+        ? legacyAuthorization.correlationId
+        : undefined;
+    const defaultControl = {
+      deadline: now + MAX_OPERATION_DURATION_MS,
+      correlationId: (legacyCorrelationId ?? `host-${id}`).slice(0, 128),
+      progress: false,
+    };
+    const supplied = OperationControlSchema.parse(parsed.data.control ?? defaultControl);
+    const control = {
+      ...supplied,
+      deadline: Math.min(supplied.deadline, now + MAX_OPERATION_DURATION_MS),
+    };
+    if (this.#active.has(id)) {
+      respond({
+        id,
+        error: makeError("CONFLICT", "Duplicate in-flight bridge request id", false, {
+          correlationId: control.correlationId,
+        }),
+      });
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort("timeout"),
+      Math.max(1, control.deadline - now),
+    );
+    timer.unref?.();
+    const reportProgress = control.progress
+      ? (progress: OperationProgress): void => {
+          respond({ type: "request.progress", id, progress });
+        }
+      : undefined;
+    const operation: HostOperationContext = {
+      signal: controller.signal,
+      deadline: control.deadline,
+      correlationId: control.correlationId,
+      ...(reportProgress ? { reportProgress } : {}),
+    };
+    this.#active.set(id, { controller, correlationId: control.correlationId, timer });
+    void reportProgress?.({
+      stage: "start",
+      progress: 0,
+      total: MAX_OPERATION_PROGRESS_UPDATES,
+      message: `${method} started`,
+    });
+    void this.dispatch(method, params, operation)
+      .then((result) => {
+        assertOperationActive(operation);
+        void reportProgress?.({
+          stage: "complete",
+          progress: MAX_OPERATION_PROGRESS_UPDATES,
+          total: MAX_OPERATION_PROGRESS_UPDATES,
+          message: `${method} completed`,
+        });
+        respond({ id, result });
+      })
       .catch((error: unknown) => {
         if (error instanceof PermissionDeniedError) {
           respond({
@@ -194,6 +311,15 @@ export class HostBridgeRouter {
           respond({ id, result: { ok: false, error: error.envelope } });
           return;
         }
+        if (error instanceof CompanionRequestError) {
+          respond({ id, result: { ok: false, error: error.envelope } });
+          return;
+        }
+        const aborted = operationFailure(operation);
+        if (aborted) {
+          respond({ id, result: { ok: false, error: aborted.envelope } });
+          return;
+        }
         respond({
           id,
           result: {
@@ -204,10 +330,19 @@ export class HostBridgeRouter {
             ),
           },
         });
+      })
+      .finally(() => {
+        clearTimeout(timer);
+        this.#active.delete(id);
       });
   }
 
-  async dispatch(method: string, params: UnknownRecord): Promise<unknown> {
+  async dispatch(
+    method: string,
+    params: UnknownRecord,
+    operation?: HostOperationContext,
+  ): Promise<unknown> {
+    assertOperationActive(operation);
     if (method === "initialize") return { protocolVersion: BRIDGE_PROTOCOL_VERSION };
     if (method === "connections.list") {
       return {
@@ -274,7 +409,7 @@ export class HostBridgeRouter {
         ...(input.to === undefined ? {} : { to: input.to }),
       });
     }
-    if (method === "mutation.execute") return this.#mutation(params);
+    if (method === "mutation.execute") return this.#mutation(params, operation);
     if (method in MUTATION_CAPABILITIES) {
       return {
         ok: false,
@@ -288,13 +423,21 @@ export class HostBridgeRouter {
       return { ok: false, error: makeError("NOT_FOUND", `Unknown bridge method ${method}`) };
     }
     const connectionId = this.#resolveConnectionId(params);
-    return this.companion.request(connectionId, method, jsonRecord(params));
+    return this.companion.request(connectionId, method, jsonRecord(params), undefined, operation);
   }
 
-  async #mutation(params: UnknownRecord): Promise<JsonValue> {
+  async #mutation(params: UnknownRecord, operation?: HostOperationContext): Promise<JsonValue> {
     const method = typeof params.method === "string" ? params.method : "";
     const operationParams = record(params.params);
     const authorization = record(params.authorization);
+    const authorizationCorrelationId =
+      typeof authorization.correlationId === "string" ? authorization.correlationId : "missing";
+    const effectiveOperation: HostOperationContext = operation ?? {
+      signal: new AbortController().signal,
+      deadline: Date.now() + MAX_OPERATION_DURATION_MS,
+      correlationId: authorizationCorrelationId,
+    };
+    assertOperationActive(effectiveOperation);
     const expectedCapability = MUTATION_CAPABILITIES[method as keyof typeof MUTATION_CAPABILITIES];
     if (!expectedCapability) throw new Error(`Unknown mutating method ${method}`);
     if (authorization.requestedCapability !== expectedCapability) {
@@ -311,6 +454,11 @@ export class HostBridgeRouter {
     const tool = typeof authorization.tool === "string" ? authorization.tool : `foundry.${method}`;
     const correlationId =
       typeof authorization.correlationId === "string" ? authorization.correlationId : "missing";
+    if (correlationId !== effectiveOperation.correlationId) {
+      throw new CompanionOperationError(
+        makeError("INVALID_DATA", "Mutation correlation id does not match bridge control"),
+      );
+    }
     const assetKind = record(operationParams["asset"])["kind"];
     const additionalCapabilities: RequestedCapability[] =
       method === "assets.images.attach" && (assetKind === "upload" || assetKind === "url")
@@ -329,6 +477,7 @@ export class HostBridgeRouter {
         ...(this.reportAuditFailure ? { onAuditFailure: this.reportAuditFailure } : {}),
       },
       async () => {
+        assertOperationActive(effectiveOperation);
         let companionMethod = method;
         let companionParams = jsonRecord(operationParams);
         let generation: { provider: string; model?: string } | undefined;
@@ -342,7 +491,11 @@ export class HostBridgeRouter {
           companionParams = jsonRecord({
             ...input,
             connectionId,
-            source: await resolveLocalImageSource(input.source, this.localImageLoader),
+            source: await resolveLocalImageSource(
+              input.source,
+              this.localImageLoader,
+              effectiveOperation,
+            ),
           });
         }
         if (method === "assets.images.attach") {
@@ -353,12 +506,19 @@ export class HostBridgeRouter {
               connectionId,
               asset: {
                 ...input.asset,
-                source: await resolveLocalImageSource(input.asset.source, this.localImageLoader),
+                source: await resolveLocalImageSource(
+                  input.asset.source,
+                  this.localImageLoader,
+                  effectiveOperation,
+                ),
               },
             });
           } else if (input.asset.kind === "url") {
             try {
-              const imported = await this.urlImporter(input.asset.url);
+              const imported = await this.urlImporter(input.asset.url, {
+                signal: effectiveOperation.signal,
+              });
+              assertOperationActive(effectiveOperation);
               companionParams = jsonRecord({
                 ...input,
                 connectionId,
@@ -394,7 +554,9 @@ export class HostBridgeRouter {
               input.prompt,
               input.options,
               input.provider,
+              effectiveOperation.signal,
             );
+            assertOperationActive(effectiveOperation);
             generation = {
               provider: generated.provider,
               ...(generated.model === undefined ? {} : { model: generated.model }),
@@ -413,6 +575,7 @@ export class HostBridgeRouter {
               },
             });
           } catch (error) {
+            assertOperationActive(effectiveOperation);
             if (error instanceof ImageProviderError) {
               throw new CompanionOperationError(
                 makeError("FOUNDRY_ERROR", error.message, error.retryable, {
@@ -429,6 +592,7 @@ export class HostBridgeRouter {
           companionMethod,
           companionParams,
           correlationId,
+          effectiveOperation,
         );
         const operationResult = record(result);
         if (operationResult.ok === false) {

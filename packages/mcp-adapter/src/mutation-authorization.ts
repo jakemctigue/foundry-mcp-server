@@ -8,10 +8,7 @@ export interface MutationAuthorizationRequest {
   auditDetails?: unknown;
 }
 export interface MutationAuthorizer {
-  run<T>(
-    request: MutationAuthorizationRequest,
-    operation: () => T | Promise<T>,
-  ): Promise<T>;
+  run<T>(request: MutationAuthorizationRequest, operation: () => T | Promise<T>): Promise<T>;
 }
 
 let correlationCounter = 0;
@@ -20,6 +17,7 @@ export function mutationContext(
   tool: string,
   args: Record<string, unknown>,
   requestedCapability: MutationAuthorizationRequest["requestedCapability"],
+  correlationId?: string,
 ): MutationAuthorizationRequest | undefined {
   const connectionId = args["connectionId"];
   if (typeof connectionId !== "string" || connectionId.length === 0) return undefined;
@@ -28,7 +26,8 @@ export function mutationContext(
     connectionId,
     requestedCapability,
     tool,
-    correlationId: `mcp-${Date.now().toString(36)}-${correlationCounter.toString(36)}`,
+    correlationId:
+      correlationId ?? `mcp-${Date.now().toString(36)}-${correlationCounter.toString(36)}`,
     auditDetails: args,
   };
 }

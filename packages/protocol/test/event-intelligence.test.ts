@@ -99,7 +99,7 @@ describe("event and intelligence protocol schemas", () => {
     const alphaPayload = companionAuthPayload(challenge, "https://foundry.test", hello);
     const betaPayload = companionAuthPayload(challenge, "https://other-foundry.test", hello);
     expect(alphaPayload).toContain("world-a:user-a");
-    expect(alphaPayload).toContain("foundry-mcp-companion-auth-v3");
+    expect(alphaPayload).toContain("foundry-mcp-companion-auth-v4");
     expect(alphaPayload).not.toBe(betaPayload);
     expect(
       CompanionWireMessageSchema.safeParse({

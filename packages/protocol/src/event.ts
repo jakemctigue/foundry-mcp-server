@@ -4,6 +4,7 @@ import { JsonValueSchema } from "./document.js";
 import { FoundryUserRoleSchema } from "./authorization.js";
 import { FoundryDiscoveryMetadataSchema } from "./connection.js";
 import { BRIDGE_PROTOCOL_VERSION } from "./version.js";
+import { OperationControlSchema, OperationProgressSchema } from "./operation.js";
 
 export const CompanionHelloMessageSchema = z
   .object({
@@ -85,7 +86,7 @@ export function companionAuthPayload(
   const parsedOrigin = CompanionOriginSchema.parse(origin);
   const parsedHello = CompanionHelloMessageSchema.parse(hello);
   return JSON.stringify([
-    "foundry-mcp-companion-auth-v3",
+    "foundry-mcp-companion-auth-v4",
     parsedChallenge,
     parsedOrigin,
     parsedHello.protocolVersion,
@@ -165,9 +166,29 @@ export const CompanionRequestMessageSchema = z
     id: z.string().trim().min(1).max(512),
     method: z.string().trim().min(1).max(512),
     params: z.record(z.string(), JsonValueSchema).default({}),
+    control: OperationControlSchema.optional(),
   })
   .strict();
 export type CompanionRequestMessage = z.infer<typeof CompanionRequestMessageSchema>;
+
+export const CompanionRequestCancelMessageSchema = z
+  .object({
+    type: z.literal("request.cancel"),
+    id: z.string().trim().min(1).max(512),
+    correlationId: z.string().trim().min(1).max(128),
+    reason: z.enum(["cancelled", "timeout"]),
+  })
+  .strict();
+export type CompanionRequestCancelMessage = z.infer<typeof CompanionRequestCancelMessageSchema>;
+
+export const CompanionRequestProgressMessageSchema = z
+  .object({
+    type: z.literal("request.progress"),
+    id: z.string().trim().min(1).max(512),
+    progress: OperationProgressSchema,
+  })
+  .strict();
+export type CompanionRequestProgressMessage = z.infer<typeof CompanionRequestProgressMessageSchema>;
 
 export const CompanionResponseMessageSchema = z
   .object({
@@ -197,6 +218,8 @@ export const CompanionWireMessageSchema = z.discriminatedUnion("type", [
   EventPublishMessageSchema,
   EventAckMessageSchema,
   CompanionRequestMessageSchema,
+  CompanionRequestCancelMessageSchema,
+  CompanionRequestProgressMessageSchema,
   CompanionResponseMessageSchema,
 ]);
 export type CompanionWireMessage = z.infer<typeof CompanionWireMessageSchema>;

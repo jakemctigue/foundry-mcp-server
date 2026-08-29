@@ -4,14 +4,19 @@ import { WebSocketServer, type WebSocket } from "ws";
 import {
   BRIDGE_PROTOCOL_VERSION,
   CompanionAuthProofMessageSchema,
+  CompanionRequestProgressMessageSchema,
   CompanionResponseMessageSchema,
   CompanionWireMessageSchema,
   MAX_IMAGE_BASE64_CHARACTERS,
+  MAX_OPERATION_DURATION_MS,
+  ErrorEnvelope,
+  makeError,
   companionAuthPayload,
   companionAuthReadyPayload,
   type CompanionHelloMessage,
   type CompanionRequestMessage,
   type JsonValue,
+  type OperationProgress,
 } from "@foundry-mcp/protocol";
 
 import type Database from "better-sqlite3";
@@ -24,6 +29,7 @@ const DEFAULT_AUTHENTICATION_TIMEOUT_MS = 10_000;
 const DEFAULT_RATE_LIMIT_WINDOW_MS = 10_000;
 const DEFAULT_MAX_MESSAGES_PER_CONNECTION = 1_000;
 const DEFAULT_MAX_MESSAGES_GLOBAL = 10_000;
+const CANCELLATION_ACK_TIMEOUT_MS = 1_000;
 
 export interface CompanionConnectionInfo extends CompanionHelloMessage {
   status: "connected";
@@ -56,8 +62,23 @@ export interface HostCompanionServer {
     method: string,
     params?: Record<string, JsonValue>,
     requestId?: string,
+    options?: CompanionRequestOptions,
   ): Promise<JsonValue>;
   close(): Promise<void>;
+}
+
+export interface CompanionRequestOptions {
+  signal?: AbortSignal;
+  deadline?: number;
+  correlationId?: string;
+  onProgress?: (progress: OperationProgress) => void | Promise<void>;
+}
+
+export class CompanionRequestError extends Error {
+  constructor(readonly envelope: ErrorEnvelope) {
+    super(envelope.message);
+    this.name = "CompanionRequestError";
+  }
 }
 
 interface PendingRequest {
@@ -67,6 +88,11 @@ interface PendingRequest {
   resolve(value: JsonValue): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout>;
+  correlationId: string;
+  progressUpdates: number;
+  onProgress?: ((progress: OperationProgress) => void | Promise<void>) | undefined;
+  removeAbortListener?: (() => void) | undefined;
+  cancelled: boolean;
 }
 
 interface CompletedRequest {
@@ -189,6 +215,46 @@ export async function startHostCompanionServer(
     return candidate.length === expected.length && crypto.timingSafeEqual(expected, candidate);
   };
 
+  const cancelPending = (
+    key: string,
+    reason: "cancelled" | "timeout",
+    notifyCompanion = true,
+  ): void => {
+    const request = pending.get(key);
+    if (!request) return;
+    if (request.cancelled) return;
+    clearTimeout(request.timer);
+    request.removeAbortListener?.();
+    request.removeAbortListener = undefined;
+    request.cancelled = true;
+    const live = connections.get(request.connectionId);
+    if (notifyCompanion && live) {
+      send(live.socket, {
+        type: "request.cancel",
+        id: request.message.id,
+        correlationId: request.correlationId,
+        reason,
+      });
+    }
+    request.timer = setTimeout(() => {
+      if (pending.get(key) !== request) return;
+      pending.delete(key);
+      request.reject(
+        new CompanionRequestError(
+          makeError(
+            reason === "timeout" ? "TIMEOUT" : "CANCELLED",
+            reason === "timeout"
+              ? `Companion request deadline elapsed: ${request.message.method}`
+              : `Companion request was cancelled: ${request.message.method}`,
+            false,
+            { correlationId: request.correlationId },
+          ),
+        ),
+      );
+    }, CANCELLATION_ACK_TIMEOUT_MS);
+    request.timer.unref?.();
+  };
+
   wss.on("connection", (socket, request) => {
     socket.on("error", () => undefined);
     let origin: string;
@@ -263,6 +329,7 @@ export async function startHostCompanionServer(
         send(socket, eventStream.resume(connectionId));
         for (const request of pending.values()) {
           if (request.connectionId === connectionId) {
+            if (request.cancelled) continue;
             send(socket, request.message);
           }
         }
@@ -289,12 +356,22 @@ export async function startHostCompanionServer(
         }
         return;
       }
+      if (message.data.type === "request.progress") {
+        const progress = CompanionRequestProgressMessageSchema.parse(message.data);
+        const key = requestKey(connectionId, progress.id);
+        const request = pending.get(key);
+        if (!request || !request.onProgress || request.progressUpdates >= 1_000) return;
+        request.progressUpdates += 1;
+        void Promise.resolve(request.onProgress(progress.progress)).catch(() => undefined);
+        return;
+      }
       if (message.data.type !== "response") return;
       const response = CompanionResponseMessageSchema.parse(message.data);
       const key = requestKey(connectionId, response.id);
       const request = pending.get(key);
       if (!request) return;
       clearTimeout(request.timer);
+      request.removeAbortListener?.();
       pending.delete(key);
       const result: JsonValue = response.ok
         ? (response.value as JsonValue)
@@ -335,13 +412,32 @@ export async function startHostCompanionServer(
       return { host, port: address.port, endpoint: `ws://${host}:${address.port.toString()}` };
     },
     listConnections: connectionSnapshot,
-    request: (connectionId, method, params = {}, requestId) => {
+    request: (connectionId, method, params = {}, requestId, requestOptions = {}) => {
       const id = requestId ?? `host-${Date.now().toString(36)}-${(++requestCounter).toString(36)}`;
       const key = requestKey(connectionId, id);
       const priorResult = completed.get(key);
       if (priorResult !== undefined) return Promise.resolve(priorResult.value);
       const priorPending = pending.get(key);
       if (priorPending) return priorPending.promise;
+      const now = Date.now();
+      const configuredTimeout = options.requestTimeoutMs ?? 30_000;
+      const maximumDeadline = now + Math.min(configuredTimeout, MAX_OPERATION_DURATION_MS);
+      const deadline = Math.min(requestOptions.deadline ?? maximumDeadline, maximumDeadline);
+      const correlationId = (requestOptions.correlationId ?? id).slice(0, 128);
+      if (requestOptions.signal?.aborted || deadline <= now) {
+        return Promise.reject(
+          new CompanionRequestError(
+            makeError(
+              requestOptions.signal?.aborted ? "CANCELLED" : "TIMEOUT",
+              requestOptions.signal?.aborted
+                ? `Companion request was cancelled before dispatch: ${method}`
+                : `Companion request deadline elapsed before dispatch: ${method}`,
+              false,
+              { correlationId },
+            ),
+          ),
+        );
+      }
       let resolveRequest: (value: JsonValue) => void = () => undefined;
       let rejectRequest: (error: Error) => void = () => undefined;
       const promise = new Promise<JsonValue>((resolve, reject) => {
@@ -353,12 +449,25 @@ export async function startHostCompanionServer(
         id,
         method,
         params: { ...params, connectionId },
+        control: {
+          deadline,
+          correlationId,
+          progress: requestOptions.onProgress !== undefined,
+        },
       };
-      const timer = setTimeout(() => {
-        pending.delete(key);
-        rejectRequest(new Error(`companion request timed out: ${method}`));
-      }, options.requestTimeoutMs ?? 30_000);
+      const timer = setTimeout(
+        () => {
+          cancelPending(key, "timeout");
+        },
+        Math.max(1, deadline - now),
+      );
       timer.unref?.();
+      let removeAbortListener: (() => void) | undefined;
+      if (requestOptions.signal) {
+        const onAbort = (): void => cancelPending(key, "cancelled");
+        requestOptions.signal.addEventListener("abort", onAbort, { once: true });
+        removeAbortListener = () => requestOptions.signal?.removeEventListener("abort", onAbort);
+      }
       pending.set(key, {
         connectionId,
         message,
@@ -366,6 +475,11 @@ export async function startHostCompanionServer(
         resolve: resolveRequest,
         reject: rejectRequest,
         timer,
+        correlationId,
+        progressUpdates: 0,
+        onProgress: requestOptions.onProgress,
+        removeAbortListener,
+        cancelled: false,
       });
       const live = connections.get(connectionId);
       if (live) send(live.socket, message);
@@ -374,6 +488,7 @@ export async function startHostCompanionServer(
     close: async () => {
       for (const request of pending.values()) {
         clearTimeout(request.timer);
+        request.removeAbortListener?.();
         request.reject(new Error("companion server closed"));
       }
       pending.clear();

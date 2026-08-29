@@ -10,6 +10,7 @@ export const ErrorCode = z.enum([
   "CONFLICT",
   "TIMEOUT",
   "CANCELLED",
+  "INDETERMINATE_MUTATION",
   "FOUNDRY_ERROR",
 ]);
 export type ErrorCode = z.infer<typeof ErrorCode>;

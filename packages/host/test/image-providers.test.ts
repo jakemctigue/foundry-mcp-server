@@ -49,6 +49,26 @@ describe("deterministic image provider", () => {
 });
 
 describe("OpenAI Images provider", () => {
+  it("passes AbortSignal into provider fetch and stops an in-flight generation", async () => {
+    const controller = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    const fetchMock: ImagesFetch = (_url, init) => {
+      receivedSignal = init.signal;
+      return new Promise((_resolve, reject) => {
+        init.signal?.addEventListener(
+          "abort",
+          () => reject(new Error("provider request aborted")),
+          { once: true },
+        );
+      });
+    };
+    const provider = new OpenAiImagesProvider({ apiKey: "sk-test", fetch: fetchMock });
+    const generated = provider.generate("cancel me", {}, controller.signal);
+    await vi.waitFor(() => expect(receivedSignal).toBe(controller.signal));
+    controller.abort(new Error("caller cancelled image generation"));
+    await expect(generated).rejects.toThrow("caller cancelled image generation");
+  });
+
   it("refuses to send bearer credentials anywhere except the official HTTPS endpoint", () => {
     const fetchMock: ImagesFetch = vi.fn(() => Promise.reject(new Error("must not fetch")));
     for (const endpoint of [

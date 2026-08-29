@@ -17,6 +17,7 @@ import { mutationContext } from "../mutation-authorization.js";
 import {
   forwardAuthorizedBridgeTool,
   forwardBridgeTool,
+  bridgeRequestOptions,
   type ToolServer,
 } from "./bridge-tool.js";
 
@@ -33,7 +34,14 @@ export function registerAssetTools(
         "Enumerates image assets exposed by Foundry FilePicker sources with source capabilities, bounded recursion, deduplication, filters, and cursor pagination.",
       inputSchema: AssetsImagesListInput,
     },
-    (args) => forwardBridgeTool(bridge, "assets.images.list", args, AssetsImagesListOutput),
+    (args, context) =>
+      forwardBridgeTool(
+        bridge,
+        "assets.images.list",
+        args,
+        AssetsImagesListOutput,
+        bridgeRequestOptions(context),
+      ),
   );
   server.registerTool(
     "foundry.assets.references.find",
@@ -43,7 +51,14 @@ export function registerAssetTools(
         "Finds image-looking strings in selected Foundry Documents and returns their owning UUID and JSON Pointer path.",
       inputSchema: AssetsReferencesFindInput,
     },
-    (args) => forwardBridgeTool(bridge, "assets.references.find", args, AssetsReferencesFindOutput),
+    (args, context) =>
+      forwardBridgeTool(
+        bridge,
+        "assets.references.find",
+        args,
+        AssetsReferencesFindOutput,
+        bridgeRequestOptions(context),
+      ),
   );
   server.registerTool(
     "foundry.assets.images.upload",
@@ -53,15 +68,23 @@ export function registerAssetTools(
         "Validates and uploads an image through an authorized writable Foundry FilePicker source with an explicit collision policy.",
       inputSchema: AssetsImagesUploadInput,
     },
-    (args) =>
-      forwardAuthorizedBridgeTool(
+    (args, context) => {
+      const options = bridgeRequestOptions(context);
+      return forwardAuthorizedBridgeTool(
         authorizer,
-        mutationContext("foundry.assets.images.upload", args, "assets:upload"),
+        mutationContext(
+          "foundry.assets.images.upload",
+          args,
+          "assets:upload",
+          options.correlationId,
+        ),
         bridge,
         "assets.images.upload",
         args,
         AssetsImagesUploadOutput,
-      ),
+        options,
+      );
+    },
   );
   server.registerTool(
     "foundry.assets.images.generate",
@@ -71,15 +94,23 @@ export function registerAssetTools(
         "Generates a bounded image with the explicitly reported provider and stores it through Foundry FilePicker. The deterministic provider is the local default; external providers never receive silent fallback.",
       inputSchema: AssetsImagesGenerateInput,
     },
-    (args) =>
-      forwardAuthorizedBridgeTool(
+    (args, context) => {
+      const options = bridgeRequestOptions(context);
+      return forwardAuthorizedBridgeTool(
         authorizer,
-        mutationContext("foundry.assets.images.generate", args, "assets:upload"),
+        mutationContext(
+          "foundry.assets.images.generate",
+          args,
+          "assets:upload",
+          options.correlationId,
+        ),
         bridge,
         "assets.images.generate",
         args,
         AssetsImagesGenerateOutput,
-      ),
+        options,
+      );
+    },
   );
   server.registerTool(
     "foundry.assets.images.attach",
@@ -89,14 +120,22 @@ export function registerAssetTools(
         "Atomically uploads or references an image and updates an authorized Foundry Document field with one audit event.",
       inputSchema: AssetsImagesAttachInput,
     },
-    (args) =>
-      forwardAuthorizedBridgeTool(
+    (args, context) => {
+      const options = bridgeRequestOptions(context);
+      return forwardAuthorizedBridgeTool(
         authorizer,
-        mutationContext("foundry.assets.images.attach", args, "assets:attach"),
+        mutationContext(
+          "foundry.assets.images.attach",
+          args,
+          "assets:attach",
+          options.correlationId,
+        ),
         bridge,
         "assets.images.attach",
         args,
         AssetsImagesAttachOutput,
-      ),
+        options,
+      );
+    },
   );
 }

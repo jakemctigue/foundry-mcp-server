@@ -17,6 +17,7 @@ import { mutationContext } from "../mutation-authorization.js";
 import {
   forwardAuthorizedBridgeTool,
   forwardBridgeTool,
+  bridgeRequestOptions,
   type ToolServer,
 } from "./bridge-tool.js";
 
@@ -33,15 +34,18 @@ export function registerSessionTools(
         "Creates or reuses the configured Journal folder, then creates one JournalEntry and initial JournalEntryPage idempotently.",
       inputSchema: SessionsStartInput,
     },
-    (args) =>
-      forwardAuthorizedBridgeTool(
+    (args, context) => {
+      const options = bridgeRequestOptions(context);
+      return forwardAuthorizedBridgeTool(
         authorizer,
-        mutationContext("foundry.sessions.start", args, "sessions:start"),
+        mutationContext("foundry.sessions.start", args, "sessions:start", options.correlationId),
         bridge,
         "sessions.start",
         args,
         SessionsStartOutput,
-      ),
+        options,
+      );
+    },
   );
   server.registerTool(
     "foundry.sessions.append",
@@ -51,15 +55,18 @@ export function registerSessionTools(
         "Appends a sanitized, timestamped JournalEntryPage without replacing existing journal content. Idempotency keys prevent duplicate pages.",
       inputSchema: SessionsAppendInput,
     },
-    (args) =>
-      forwardAuthorizedBridgeTool(
+    (args, context) => {
+      const options = bridgeRequestOptions(context);
+      return forwardAuthorizedBridgeTool(
         authorizer,
-        mutationContext("foundry.sessions.append", args, "sessions:append"),
+        mutationContext("foundry.sessions.append", args, "sessions:append", options.correlationId),
         bridge,
         "sessions.append",
         args,
         SessionsAppendOutput,
-      ),
+        options,
+      );
+    },
   );
   server.registerTool(
     "foundry.sessions.list",
@@ -69,7 +76,14 @@ export function registerSessionTools(
         "Lists module-owned journal session summaries with filters and cursor pagination.",
       inputSchema: SessionsListInput,
     },
-    (args) => forwardBridgeTool(bridge, "sessions.list", args, SessionsListOutput),
+    (args, context) =>
+      forwardBridgeTool(
+        bridge,
+        "sessions.list",
+        args,
+        SessionsListOutput,
+        bridgeRequestOptions(context),
+      ),
   );
   server.registerTool(
     "foundry.sessions.get",
@@ -78,7 +92,14 @@ export function registerSessionTools(
       description: "Returns session metadata and its chronological JournalEntryPage timeline.",
       inputSchema: SessionsGetInput,
     },
-    (args) => forwardBridgeTool(bridge, "sessions.get", args, SessionsGetOutput),
+    (args, context) =>
+      forwardBridgeTool(
+        bridge,
+        "sessions.get",
+        args,
+        SessionsGetOutput,
+        bridgeRequestOptions(context),
+      ),
   );
   for (const operation of ["end", "reopen"] as const) {
     server.registerTool(
@@ -89,15 +110,23 @@ export function registerSessionTools(
           "Updates module-owned status metadata idempotently while retaining all prior JournalEntryPage content.",
         inputSchema: SessionsStatusInput,
       },
-      (args) =>
-        forwardAuthorizedBridgeTool(
+      (args, context) => {
+        const options = bridgeRequestOptions(context);
+        return forwardAuthorizedBridgeTool(
           authorizer,
-          mutationContext(`foundry.sessions.${operation}`, args, "sessions:append"),
+          mutationContext(
+            `foundry.sessions.${operation}`,
+            args,
+            "sessions:append",
+            options.correlationId,
+          ),
           bridge,
           `sessions.${operation}`,
           args,
           SessionsStatusOutput,
-        ),
+          options,
+        );
+      },
     );
   }
 }

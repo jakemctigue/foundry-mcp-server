@@ -22,6 +22,7 @@ import {
   type JsonObject,
   type JsonValue,
   type OperationResult,
+  type OperationExecutionOptions,
 } from "@foundry-mcp/protocol";
 
 import { MAX_RUNTIME_IMAGE_DIMENSION, type FoundryAssetRuntimeAdapter } from "./asset-runtime.js";
@@ -34,8 +35,8 @@ export interface AssetPayload {
 }
 
 export interface FoundryAssetServiceOptions {
-  loadLocalFile?: (path: string, maxBytes: number) => Promise<AssetPayload>;
-  importUrl?: (url: string, maxBytes: number) => Promise<AssetPayload>;
+  loadLocalFile?: (path: string, maxBytes: number, signal?: AbortSignal) => Promise<AssetPayload>;
+  importUrl?: (url: string, maxBytes: number, signal?: AbortSignal) => Promise<AssetPayload>;
   maxImageBytes?: number;
   maxImageWidth?: number;
   maxImageHeight?: number;
@@ -285,8 +286,12 @@ export class FoundryAssetService {
     );
   }
 
-  async list(input: unknown = {}): Promise<OperationResult<AssetsImagesListOutput>> {
+  async list(
+    input: unknown = {},
+    operation?: OperationExecutionOptions,
+  ): Promise<OperationResult<AssetsImagesListOutput>> {
     return this.#run(async () => {
+      this.#guard(operation);
       const parsed = AssetsImagesListInput.safeParse(input);
       if (!parsed.success)
         operationError("INVALID_DATA", "Input validation failed", { issues: parsed.error.issues });
@@ -304,10 +309,16 @@ export class FoundryAssetService {
         const queue: Array<{ path: string; depth: number }> = [{ path: pathPrefix, depth: 0 }];
         const visited = new Set<string>();
         while (queue.length > 0) {
+          this.#guard(operation);
           const current = queue.shift();
           if (!current || visited.has(current.path)) continue;
           visited.add(current.path);
           const browsed = await this.assets.browse(source.id, current.path, extensions);
+          await this.#progress(
+            operation,
+            Math.min(900, 100 + visited.size),
+            `Scanned ${visited.size.toString()} asset folders`,
+          );
           for (const entry of browsed.entries) {
             const entryPath = normalizedRuntimePath(entry.path);
             if (entry.kind === "directory") {
@@ -360,8 +371,12 @@ export class FoundryAssetService {
     });
   }
 
-  async referencesFind(input: unknown): Promise<OperationResult<AssetsReferencesFindOutput>> {
+  async referencesFind(
+    input: unknown,
+    operation?: OperationExecutionOptions,
+  ): Promise<OperationResult<AssetsReferencesFindOutput>> {
     return this.#run(async () => {
+      this.#guard(operation);
       const parsed = AssetsReferencesFindInput.safeParse(input);
       if (!parsed.success)
         operationError("INVALID_DATA", "Input validation failed", { issues: parsed.error.issues });
@@ -370,11 +385,14 @@ export class FoundryAssetService {
       else {
         let cursor: string | undefined;
         do {
-          const listed = await this.documents.list({
-            ...parsed.data.query,
-            pageSize: 200,
-            ...(cursor ? { cursor } : {}),
-          });
+          const listed = await this.documents.list(
+            {
+              ...parsed.data.query,
+              pageSize: 200,
+              ...(cursor ? { cursor } : {}),
+            },
+            operation,
+          );
           if (!listed.ok) throw new AssetOperationError(listed.error);
           roots.push(...listed.value.items.map((item) => item.uuid));
           cursor = listed.value.nextCursor;
@@ -382,16 +400,20 @@ export class FoundryAssetService {
       }
       const uuids = new Set<string>();
       for (const rootUuid of roots) {
+        this.#guard(operation);
         uuids.add(rootUuid);
         let cursor: string | undefined;
         do {
-          const embedded = await this.documents.embeddedList({
-            parentUuid: rootUuid,
-            recursive: true,
-            maxDepth: MAX_EMBEDDED_DEPTH,
-            pageSize: 200,
-            ...(cursor ? { cursor } : {}),
-          });
+          const embedded = await this.documents.embeddedList(
+            {
+              parentUuid: rootUuid,
+              recursive: true,
+              maxDepth: MAX_EMBEDDED_DEPTH,
+              pageSize: 200,
+              ...(cursor ? { cursor } : {}),
+            },
+            operation,
+          );
           if (!embedded.ok) throw new AssetOperationError(embedded.error);
           embedded.value.items.forEach((item) => uuids.add(item.uuid));
           cursor = embedded.value.nextCursor;
@@ -399,7 +421,8 @@ export class FoundryAssetService {
       }
       const references: ImageReference[] = [];
       for (const uuid of uuids) {
-        const document = await this.documents.get({ uuid });
+        this.#guard(operation);
+        const document = await this.documents.get({ uuid }, operation);
         if (!document.ok) throw new AssetOperationError(document.error);
         findImageReferences(uuid, document.value.data, "", references);
       }
@@ -413,8 +436,12 @@ export class FoundryAssetService {
     });
   }
 
-  async upload(input: unknown): Promise<OperationResult<AssetsImagesUploadOutput>> {
+  async upload(
+    input: unknown,
+    operation?: OperationExecutionOptions,
+  ): Promise<OperationResult<AssetsImagesUploadOutput>> {
     return this.#run(async () => {
+      this.#guard(operation);
       const parsed = AssetsImagesUploadInput.safeParse(input);
       if (!parsed.success)
         operationError("INVALID_DATA", "Input validation failed", { issues: parsed.error.issues });
@@ -423,13 +450,18 @@ export class FoundryAssetService {
         parsed.data.destinationPath,
         parsed.data.source,
         parsed.data.onCollision,
+        operation,
       );
-      return this.#commitUpload(prepared);
+      return this.#commitUpload(prepared, operation);
     });
   }
 
-  async attach(input: unknown): Promise<OperationResult<AssetsImagesAttachOutput>> {
+  async attach(
+    input: unknown,
+    operation?: OperationExecutionOptions,
+  ): Promise<OperationResult<AssetsImagesAttachOutput>> {
     return this.#run(async () => {
+      this.#guard(operation);
       const parsed = AssetsImagesAttachInput.safeParse(input);
       if (!parsed.success)
         operationError("INVALID_DATA", "Input validation failed", { issues: parsed.error.issues });
@@ -447,7 +479,7 @@ export class FoundryAssetService {
           "PERMISSION_DENIED",
           permission.reason ?? "The connected user cannot update this Document",
         );
-      const before = await this.documents.get({ uuid: parsed.data.documentUuid });
+      const before = await this.documents.get({ uuid: parsed.data.documentUuid }, operation);
       if (!before.ok) throw new AssetOperationError(before.error);
       if (parsed.data.expectedHash && parsed.data.expectedHash !== before.value.sourceHash)
         operationError("CONFLICT", "Document source hash does not match", {
@@ -467,13 +499,14 @@ export class FoundryAssetService {
         sourceId = parsed.data.asset.sourceId;
         const source: AssetUploadSource =
           parsed.data.asset.kind === "url"
-            ? await this.#urlSource(parsed.data.asset.url)
+            ? await this.#urlSource(parsed.data.asset.url, operation)
             : parsed.data.asset.source;
         prepared = await this.#prepareUpload(
           sourceId,
           parsed.data.asset.destinationPath,
           source,
           parsed.data.asset.onCollision,
+          operation,
         );
         assetPath = prepared.targetPath;
       }
@@ -494,14 +527,18 @@ export class FoundryAssetService {
           },
         });
         if (prepared) {
-          uploaded = await this.#commitUpload(prepared);
+          uploaded = await this.#commitUpload(prepared, operation);
           assetPath = uploaded.assetPath;
         }
-        const updated = await this.documents.update({
-          uuid: parsed.data.documentUuid,
-          data: fieldPatch(parsed.data.fieldPath, assetPath),
-          expectedHash: before.value.sourceHash,
-        });
+        this.#guard(operation);
+        const updated = await this.documents.update(
+          {
+            uuid: parsed.data.documentUuid,
+            data: fieldPatch(parsed.data.fieldPath, assetPath),
+            expectedHash: before.value.sourceHash,
+          },
+          operation,
+        );
         if (!updated.ok) throw new AssetOperationError(updated.error);
         documentCommitted = true;
         return {
@@ -599,10 +636,11 @@ export class FoundryAssetService {
     return false;
   }
 
-  async #urlSource(url: string): Promise<AssetUploadSource> {
+  async #urlSource(url: string, operation?: OperationExecutionOptions): Promise<AssetUploadSource> {
     if (!this.options.importUrl)
       operationError("INVALID_DATA", "URL import is unavailable on this host");
-    const payload = await this.options.importUrl(url, this.#maxImageBytes);
+    const payload = await this.options.importUrl(url, this.#maxImageBytes, operation?.signal);
+    this.#guard(operation);
     let binary = "";
     for (const byte of payload.bytes) binary += String.fromCharCode(byte);
     return {
@@ -617,7 +655,9 @@ export class FoundryAssetService {
     destinationPath: string,
     source: AssetUploadSource,
     collisionPolicy: AssetCollisionPolicy,
+    operation?: OperationExecutionOptions,
   ): Promise<PreparedUpload> {
+    this.#guard(operation);
     const target = validateAssetPath(destinationPath);
     const extension = extensionOf(target);
     if (!DEFAULT_IMAGE_EXTENSIONS.includes(extension as (typeof DEFAULT_IMAGE_EXTENSIONS)[number]))
@@ -650,7 +690,8 @@ export class FoundryAssetService {
         collision = "renamed";
       }
     }
-    const payload = await this.#resolvePayload(source);
+    const payload = await this.#resolvePayload(source, operation);
+    this.#guard(operation);
     const inspected = inspectImageBytes(payload.bytes, {
       expectedExtension: extensionOf(targetPath),
       ...(payload.mimeType ? { expectedMimeType: payload.mimeType } : {}),
@@ -707,11 +748,19 @@ export class FoundryAssetService {
     };
   }
 
-  async #resolvePayload(source: AssetUploadSource): Promise<AssetPayload> {
+  async #resolvePayload(
+    source: AssetUploadSource,
+    operation?: OperationExecutionOptions,
+  ): Promise<AssetPayload> {
     if (source.kind === "file") {
       if (!this.options.loadLocalFile)
         operationError("INVALID_DATA", "Local file loading is unavailable on this host");
-      const payload = await this.options.loadLocalFile(source.path, this.#maxImageBytes);
+      const payload = await this.options.loadLocalFile(
+        source.path,
+        this.#maxImageBytes,
+        operation?.signal,
+      );
+      this.#guard(operation);
       const mimeType = source.mimeType ?? payload.mimeType;
       return { bytes: payload.bytes, ...(mimeType ? { mimeType } : {}) };
     }
@@ -729,7 +778,11 @@ export class FoundryAssetService {
     return source;
   }
 
-  async #commitUpload(prepared: PreparedUpload): Promise<AssetsImagesUploadOutput> {
+  async #commitUpload(
+    prepared: PreparedUpload,
+    operation?: OperationExecutionOptions,
+  ): Promise<AssetsImagesUploadOutput> {
+    this.#guard(operation);
     const stored = await this.assets.upload(
       prepared.sourceId,
       prepared.targetPath,
@@ -737,6 +790,7 @@ export class FoundryAssetService {
       prepared.mimeType,
       { overwrite: prepared.overwrite },
     );
+    operation?.markCommitted?.(`stored asset ${prepared.sourceId}:${prepared.targetPath}`);
     return {
       assetPath: normalizedRuntimePath(stored.path),
       source: prepared.sourceId,
@@ -754,6 +808,21 @@ export class FoundryAssetService {
     } catch (error) {
       return { ok: false, error: toErrorEnvelope(error) };
     }
+  }
+
+  #guard(operation?: OperationExecutionOptions): void {
+    if (operation?.signal?.aborted) operationError("CANCELLED", "Operation was cancelled");
+    if (operation?.deadline !== undefined && Date.now() >= operation.deadline) {
+      operationError("TIMEOUT", "Operation deadline elapsed", undefined, true);
+    }
+  }
+
+  async #progress(
+    operation: OperationExecutionOptions | undefined,
+    progress: number,
+    message: string,
+  ): Promise<void> {
+    await operation?.reportProgress?.({ stage: "progress", progress, total: 1_000, message });
   }
 }
 

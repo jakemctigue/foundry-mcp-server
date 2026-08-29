@@ -5,6 +5,7 @@ import {
   CapabilitiesGetOutput,
   ConnectionsListOutput,
   LEGACY_MCP_PROTOCOL_VERSIONS,
+  MAX_OPERATION_PROGRESS_UPDATES,
   MCP_PROTOCOL_VERSION,
   makeError,
   type CapabilitiesGetOutput as CapabilitiesGetOutputData,
@@ -18,6 +19,7 @@ import { registerIntelligenceTools } from "./tools/intelligence.js";
 import { registerSessionTools } from "./tools/sessions.js";
 import { registerFoundryResources } from "./resources.js";
 import { registerFoundryPrompts } from "./prompts.js";
+import { bridgeRequestOptions } from "./tools/bridge-tool.js";
 
 // Accepts any object shape so the SDK never rejects the call before our
 // handler runs; we perform the "no unexpected arguments" check ourselves so
@@ -60,16 +62,45 @@ export function createFoundryMcpServer(options: CreateServerOptions): McpServer 
         "Lists currently paired Foundry VTT world connections known to the bridge daemon. Read-only, no side effects. Returns an empty array when no worlds are paired.",
       inputSchema: PermissiveNoArgs,
     },
-    async (args: Record<string, unknown>) => {
+    async (args: Record<string, unknown>, context) => {
       if (Object.keys(args).length > 0) {
         return errorContent("INVALID_DATA", "foundry.connections.list takes no arguments");
       }
 
-      const result = (await bridge.request("connections.list")) as unknown;
+      const requestOptions = bridgeRequestOptions(context);
+      await requestOptions.onProgress?.({
+        stage: "start",
+        progress: 0,
+        total: MAX_OPERATION_PROGRESS_UPDATES,
+        message: "connections.list started",
+      });
+      const result = (await bridge.request(
+        "connections.list",
+        {},
+        {
+          ...requestOptions,
+          ...(requestOptions.onProgress
+            ? {
+                onProgress: (
+                  progress: Parameters<NonNullable<typeof requestOptions.onProgress>>[0],
+                ) =>
+                  progress.stage === "start" || progress.stage === "complete"
+                    ? undefined
+                    : requestOptions.onProgress?.(progress),
+              }
+            : {}),
+        },
+      )) as unknown;
       const parsed = ConnectionsListOutput.safeParse(result);
       if (!parsed.success) {
         return errorContent("INVALID_DATA", "bridge returned a malformed connections list");
       }
+      await requestOptions.onProgress?.({
+        stage: "complete",
+        progress: MAX_OPERATION_PROGRESS_UPDATES,
+        total: MAX_OPERATION_PROGRESS_UPDATES,
+        message: "connections.list completed",
+      });
 
       return {
         content: [

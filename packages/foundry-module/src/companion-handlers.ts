@@ -1,4 +1,9 @@
-import { makeError, type JsonValue, type OperationResult } from "@foundry-mcp/protocol";
+import {
+  makeError,
+  type JsonValue,
+  type OperationExecutionOptions,
+  type OperationResult,
+} from "@foundry-mcp/protocol";
 
 import type { FoundryAssetService } from "./assets.js";
 import type { FoundryDocumentService } from "./documents.js";
@@ -9,7 +14,10 @@ export interface CompanionServices {
   assets: FoundryAssetService;
   sessions: FoundrySessionService;
 }
-type CompanionHandler = (params: unknown) => Promise<OperationResult<unknown>>;
+type CompanionHandler = (
+  params: unknown,
+  options?: OperationExecutionOptions,
+) => Promise<OperationResult<unknown>>;
 
 /**
  * Browser-only request dispatcher. All side effects flow through the runtime
@@ -20,28 +28,37 @@ export class FoundryCompanionHandlers {
 
   constructor(readonly services: CompanionServices) {
     this.#handlers = new Map<string, CompanionHandler>([
-      ["documents.types", (params) => services.documents.types(params)],
-      ["documents.list", (params) => services.documents.list(params)],
-      ["documents.get", (params) => services.documents.get(params)],
-      ["documents.create", (params) => services.documents.create(params)],
-      ["documents.update", (params) => services.documents.update(params)],
-      ["documents.embedded.list", (params) => services.documents.embeddedList(params)],
-      ["compendiums.list", (params) => services.documents.compendiumsList(params)],
+      ["documents.types", (params, options) => services.documents.types(params, options)],
+      ["documents.list", (params, options) => services.documents.list(params, options)],
+      ["documents.get", (params, options) => services.documents.get(params, options)],
+      ["documents.create", (params, options) => services.documents.create(params, options)],
+      ["documents.update", (params, options) => services.documents.update(params, options)],
+      [
+        "documents.embedded.list",
+        (params, options) => services.documents.embeddedList(params, options),
+      ],
+      [
+        "compendiums.list",
+        (params, options) => services.documents.compendiumsList(params, options),
+      ],
       [
         "compendiums.documents.list",
-        (params) => services.documents.compendiumDocumentsList(params),
+        (params, options) => services.documents.compendiumDocumentsList(params, options),
       ],
-      ["documents.snapshot", (params) => services.documents.snapshot(params)],
-      ["assets.images.list", (params) => services.assets.list(params)],
-      ["assets.references.find", (params) => services.assets.referencesFind(params)],
-      ["assets.images.upload", (params) => services.assets.upload(params)],
-      ["assets.images.attach", (params) => services.assets.attach(params)],
-      ["sessions.start", (params) => services.sessions.start(params)],
-      ["sessions.append", (params) => services.sessions.append(params)],
-      ["sessions.list", (params) => services.sessions.list(params)],
-      ["sessions.get", (params) => services.sessions.get(params)],
-      ["sessions.end", (params) => services.sessions.end(params)],
-      ["sessions.reopen", (params) => services.sessions.reopen(params)],
+      ["documents.snapshot", (params, options) => services.documents.snapshot(params, options)],
+      ["assets.images.list", (params, options) => services.assets.list(params, options)],
+      [
+        "assets.references.find",
+        (params, options) => services.assets.referencesFind(params, options),
+      ],
+      ["assets.images.upload", (params, options) => services.assets.upload(params, options)],
+      ["assets.images.attach", (params, options) => services.assets.attach(params, options)],
+      ["sessions.start", (params, options) => services.sessions.start(params, options)],
+      ["sessions.append", (params, options) => services.sessions.append(params, options)],
+      ["sessions.list", (params, options) => services.sessions.list(params, options)],
+      ["sessions.get", (params, options) => services.sessions.get(params, options)],
+      ["sessions.end", (params, options) => services.sessions.end(params, options)],
+      ["sessions.reopen", (params, options) => services.sessions.reopen(params, options)],
     ]);
   }
 
@@ -49,13 +66,17 @@ export class FoundryCompanionHandlers {
     return [...this.#handlers.keys()].sort();
   }
 
-  async handle(method: string, params: unknown): Promise<OperationResult<JsonValue>> {
+  async handle(
+    method: string,
+    params: unknown,
+    options?: OperationExecutionOptions,
+  ): Promise<OperationResult<JsonValue>> {
     const handler = this.#handlers.get(method);
     if (!handler) {
       return { ok: false, error: makeError("NOT_FOUND", `Unknown companion method ${method}`) };
     }
     try {
-      const result = await handler(params);
+      const result = await handler(params, options);
       return JSON.parse(JSON.stringify(result)) as OperationResult<JsonValue>;
     } catch (error) {
       return {

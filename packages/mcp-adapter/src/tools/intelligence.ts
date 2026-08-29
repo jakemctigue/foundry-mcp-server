@@ -8,7 +8,7 @@ import {
 } from "@foundry-mcp/protocol";
 
 import { IntelligenceBridgeApi } from "../intelligence-api.js";
-import { BridgeResultError, type ToolServer } from "./bridge-tool.js";
+import { bridgeRequestOptions, BridgeResultError, type ToolServer } from "./bridge-tool.js";
 
 function toolResult<T extends Record<string, unknown>>(operation: () => Promise<T>) {
   return async (): Promise<
@@ -42,7 +42,7 @@ export function registerIntelligenceTools(server: ToolServer, api: IntelligenceB
         "Searches the local redacted event ledger and reconciled object snapshots with deterministic relevance ranking.",
       inputSchema: IntelligenceSearchInput,
     },
-    (args) => toolResult(() => api.search(args))(),
+    (args, context) => toolResult(() => api.search(args, bridgeRequestOptions(context)))(),
   );
   server.registerTool(
     "foundry.intelligence.status",
@@ -52,7 +52,7 @@ export function registerIntelligenceTools(server: ToolServer, api: IntelligenceB
         "Reports durable reconciliation, event, retention, queue, gap, and truncation health.",
       inputSchema: IntelligenceStatusInput,
     },
-    (args) => toolResult(() => api.status(args))(),
+    (args, context) => toolResult(() => api.status(args, bridgeRequestOptions(context)))(),
   );
   server.registerTool(
     "foundry.intelligence.timeline",
@@ -61,7 +61,7 @@ export function registerIntelligenceTools(server: ToolServer, api: IntelligenceB
       description: "Reads a chronological, filtered, cursor-paginated local event timeline.",
       inputSchema: IntelligenceTimelineInput,
     },
-    (args) => toolResult(() => api.timeline(args))(),
+    (args, context) => toolResult(() => api.timeline(args, bridgeRequestOptions(context)))(),
   );
   server.registerTool(
     "foundry.intelligence.changed-since",
@@ -70,7 +70,7 @@ export function registerIntelligenceTools(server: ToolServer, api: IntelligenceB
       description: "Returns redacted events after exactly one sequence or timestamp cursor.",
       inputSchema: IntelligenceChangedSinceInput,
     },
-    (args) => toolResult(() => api.changedSince(args))(),
+    (args, context) => toolResult(() => api.changedSince(args, bridgeRequestOptions(context)))(),
   );
   server.registerTool(
     "foundry.intelligence.context",
@@ -80,6 +80,6 @@ export function registerIntelligenceTools(server: ToolServer, api: IntelligenceB
         "Builds a bounded, redacted context pack with event and reconciled-object provenance.",
       inputSchema: IntelligenceContextInput,
     },
-    (args) => toolResult(() => api.context(args))(),
+    (args, context) => toolResult(() => api.context(args, bridgeRequestOptions(context)))(),
   );
 }

@@ -6,6 +6,7 @@ import {
   companionAuthReadyPayload,
   type CompanionHelloMessage,
   type JsonValue,
+  type OperationExecutionOptions,
 } from "@foundry-mcp/protocol";
 import {
   CompanionBridgeClient,
@@ -261,6 +262,79 @@ describe("browser companion (mocked Foundry global)", () => {
       expect.objectContaining({ id: "pending-mutation", ok: true }),
       expect.objectContaining({ id: "pending-mutation", ok: true }),
     ]);
+  });
+
+  it("reports an indeterminate committed mutation when cancellation arrives after a side effect", async () => {
+    const socket = new MockSocket();
+    const handler = vi.fn(
+      async (
+        _method: string,
+        _params: Record<string, JsonValue>,
+        operation: OperationExecutionOptions,
+      ): Promise<JsonValue> => {
+        await operation.reportProgress?.({
+          stage: "progress",
+          progress: 400,
+          total: 1_000,
+          message: "Foundry update dispatched",
+        });
+        operation.markCommitted?.("updated Actor.hero");
+        return new Promise<JsonValue>((_resolve, reject) => {
+          operation.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("cancelled after update")),
+            { once: true },
+          );
+        });
+      },
+    );
+    const client = new CompanionBridgeClient({
+      endpoint: "ws://127.0.0.1:3210",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
+      ...pairedOptions(),
+      storage: new MemoryStorage(),
+      createSocket: () => socket,
+      handleRequest: handler,
+    });
+    client.start();
+    await authenticate(socket);
+    socket.emit("message", {
+      type: "request",
+      id: "committed-cancel",
+      method: "documents.update",
+      params: { uuid: "Actor.hero" },
+      control: {
+        deadline: Date.now() + 10_000,
+        correlationId: "mcp-committed-cancel",
+        progress: true,
+      },
+    });
+    await vi.waitFor(() =>
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({ type: "request.progress", id: "committed-cancel" }),
+      ),
+    );
+    socket.emit("message", {
+      type: "request.cancel",
+      id: "committed-cancel",
+      correlationId: "mcp-committed-cancel",
+      reason: "cancelled",
+    });
+    await vi.waitFor(() =>
+      expect(socket.sent).toContainEqual(
+        expect.objectContaining({
+          type: "response",
+          id: "committed-cancel",
+          ok: false,
+          error: expect.objectContaining({
+            code: "INDETERMINATE_MUTATION",
+            retryable: false,
+            details: expect.objectContaining({ committed: true, indeterminate: true }),
+          }),
+        }),
+      ),
+    );
   });
 
   it("advances to the durable host sequence and prunes stale pending events on resume", async () => {

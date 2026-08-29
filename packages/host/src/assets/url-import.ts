@@ -42,7 +42,12 @@ interface UrlResponse {
 
 export type UrlImportFetch = (
   url: string,
-  init: { redirect: "manual"; headers: Record<string, string>; resolvedAddresses: string[] },
+  init: {
+    redirect: "manual";
+    headers: Record<string, string>;
+    resolvedAddresses: string[];
+    signal?: AbortSignal;
+  },
 ) => Promise<UrlResponse>;
 
 export type UrlAddressResolver = (hostname: string) => Promise<string[]>;
@@ -52,6 +57,14 @@ export interface ImportImageUrlOptions {
   resolve?: UrlAddressResolver;
   maxBytes?: number;
   maxRedirects?: number;
+  signal?: AbortSignal;
+}
+
+function assertNotAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new Error("Image URL import was cancelled");
 }
 
 function ipv4Octets(address: string): number[] | undefined {
@@ -235,13 +248,23 @@ function pinnedFetch(url: string, init: Parameters<UrlImportFetch>[1]): Promise<
         });
       },
     );
+    const onAbort = (): void => {
+      request.destroy(new Error("Image URL import was cancelled"));
+    };
+    init.signal?.addEventListener("abort", onAbort, { once: true });
     request.on("error", reject);
+    request.on("close", () => init.signal?.removeEventListener("abort", onAbort));
     request.end();
   });
 }
 /* v8 ignore stop */
 
-async function readBoundedBody(response: UrlResponse, maxBytes: number): Promise<Uint8Array> {
+async function readBoundedBody(
+  response: UrlResponse,
+  maxBytes: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  assertNotAborted(signal);
   const contentLength = response.headers.get("content-length");
   if (contentLength) {
     const declared = Number.parseInt(contentLength, 10);
@@ -253,6 +276,10 @@ async function readBoundedBody(response: UrlResponse, maxBytes: number): Promise
     const chunks: Uint8Array[] = [];
     let total = 0;
     while (true) {
+      if (signal?.aborted) {
+        await reader.cancel?.();
+        assertNotAborted(signal);
+      }
       const next = await reader.read();
       if (next.done) break;
       const chunk = next.value ?? new Uint8Array();
@@ -277,6 +304,7 @@ async function readBoundedBody(response: UrlResponse, maxBytes: number): Promise
   if (!response.arrayBuffer)
     throw new UrlImportError("NETWORK_ERROR", "Image response body is unavailable");
   const bytes = new Uint8Array(await response.arrayBuffer());
+  assertNotAborted(signal);
   if (bytes.byteLength > maxBytes)
     throw new UrlImportError("TOO_LARGE", `Image exceeds the ${maxBytes.toString()} byte limit`);
   return bytes;
@@ -297,15 +325,19 @@ export async function importImageUrl(
   const maxBytes = options.maxBytes ?? MAX_IMAGE_BYTES;
   const maxRedirects = options.maxRedirects ?? 5;
   for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount += 1) {
+    assertNotAborted(options.signal);
     const resolvedAddresses = await validateTarget(current, resolve);
+    assertNotAborted(options.signal);
     let response: UrlResponse;
     try {
       response = await fetchValue(current.toString(), {
         redirect: "manual",
         headers: { Accept: "image/png,image/jpeg,image/gif,image/webp" },
         resolvedAddresses,
+        ...(options.signal ? { signal: options.signal } : {}),
       });
     } catch {
+      if (options.signal?.aborted) assertNotAborted(options.signal);
       throw new UrlImportError("NETWORK_ERROR", "Image URL request failed");
     }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -324,7 +356,7 @@ export async function importImageUrl(
       throw new UrlImportError("NETWORK_ERROR", "Image URL request was rejected", {
         status: response.status,
       });
-    const bytes = await readBoundedBody(response, maxBytes);
+    const bytes = await readBoundedBody(response, maxBytes, options.signal);
     const declaredMime = response.headers.get("content-type") ?? undefined;
     const inspected = inspectImageBytes(bytes, {
       ...(declaredMime ? { expectedMimeType: declaredMime } : {}),

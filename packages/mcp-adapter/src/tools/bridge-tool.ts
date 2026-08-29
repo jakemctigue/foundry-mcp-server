@@ -1,8 +1,18 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/server";
 
-import { ErrorEnvelope, makeError } from "@foundry-mcp/protocol";
-import type { BridgeConnection } from "../bridge-connection.js";
+import {
+  ErrorEnvelope,
+  MAX_OPERATION_DURATION_MS,
+  MAX_OPERATION_PROGRESS_UPDATES,
+  makeError,
+  type OperationProgress,
+} from "@foundry-mcp/protocol";
+import {
+  BridgeRequestError,
+  type BridgeConnection,
+  type BridgeRequestOptions,
+} from "../bridge-connection.js";
 import type {
   MutationAuthorizationRequest,
   MutationAuthorizer,
@@ -21,13 +31,95 @@ export class BridgeResultError extends Error {
   }
 }
 
+interface McpRequestContextShape {
+  mcpReq?: {
+    id?: string | number;
+    signal?: AbortSignal;
+    _meta?: { progressToken?: unknown; [key: string]: unknown };
+    notify?: (notification: unknown) => Promise<void>;
+  };
+}
+
+function boundedDeadline(meta: Record<string, unknown> | undefined): number {
+  const now = Date.now();
+  const maximum = now + MAX_OPERATION_DURATION_MS;
+  const requested = meta?.["foundryMcp/deadline"];
+  return typeof requested === "number" && Number.isSafeInteger(requested) && requested > now
+    ? Math.min(requested, maximum)
+    : maximum;
+}
+
+/** Converts SDK v2 request context into private bridge operation controls. */
+export function bridgeRequestOptions(
+  context: unknown,
+  correlationId?: string,
+): BridgeRequestOptions {
+  const request = (context as McpRequestContextShape | undefined)?.mcpReq;
+  const meta = request?._meta;
+  const token = meta?.progressToken;
+  const progressToken =
+    typeof token === "string" || (typeof token === "number" && Number.isFinite(token))
+      ? token
+      : undefined;
+  let lastProgress = -1;
+  let notifications = 0;
+  const onProgress =
+    progressToken !== undefined && request?.notify
+      ? async (update: OperationProgress): Promise<void> => {
+          if (notifications >= MAX_OPERATION_PROGRESS_UPDATES || update.progress < lastProgress)
+            return;
+          lastProgress = update.progress;
+          notifications += 1;
+          await request.notify?.({
+            method: "notifications/progress",
+            params: {
+              progressToken,
+              progress: update.progress,
+              total: update.total,
+              ...(update.message ? { message: update.message } : {}),
+            },
+          });
+        }
+      : undefined;
+  return {
+    ...(request?.signal ? { signal: request.signal } : {}),
+    deadline: boundedDeadline(meta),
+    correlationId:
+      correlationId ??
+      `mcp-${String(request?.id ?? "request")}-${Date.now().toString(36)}`.slice(0, 128),
+    ...(onProgress ? { onProgress } : {}),
+  };
+}
+
 export async function requestBridgeValue<T>(
   bridge: BridgeConnection,
   method: string,
   args: Record<string, unknown>,
   outputSchema: z.ZodType<T>,
+  options?: BridgeRequestOptions,
 ): Promise<T> {
-  let raw = await bridge.request(method, args);
+  await options?.onProgress?.({
+    stage: "start",
+    progress: 0,
+    total: MAX_OPERATION_PROGRESS_UPDATES,
+    message: `${method} started`,
+  });
+  const bridgeOptions = options
+    ? {
+        ...options,
+        ...(options.onProgress
+          ? {
+              onProgress: (progress: OperationProgress) =>
+                progress.stage === "start" || progress.stage === "complete"
+                  ? undefined
+                  : options.onProgress?.(progress),
+            }
+          : {}),
+      }
+    : undefined;
+  let raw = bridgeOptions
+    ? await bridge.request(method, args, bridgeOptions)
+    : await bridge.request(method, args);
   if (raw && typeof raw === "object" && "ok" in raw) {
     const result = raw as { ok?: unknown; value?: unknown; error?: unknown };
     if (result.ok === false) {
@@ -48,6 +140,12 @@ export async function requestBridgeValue<T>(
       }),
     );
   }
+  await options?.onProgress?.({
+    stage: "complete",
+    progress: MAX_OPERATION_PROGRESS_UPDATES,
+    total: MAX_OPERATION_PROGRESS_UPDATES,
+    message: `${method} completed`,
+  });
   return parsed.data;
 }
 
@@ -56,18 +154,20 @@ export async function forwardBridgeTool(
   method: string,
   args: Record<string, unknown>,
   outputSchema: z.ZodType,
+  options?: BridgeRequestOptions,
 ): Promise<
   | { content: Array<{ type: "text"; text: string }>; structuredContent: Record<string, unknown> }
   | { content: Array<{ type: "text"; text: string }>; isError: true }
 > {
   try {
-    const parsed = await requestBridgeValue(bridge, method, args, outputSchema);
+    const parsed = await requestBridgeValue(bridge, method, args, outputSchema, options);
     return {
       content: [{ type: "text", text: `${method} completed successfully.` }],
       structuredContent: parsed as Record<string, unknown>,
     };
   } catch (error) {
     if (error instanceof BridgeResultError) return errorContent(error.envelope);
+    if (error instanceof BridgeRequestError) return errorContent(error.envelope);
     return errorContent(makeError("OFFLINE_BRIDGE", `Bridge request ${method} failed`, true));
   }
 }
@@ -113,6 +213,7 @@ export async function forwardAuthorizedBridgeTool(
   method: string,
   args: Record<string, unknown>,
   outputSchema: z.ZodType,
+  options?: BridgeRequestOptions,
 ): Promise<Awaited<ReturnType<typeof forwardBridgeTool>>> {
   if (!authorization) {
     return errorContent(
@@ -130,11 +231,12 @@ export async function forwardAuthorizedBridgeTool(
       "mutation.execute",
       { method, params: args, authorization },
       outputSchema,
+      options,
     );
   }
   try {
     return await authorizer.run(authorization, async () => {
-      const result = await forwardBridgeTool(bridge, method, args, outputSchema);
+      const result = await forwardBridgeTool(bridge, method, args, outputSchema, options);
       if ("isError" in result && result.isError) throw new AuthorizedToolFailure(result);
       return result;
     });

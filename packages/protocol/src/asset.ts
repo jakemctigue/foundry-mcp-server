@@ -203,7 +203,11 @@ export interface GeneratedImage {
 
 export interface ImageGenerationProvider {
   readonly id: string;
-  generate(prompt: string, options?: ImageGenerationOptions): Promise<GeneratedImage>;
+  generate(
+    prompt: string,
+    options?: ImageGenerationOptions,
+    signal?: AbortSignal,
+  ): Promise<GeneratedImage>;
 }
 
 export interface ImageInspection {
