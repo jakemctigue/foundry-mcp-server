@@ -107,15 +107,13 @@ describe("mcp-adapter <-> real host daemon", () => {
     });
     expect(daemon.pipe.ready).toBe(true);
 
-    const bridge = await connectToDaemon(daemon.pipePath, {
-      connectPipeClient: (pipePath) =>
-        connectPipeClient(pipePath, { authKey: Buffer.alloc(32, 0xa5) }),
-      requestTimeoutMs: 2_000,
-    });
-    await expect(bridge.request("initialize")).rejects.toThrow(
-      "bridge transport closed before the request completed",
-    );
-    await bridge.close();
+    await expect(
+      connectToDaemon(daemon.pipePath, {
+        connectPipeClient: (pipePath) =>
+          connectPipeClient(pipePath, { authKey: Buffer.alloc(32, 0xa5) }),
+        requestTimeoutMs: 2_000,
+      }),
+    ).rejects.toThrow("bridge connection closed before authentication completed");
   });
 
   it("does not substitute a stub when the daemon connection fails", async () => {

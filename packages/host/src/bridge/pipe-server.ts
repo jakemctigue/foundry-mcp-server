@@ -4,6 +4,10 @@ import type { Logger } from "../logger.js";
 import { defaultAclCheck, enforceAcl, type AclCheck } from "./acl.js";
 import {
   BridgeAuthenticator,
+  createBridgeAuthChallenge,
+  createBridgeAuthReady,
+  isBridgeAuthInit,
+  isBridgeAuthProof,
   isBridgeRequestAuthorized,
   registerInProcessBridgeAuthKey,
   unregisterInProcessBridgeAuthKey,
@@ -96,6 +100,29 @@ interface AuthorizedConnection {
   decoder: FrameDecoder;
   authenticator: BridgeAuthenticator;
   tokenAllowed: Promise<boolean>;
+  initialized: boolean;
+  authenticated: boolean;
+}
+
+function createAuthorizedConnection(
+  authKey: Buffer,
+  tokenAllowed: Promise<boolean>,
+): { connection: AuthorizedConnection; challenge: unknown } {
+  const { challenge, session } = createBridgeAuthChallenge();
+  return {
+    connection: {
+      decoder: new FrameDecoder(),
+      authenticator: new BridgeAuthenticator(authKey, {
+        session,
+        signDirection: "server-to-client",
+        verifyDirection: "client-to-server",
+      }),
+      tokenAllowed,
+      initialized: false,
+      authenticated: false,
+    },
+    challenge,
+  };
 }
 
 function failedHandle(): PipeServerHandle {
@@ -140,6 +167,15 @@ async function processAuthenticatedChunk(
   }
 
   for (const frame of frames) {
+    if (!connection.initialized) {
+      if (!isBridgeAuthInit(frame)) {
+        logger.warn("bridge authentication initialization failed; closing connection");
+        reject();
+        return;
+      }
+      connection.initialized = true;
+      continue;
+    }
     const verification = connection.authenticator.verify(frame);
     if (!isBridgeRequestAuthorized(aclAllowed && tokenAllowed, verification.ok)) {
       logger.warn("bridge HMAC check failed; closing connection", {
@@ -147,6 +183,16 @@ async function processAuthenticatedChunk(
       });
       reject();
       return;
+    }
+    if (!connection.authenticated) {
+      if (!isBridgeAuthProof(verification.message)) {
+        logger.warn("bridge authentication proof failed; closing connection");
+        reject();
+        return;
+      }
+      connection.authenticated = true;
+      respond(encodeFrame(connection.authenticator.sign(createBridgeAuthReady())));
+      continue;
     }
     onMessage(verification.message, (response) => {
       respond(encodeFrame(connection.authenticator.sign(response)));
@@ -168,13 +214,12 @@ async function startUnixPipeServer(
 
   let aclAllowed = false;
   const server = net.createServer((socket) => {
-    const connection: AuthorizedConnection = {
-      decoder: new FrameDecoder(),
-      authenticator: new BridgeAuthenticator(authKey),
-      tokenAllowed: Promise.resolve(
-        clientTokenCheck({ platform: process.platform, tokenVerified: true }),
-      ),
-    };
+    const created = createAuthorizedConnection(
+      authKey,
+      Promise.resolve(clientTokenCheck({ platform: process.platform, tokenVerified: true })),
+    );
+    const connection = created.connection;
+    socket.write(encodeFrame(created.challenge));
     socket.on("data", (chunk: Buffer) => {
       void processAuthenticatedChunk(
         connection,
@@ -237,10 +282,9 @@ async function startWindowsPipeServer(
       executablePath: options.brokerExecutablePath,
       onConnected: (identity: BrokerClientIdentity) => {
         const expected = readyIdentity;
-        connections.set(identity.connectionId, {
-          decoder: new FrameDecoder(),
-          authenticator: new BridgeAuthenticator(authKey),
-          tokenAllowed: Promise.resolve(
+        const created = createAuthorizedConnection(
+          authKey,
+          Promise.resolve(
             clientTokenCheck({
               platform: "win32",
               tokenVerified: identity.tokenVerified,
@@ -250,7 +294,9 @@ async function startWindowsPipeServer(
               expectedLogonSid: expected?.logonSid,
             }),
           ),
-        });
+        );
+        connections.set(identity.connectionId, created.connection);
+        broker.send(identity.connectionId, encodeFrame(created.challenge));
       },
       onData: async (connectionId, data) => {
         if (!aclAllowed) {

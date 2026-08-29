@@ -13,8 +13,32 @@ import {
   unregisterInProcessBridgeAuthKey,
 } from "../src/bridge/bridge-auth.js";
 import { createLogger } from "../src/logger.js";
+import { createSecretStorage, DEV_FALLBACK_DISABLED_ERROR } from "../src/secrets/storage.js";
 
 const AUTH_KEY = Buffer.alloc(32, 0x51);
+const AUTH_SESSION = Buffer.alloc(32, 0x71);
+
+function clientAuthenticator(
+  key: Buffer = AUTH_KEY,
+  session: Buffer = AUTH_SESSION,
+): BridgeAuthenticator {
+  return new BridgeAuthenticator(key, {
+    session,
+    signDirection: "client-to-server",
+    verifyDirection: "server-to-client",
+  });
+}
+
+function serverAuthenticator(
+  key: Buffer = AUTH_KEY,
+  session: Buffer = AUTH_SESSION,
+): BridgeAuthenticator {
+  return new BridgeAuthenticator(key, {
+    session,
+    signDirection: "server-to-client",
+    verifyDirection: "client-to-server",
+  });
+}
 
 describe("bridge defense-in-depth authorization", () => {
   const temporaryDirectories: string[] = [];
@@ -38,8 +62,8 @@ describe("bridge defense-in-depth authorization", () => {
   );
 
   it("authenticates an untampered message", () => {
-    const signer = new BridgeAuthenticator(AUTH_KEY);
-    const verifier = new BridgeAuthenticator(AUTH_KEY);
+    const signer = clientAuthenticator();
+    const verifier = serverAuthenticator();
     const envelope = signer.sign({ method: "connections.list" });
     expect(verifier.verify(envelope)).toEqual({
       ok: true,
@@ -48,14 +72,14 @@ describe("bridge defense-in-depth authorization", () => {
   });
 
   it("fails closed for a wrong key", () => {
-    const signer = new BridgeAuthenticator(AUTH_KEY);
-    const verifier = new BridgeAuthenticator(Buffer.alloc(32, 0x52));
+    const signer = clientAuthenticator();
+    const verifier = serverAuthenticator(Buffer.alloc(32, 0x52));
     expect(verifier.verify(signer.sign({ method: "connections.list" })).ok).toBe(false);
   });
 
   it("fails closed for a replayed authenticated frame", () => {
-    const signer = new BridgeAuthenticator(AUTH_KEY);
-    const verifier = new BridgeAuthenticator(AUTH_KEY);
+    const signer = clientAuthenticator();
+    const verifier = serverAuthenticator();
     const envelope = signer.sign({ method: "connections.list" });
     expect(verifier.verify(envelope).ok).toBe(true);
     expect(verifier.verify(envelope)).toMatchObject({
@@ -64,9 +88,21 @@ describe("bridge defense-in-depth authorization", () => {
     });
   });
 
+  it("rejects a captured frame after reconnecting with a fresh session", () => {
+    const envelope = clientAuthenticator().sign({ method: "assets.images.upload" });
+    expect(serverAuthenticator().verify(envelope).ok).toBe(true);
+    expect(serverAuthenticator(AUTH_KEY, Buffer.alloc(32, 0x72)).verify(envelope).ok).toBe(false);
+  });
+
+  it("binds the MAC to one transport direction", () => {
+    const responseEnvelope = serverAuthenticator().sign({ id: "response" });
+    expect(clientAuthenticator().verify(responseEnvelope).ok).toBe(true);
+    expect(serverAuthenticator().verify(responseEnvelope).ok).toBe(false);
+  });
+
   it("fails closed if the payload is modified after signing", () => {
-    const signer = new BridgeAuthenticator(AUTH_KEY);
-    const verifier = new BridgeAuthenticator(AUTH_KEY);
+    const signer = clientAuthenticator();
+    const verifier = serverAuthenticator();
     const envelope = signer.sign({ method: "connections.list" });
     const changed = {
       ...envelope,
@@ -85,7 +121,7 @@ describe("bridge defense-in-depth authorization", () => {
     { version: 1, nonce: "a", mac: "a" },
     { version: 1, nonce: "a", payload: "a" },
   ])("rejects malformed envelopes without throwing", (value) => {
-    expect(new BridgeAuthenticator(AUTH_KEY).verify(value)).toMatchObject({ ok: false });
+    expect(serverAuthenticator().verify(value)).toMatchObject({ ok: false });
   });
 
   it.each([
@@ -94,17 +130,24 @@ describe("bridge defense-in-depth authorization", () => {
     { field: "payload", value: "not+base64url" },
     { field: "mac", value: "not+base64url" },
   ])("rejects invalid $field encoding", ({ field, value }) => {
-    const envelope = new BridgeAuthenticator(AUTH_KEY).sign({ ok: true });
+    const envelope = clientAuthenticator().sign({ ok: true });
     const changed = { ...envelope, [field]: value };
-    expect(new BridgeAuthenticator(AUTH_KEY).verify(changed)).toMatchObject({ ok: false });
+    expect(serverAuthenticator().verify(changed)).toMatchObject({ ok: false });
   });
 
   it("requires an exact 256-bit key", () => {
-    expect(() => new BridgeAuthenticator(Buffer.alloc(31))).toThrow(/exactly 32 bytes/);
+    expect(
+      () =>
+        new BridgeAuthenticator(Buffer.alloc(31), {
+          session: AUTH_SESSION,
+          signDirection: "client-to-server",
+          verifyDirection: "server-to-client",
+        }),
+    ).toThrow(/exactly 32 bytes/);
   });
 
   it("rejects non-serializable and oversized outgoing messages", () => {
-    const signer = new BridgeAuthenticator(AUTH_KEY);
+    const signer = clientAuthenticator();
     expect(() => signer.sign(undefined)).toThrow(/not JSON serializable/);
     expect(() => signer.sign("x".repeat(16 * 1024 * 1024))).toThrow(/payload limit/);
   });
@@ -134,10 +177,69 @@ describe("bridge defense-in-depth authorization", () => {
     expect(clientLoaded?.equals(created)).toBe(true);
   });
 
+  it("refuses the development fallback in production even when explicitly requested", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fmcp-bridge-production-"));
+    temporaryDirectories.push(directory);
+    const logger = createLogger({ sinks: [{ write: () => {} }], level: "error" });
+    const previousNodeEnv = process.env["NODE_ENV"];
+    process.env["NODE_ENV"] = "production";
+    try {
+      const storage = createSecretStorage({
+        dir: directory,
+        logger,
+        forceFallback: true,
+        allowDevelopmentFallback: true,
+      });
+      await expect(storage.save("bridge-auth", AUTH_KEY)).rejects.toThrow(
+        DEV_FALLBACK_DISABLED_ERROR,
+      );
+      expect(fs.existsSync(path.join(directory, "bridge-auth.secret"))).toBe(false);
+    } finally {
+      if (previousNodeEnv === undefined) {
+        delete process.env["NODE_ENV"];
+      } else {
+        process.env["NODE_ENV"] = previousNodeEnv;
+      }
+    }
+  });
+
+  it("allows the encrypted-file fallback only with an explicit non-production opt-in", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fmcp-bridge-development-"));
+    temporaryDirectories.push(directory);
+    const logger = createLogger({ sinks: [{ write: () => {} }], level: "error" });
+    const previousNodeEnv = process.env["NODE_ENV"];
+    delete process.env["NODE_ENV"];
+    try {
+      const disabled = createSecretStorage({
+        dir: directory,
+        logger,
+        forceFallback: true,
+      });
+      await expect(disabled.save("disabled", AUTH_KEY)).rejects.toThrow(
+        DEV_FALLBACK_DISABLED_ERROR,
+      );
+
+      const enabled = createSecretStorage({
+        dir: directory,
+        logger,
+        forceFallback: true,
+        allowDevelopmentFallback: true,
+      });
+      await enabled.save("enabled", AUTH_KEY);
+      expect((await enabled.load("enabled"))?.equals(AUTH_KEY)).toBe(true);
+    } finally {
+      if (previousNodeEnv === undefined) {
+        delete process.env["NODE_ENV"];
+      } else {
+        process.env["NODE_ENV"] = previousNodeEnv;
+      }
+    }
+  });
+
   it("rejects authenticated payloads that are too large or not JSON", () => {
     const oversizedPayload = Buffer.alloc(16 * 1024 * 1024 + 1, 0x61);
     expect(
-      new BridgeAuthenticator(AUTH_KEY).verify({
+      serverAuthenticator().verify({
         version: 1,
         nonce: Buffer.alloc(16, 1).toString("base64url"),
         payload: oversizedPayload.toString("base64url"),
@@ -150,11 +252,13 @@ describe("bridge defense-in-depth authorization", () => {
     const mac = crypto
       .createHmac("sha256", AUTH_KEY)
       .update(Buffer.from("foundry-mcp-bridge-v1\0", "utf8"))
+      .update(AUTH_SESSION)
+      .update(Buffer.from("client-to-server\0", "utf8"))
       .update(nonce)
       .update(invalidJson)
       .digest();
     expect(
-      new BridgeAuthenticator(AUTH_KEY).verify({
+      serverAuthenticator().verify({
         version: 1,
         nonce: nonce.toString("base64url"),
         payload: invalidJson.toString("base64url"),
@@ -167,8 +271,8 @@ describe("bridge defense-in-depth authorization", () => {
   });
 
   it("fails closed after the bounded per-connection frame budget", () => {
-    const signer = new BridgeAuthenticator(AUTH_KEY);
-    const verifier = new BridgeAuthenticator(AUTH_KEY);
+    const signer = clientAuthenticator();
+    const verifier = serverAuthenticator();
     for (let index = 0; index < 4_096; index += 1) {
       expect(verifier.verify(signer.sign(index)).ok).toBe(true);
     }

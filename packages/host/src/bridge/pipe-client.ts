@@ -1,10 +1,16 @@
 import net from "node:net";
 import {
   BridgeAuthenticator,
+  createBridgeAuthInit,
+  createBridgeAuthProof,
   findInProcessBridgeAuthKey,
+  isBridgeAuthReady,
   loadExistingBridgeAuthKey,
+  parseBridgeAuthChallenge,
 } from "./bridge-auth.js";
 import { encodeFrame, FrameDecoder } from "./pipe-server.js";
+
+const AUTH_HANDSHAKE_TIMEOUT_MS = 15_000;
 
 export interface PipeClient {
   send: (message: unknown) => void;
@@ -17,6 +23,7 @@ export interface PipeClient {
 export interface ConnectPipeClientOptions {
   authKey?: Buffer;
   appDataDir?: string;
+  allowDevelopmentSecretFallback?: boolean;
 }
 
 async function resolveClientAuthKey(
@@ -26,7 +33,9 @@ async function resolveClientAuthKey(
   const key =
     options.authKey ??
     findInProcessBridgeAuthKey(pipePath) ??
-    (await loadExistingBridgeAuthKey(options.appDataDir));
+    (await loadExistingBridgeAuthKey(options.appDataDir, {
+      allowDevelopmentFallback: options.allowDevelopmentSecretFallback === true,
+    }));
   if (!key || key.length !== 32) {
     throw new Error("bridge HMAC key is unavailable; refusing unauthenticated pipe connection");
   }
@@ -40,9 +49,26 @@ export async function connectPipeClient(
   const authKey = await resolveClientAuthKey(pipePath, options);
   const socket = net.createConnection(pipePath);
   const decoder = new FrameDecoder();
-  const authenticator = new BridgeAuthenticator(authKey);
+  let authenticator: BridgeAuthenticator | undefined;
   const handlers: Array<(message: unknown) => void> = [];
   const errorHandlers: Array<(error: Error) => void> = [];
+  let resolveHandshake: (() => void) | undefined;
+  let rejectHandshake: ((error: Error) => void) | undefined;
+  let handshakeSettled = false;
+  const handshake = new Promise<void>((resolve, reject) => {
+    resolveHandshake = resolve;
+    rejectHandshake = reject;
+  });
+  // A socket can fail before the connect promise below completes. Mark this
+  // second promise as observed immediately so that the same early error cannot
+  // become an unhandled rejection before we reach the handshake await.
+  void handshake.catch(() => undefined);
+
+  function failHandshake(error: Error): void {
+    if (handshakeSettled) return;
+    handshakeSettled = true;
+    rejectHandshake?.(error);
+  }
   const closeHandlers: Array<() => void> = [];
   let closed = false;
 
@@ -50,9 +76,13 @@ export async function connectPipeClient(
   // transport without becoming an uncaught EventEmitter error when a caller
   // chooses not to observe diagnostics.
   socket.on("error", (error) => {
+    failHandshake(error);
     for (const handler of errorHandlers) {
       handler(error);
     }
+  });
+  socket.once("close", () => {
+    failHandshake(new Error("bridge connection closed before authentication completed"));
   });
   socket.on("close", () => {
     closed = true;
@@ -65,10 +95,33 @@ export async function connectPipeClient(
     try {
       const frames = decoder.push(chunk);
       for (const frame of frames) {
+        if (!authenticator) {
+          const session = parseBridgeAuthChallenge(frame);
+          if (!session) {
+            socket.destroy(new Error("bridge returned an invalid authentication challenge"));
+            return;
+          }
+          authenticator = new BridgeAuthenticator(authKey, {
+            session,
+            signDirection: "client-to-server",
+            verifyDirection: "server-to-client",
+          });
+          socket.write(encodeFrame(authenticator.sign(createBridgeAuthProof())));
+          continue;
+        }
         const verification = authenticator.verify(frame);
         if (!verification.ok) {
           socket.destroy(new Error(verification.reason ?? "bridge response authentication failed"));
           return;
+        }
+        if (!handshakeSettled) {
+          if (!isBridgeAuthReady(verification.message)) {
+            socket.destroy(new Error("bridge returned an invalid authentication proof"));
+            return;
+          }
+          handshakeSettled = true;
+          resolveHandshake?.();
+          continue;
         }
         for (const handler of handlers) {
           handler(verification.message);
@@ -82,13 +135,29 @@ export async function connectPipeClient(
   await new Promise<void>((resolve, reject) => {
     socket.once("connect", () => {
       socket.removeListener("error", reject);
+      socket.write(encodeFrame(createBridgeAuthInit()));
       resolve();
     });
     socket.once("error", reject);
   });
 
+  const handshakeTimer = setTimeout(() => {
+    const error = new Error("bridge authentication challenge timed out");
+    failHandshake(error);
+    socket.destroy(error);
+  }, AUTH_HANDSHAKE_TIMEOUT_MS);
+  handshakeTimer.unref();
+  try {
+    await handshake;
+  } finally {
+    clearTimeout(handshakeTimer);
+  }
+
   return {
     send: (message: unknown) => {
+      if (!authenticator) {
+        throw new Error("bridge authentication is not initialized");
+      }
       socket.write(encodeFrame(authenticator.sign(message)));
     },
     onMessage: (handler) => {

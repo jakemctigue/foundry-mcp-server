@@ -80,16 +80,16 @@ describe("pipe security enforcement", () => {
     });
     expect(server.ready).toBe(true);
 
-    const client = await connectPipeClient(target, { authKey: AUTH_KEY });
-    client.send({ method: "connections.list" });
+    await expect(connectPipeClient(target, { authKey: AUTH_KEY })).rejects.toThrow(
+      "bridge connection closed before authentication completed",
+    );
     await waitWithTimeout(capture.waitForWarning);
 
     expect(messages).toBe(0);
     expect(capture.warnings.some((message) => message.includes("client token check failed"))).toBe(
       true,
     );
-    await client.close();
-    await server.close();
+    await Promise.all([server.close(), server.close()]);
   });
 
   it("rejects a valid-token connection with an invalid HMAC before onMessage", async () => {
@@ -106,14 +106,14 @@ describe("pipe security enforcement", () => {
     });
     expect(server.ready).toBe(true);
 
-    const client = await connectPipeClient(target, { authKey: Buffer.alloc(32, 0x62) });
-    client.send({ method: "connections.list" });
+    await expect(connectPipeClient(target, { authKey: Buffer.alloc(32, 0x62) })).rejects.toThrow(
+      "bridge connection closed before authentication completed",
+    );
     await waitWithTimeout(capture.waitForWarning);
 
     expect(messages).toBe(0);
     expect(capture.warnings.some((message) => message.includes("HMAC check failed"))).toBe(true);
-    await client.close();
-    await server.close();
+    await Promise.all([server.close(), server.close()]);
   });
 
   it("fails closed before transport startup when no HMAC key is configured", async () => {

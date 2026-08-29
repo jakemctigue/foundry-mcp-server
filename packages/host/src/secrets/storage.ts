@@ -10,6 +10,8 @@ export interface SecretStorage {
 
 const DEV_FALLBACK_WARNING =
   "using AES-256-GCM encrypted-file secret storage: development fallback, not for production Windows use";
+const DEV_FALLBACK_DISABLED_ERROR =
+  "OS-protected secret storage is unavailable; encrypted-file fallback requires an explicit non-production development opt-in";
 
 interface DpapiModule {
   protectData: (
@@ -77,13 +79,25 @@ export interface CreateSecretStorageOptions {
   dir: string;
   logger: Logger;
   forceFallback?: boolean;
+  allowDevelopmentFallback?: boolean;
+}
+
+function requireDevelopmentFallback(options: CreateSecretStorageOptions): void {
+  const runtimeMode = process.env["NODE_ENV"];
+  const explicitlyDevelopment =
+    options.allowDevelopmentFallback === true ||
+    runtimeMode === "development" ||
+    runtimeMode === "test";
+  if (!explicitlyDevelopment || runtimeMode === "production") {
+    throw new Error(DEV_FALLBACK_DISABLED_ERROR);
+  }
 }
 
 /**
  * Creates a secret storage backend. On Windows, secrets are protected via
- * DPAPI (current-user scope). If DPAPI is unavailable (non-Windows, or the
- * native module fails to load), falls back to an AES-256-GCM encrypted file
- * and logs an explicit warning that this fallback is not for production use.
+ * DPAPI (current-user scope). An AES-256-GCM encrypted-file fallback is
+ * available only to explicitly opted-in development/test runtimes and is
+ * always refused when NODE_ENV=production.
  */
 export function createSecretStorage(options: CreateSecretStorageOptions): SecretStorage {
   const { dir, logger } = options;
@@ -111,6 +125,7 @@ export function createSecretStorage(options: CreateSecretStorageOptions): Secret
           // write an unprotected secret; continue into the encrypted fallback.
         }
       }
+      requireDevelopmentFallback(options);
       logger.warn(DEV_FALLBACK_WARNING, { key });
       fs.writeFileSync(filePath, encryptFallback(value));
     },
@@ -129,10 +144,11 @@ export function createSecretStorage(options: CreateSecretStorageOptions): Secret
           // authenticated and throws if this was not a fallback-format blob.
         }
       }
+      requireDevelopmentFallback(options);
       logger.warn(DEV_FALLBACK_WARNING, { key });
       return decryptFallback(blob);
     },
   };
 }
 
-export { DEV_FALLBACK_WARNING };
+export { DEV_FALLBACK_DISABLED_ERROR, DEV_FALLBACK_WARNING };

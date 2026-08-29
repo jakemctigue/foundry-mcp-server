@@ -147,9 +147,21 @@ function spawnBroker(
   return { child, invocation };
 }
 
-function writeCommand(child: ChildProcessWithoutNullStreams, command: object): void {
-  if (!child.stdin.destroyed) {
-    child.stdin.write(`${JSON.stringify(command)}\n`);
+function writeCommand(
+  child: ChildProcessWithoutNullStreams,
+  command: object,
+  onError: (error: Error) => void,
+): void {
+  if (!child.stdin.destroyed && !child.stdin.writableEnded && !child.stdin.writableFinished) {
+    try {
+      child.stdin.write(`${JSON.stringify(command)}\n`, (error) => {
+        if (error) {
+          onError(error);
+        }
+      });
+    } catch (error) {
+      onError(error instanceof Error ? error : new Error(String(error)));
+    }
   }
 }
 
@@ -181,6 +193,9 @@ export async function startWindowsPipeBroker(
   });
 
   let settled = false;
+  let closing = false;
+  let controlFailed = false;
+  let closePromise: Promise<void> | undefined;
   let readyIdentity: BrokerReadyIdentity | undefined;
   let eventChain = Promise.resolve();
   let resolveReady: ((identity: BrokerReadyIdentity) => void) | undefined;
@@ -189,6 +204,22 @@ export async function startWindowsPipeBroker(
     resolveReady = resolve;
     rejectReady = reject;
   });
+
+  function failControlChannel(error: Error): void {
+    if (closing || controlFailed) {
+      return;
+    }
+    controlFailed = true;
+    options.logger.error("Windows pipe broker control channel failed closed", {
+      error: error.message,
+    });
+    child.kill();
+    if (!settled) {
+      settled = true;
+      clearTimeout(startupTimer);
+      rejectReady?.(error);
+    }
+  }
 
   const startupTimer = setTimeout(() => {
     if (!settled) {
@@ -274,6 +305,7 @@ export async function startWindowsPipeBroker(
       rejectReady?.(error);
     }
   });
+  child.stdin.on("error", failControlChannel);
   child.once("exit", (code, signal) => {
     if (!settled) {
       settled = true;
@@ -300,28 +332,38 @@ export async function startWindowsPipeBroker(
   return {
     identity,
     send: (connectionId, data) => {
-      writeCommand(child, { type: "data", connectionId, data: data.toString("base64") });
+      if (closing) return;
+      writeCommand(
+        child,
+        { type: "data", connectionId, data: data.toString("base64") },
+        failControlChannel,
+      );
     },
     closeConnection: (connectionId) => {
-      writeCommand(child, { type: "close", connectionId });
+      if (closing) return;
+      writeCommand(child, { type: "close", connectionId }, failControlChannel);
     },
-    close: async () => {
-      if (child.exitCode !== null || child.signalCode !== null) {
-        return;
-      }
-      writeCommand(child, { type: "shutdown" });
-      child.stdin.end();
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          child.kill();
-          resolve();
-        }, 5_000);
-        timer.unref();
-        child.once("exit", () => {
-          clearTimeout(timer);
-          resolve();
+    close: () => {
+      closePromise ??= (async () => {
+        if (child.exitCode !== null || child.signalCode !== null) {
+          return;
+        }
+        closing = true;
+        writeCommand(child, { type: "shutdown" }, failControlChannel);
+        child.stdin.end();
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            child.kill();
+            resolve();
+          }, 5_000);
+          timer.unref();
+          child.once("exit", () => {
+            clearTimeout(timer);
+            resolve();
+          });
         });
-      });
+      })();
+      return closePromise;
     },
   };
 }
