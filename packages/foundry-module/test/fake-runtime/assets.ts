@@ -2,6 +2,8 @@ import type { AssetSourceCapability } from "@foundry-mcp/protocol";
 import type {
   FoundryAssetRuntimeAdapter,
   RuntimeAssetBrowseResult,
+  RuntimeDecodedImage,
+  RuntimeImageDecodeLimits,
   RuntimeAssetUploadResult,
 } from "../../src/asset-runtime.js";
 
@@ -33,6 +35,7 @@ function normalize(path: string): string {
 export class FakeFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
   online = true;
   uploadCalls = 0;
+  decodeCalls = 0;
   readonly #sources = new Map<string, FakeAssetSource>();
 
   addSource(capability: AssetSourceCapability): this {
@@ -99,6 +102,22 @@ export class FakeFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
 
   async exists(sourceId: string, path: string): Promise<boolean> {
     return this.#sources.get(sourceId)?.files.has(normalize(path)) ?? false;
+  }
+
+  async decodeImage(
+    bytes: Uint8Array,
+    mimeType: string,
+    _limits: RuntimeImageDecodeLimits,
+  ): Promise<RuntimeDecodedImage> {
+    this.decodeCalls += 1;
+    if (
+      mimeType === "image/png" &&
+      bytes.byteLength === VALID_PNG.byteLength &&
+      bytes.every((byte, index) => byte === VALID_PNG[index])
+    ) {
+      return { width: 1, height: 1 };
+    }
+    throw new Error("Fake decoder rejected invalid image bytes");
   }
 
   async upload(

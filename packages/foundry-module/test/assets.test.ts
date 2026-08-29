@@ -18,6 +18,23 @@ function encode(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
+function uploadSource(bytes: Uint8Array, mimeType: string) {
+  return { kind: "base64" as const, data: encode(bytes), mimeType };
+}
+
+const CORRUPT_HEADER_PNG = VALID_PNG.slice(0, 33);
+const CORRUPT_HEADER_JPEG = Uint8Array.from([
+  0xff, 0xd8, 0xff, 0xc0, 0x00, 0x11, 0x08, 0x00, 0x01, 0x00, 0x01, 0x03, 0x01, 0x11, 0x00, 0x02,
+  0x11, 0x00, 0x03, 0x11, 0x00,
+]);
+const CORRUPT_HEADER_WEBP = (() => {
+  const bytes = new Uint8Array(30);
+  bytes.set(new TextEncoder().encode("RIFF"), 0);
+  bytes.set(new TextEncoder().encode("WEBP"), 8);
+  bytes.set(new TextEncoder().encode("VP8X"), 12);
+  return bytes;
+})();
+
 function createService(options: ConstructorParameters<typeof FoundryAssetService>[3] = {}) {
   const runtime = createRichFakeRuntime();
   const assets = createFakeAssetRuntime();
@@ -131,6 +148,141 @@ describe("FoundryAssetService upload", () => {
     expect(assets.uploadCalls).toBe(0);
   });
 
+  it.each([
+    ["truncated PNG", "image/png", "art/corrupt.png", CORRUPT_HEADER_PNG],
+    ["truncated JPEG", "image/jpeg", "art/corrupt.jpg", CORRUPT_HEADER_JPEG],
+    ["truncated WebP", "image/webp", "art/corrupt.webp", CORRUPT_HEADER_WEBP],
+  ])("rejects a header-valid but undecodable %s", async (_label, mimeType, path, bytes) => {
+    const { assets, service } = createService();
+    expect(
+      await service.upload({ destinationPath: path, source: uploadSource(bytes, mimeType) }),
+    ).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_DATA", message: "Image could not be decoded safely" },
+    });
+    expect(assets.decodeCalls).toBe(1);
+    expect(assets.uploadCalls).toBe(0);
+  });
+
+  it("rejects image/active-markup polyglots even when the header remains valid", async () => {
+    const markup = new TextEncoder().encode("<svg><script>alert(1)</script></svg>");
+    const polyglot = new Uint8Array(VALID_PNG.byteLength + markup.byteLength);
+    polyglot.set(VALID_PNG);
+    polyglot.set(markup, VALID_PNG.byteLength);
+    const { assets, service } = createService();
+
+    expect(
+      await service.upload({
+        destinationPath: "art/polyglot.png",
+        source: uploadSource(polyglot, "image/png"),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+    expect(assets.uploadCalls).toBe(0);
+  });
+
+  it("fails closed on decoder errors, missing decoders, and decoded dimension limits", async () => {
+    const failed = createService();
+    vi.spyOn(failed.assets, "decodeImage").mockRejectedValue(new Error("decoder failure"));
+    expect(
+      await failed.service.upload({
+        destinationPath: "art/decoder-failure.png",
+        source: uploadSource(VALID_PNG, "image/png"),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+    expect(failed.assets.uploadCalls).toBe(0);
+    expect(
+      await failed.service.upload({
+        destinationPath: "art/generated-decoder-failure.png",
+        source: {
+          kind: "generated",
+          data: encode(VALID_PNG),
+          mimeType: "image/png",
+          provider: "test",
+        },
+      }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+    expect(failed.assets.uploadCalls).toBe(0);
+
+    const missingRuntime = createFakeAssetRuntime();
+    const missingDecoder = {
+      isOnline: () => missingRuntime.isOnline(),
+      listSources: () => missingRuntime.listSources(),
+      browse: (sourceId: string, path: string, extensions?: string[]) =>
+        missingRuntime.browse(sourceId, path, extensions),
+      exists: (sourceId: string, path: string) => missingRuntime.exists(sourceId, path),
+      decodeImage: undefined,
+      upload: (
+        sourceId: string,
+        path: string,
+        bytes: Uint8Array,
+        mimeType: string,
+        options: { overwrite: boolean },
+      ) => missingRuntime.upload(sourceId, path, bytes, mimeType, options),
+    } as unknown as FoundryAssetRuntimeAdapter;
+    const documentRuntime = createRichFakeRuntime();
+    const withoutDecoder = new FoundryAssetService(
+      missingDecoder,
+      new FoundryDocumentService(documentRuntime),
+      documentRuntime,
+    );
+    expect(
+      await withoutDecoder.upload({
+        destinationPath: "art/no-decoder.png",
+        source: uploadSource(VALID_PNG, "image/png"),
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { code: "INVALID_DATA", message: "Safe image decoding is unavailable" },
+    });
+
+    const dimensions = createService({ maxImageWidth: 100, maxImagePixels: 10_000 });
+    const decodeImage = vi
+      .spyOn(dimensions.assets, "decodeImage")
+      .mockResolvedValue({ width: 101, height: 1 });
+    const wideHeader = Uint8Array.from(VALID_PNG);
+    wideHeader[19] = 101;
+    expect(
+      await dimensions.service.upload({
+        destinationPath: "art/header-too-wide.png",
+        source: uploadSource(wideHeader, "image/png"),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+    expect(decodeImage).not.toHaveBeenCalled();
+
+    expect(
+      await dimensions.service.upload({
+        destinationPath: "art/too-wide.png",
+        source: uploadSource(VALID_PNG, "image/png"),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+    expect(dimensions.assets.uploadCalls).toBe(0);
+
+    decodeImage.mockResolvedValue({ width: 100, height: 101 });
+    expect(
+      await dimensions.service.upload({
+        destinationPath: "art/too-many-pixels.png",
+        source: uploadSource(VALID_PNG, "image/png"),
+      }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+    expect(dimensions.assets.uploadCalls).toBe(0);
+  });
+
+  it("decodes host-rewritten base64 bytes without attempting to re-read a host path", async () => {
+    const loadLocalFile = vi.fn(async () => ({ bytes: VALID_PNG, mimeType: "image/png" }));
+    const { assets, service } = createService({ loadLocalFile });
+    expect(
+      unwrap(
+        await service.upload({
+          destinationPath: "art/host-rewritten.png",
+          source: uploadSource(VALID_PNG, "image/png"),
+        }),
+      ),
+    ).toMatchObject({ assetPath: "art/host-rewritten.png" });
+    expect(loadLocalFile).not.toHaveBeenCalled();
+    expect(assets.decodeCalls).toBe(1);
+    expect(assets.uploadCalls).toBe(1);
+  });
+
   it("honors error, overwrite, rename, file, and generated sources and persists listings", async () => {
     const fileLoads: Array<[string, number]> = [];
     const { assets, service } = createService({
@@ -177,6 +329,7 @@ describe("FoundryAssetService upload", () => {
       }),
     );
     expect(fileLoads).toEqual([["C:\\authorized\\input.png", 20 * 1024 * 1024]]);
+    expect(assets.decodeCalls).toBe(3);
     expect(unwrap(await service.list({ source: "data" })).items.map((item) => item.path)).toEqual([
       "art/from-file.png",
       "art/token-1.png",
@@ -186,6 +339,36 @@ describe("FoundryAssetService upload", () => {
 });
 
 describe("FoundryAssetService attach", () => {
+  it("rejects undecodable URL and upload attachment bytes before asset or Document mutation", async () => {
+    const { runtime, assets, documents, service } = createService({
+      importUrl: async () => ({ bytes: CORRUPT_HEADER_PNG, mimeType: "image/png" }),
+    });
+    const actor = runtime.seedDocument("Actor", { name: "Decode Guard", type: "stormborn" });
+    expect(
+      await service.attach({
+        documentUuid: actor.uuid,
+        asset: {
+          kind: "url",
+          url: "https://example.test/corrupt.png",
+          destinationPath: "tokens/corrupt-url.png",
+        },
+      }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+    expect(
+      await service.attach({
+        documentUuid: actor.uuid,
+        asset: {
+          kind: "upload",
+          destinationPath: "tokens/corrupt-upload.png",
+          source: uploadSource(CORRUPT_HEADER_PNG, "image/png"),
+        },
+      }),
+    ).toMatchObject({ ok: false, error: { code: "INVALID_DATA" } });
+    expect(assets.decodeCalls).toBe(2);
+    expect(assets.uploadCalls).toBe(0);
+    expect(unwrap(await documents.get({ uuid: actor.uuid })).data.img).toBeUndefined();
+  });
+
   it("fails before upload or Document mutation when audit recording fails", async () => {
     const { runtime, assets, documents, service } = createService();
     const actor = runtime.seedDocument("Actor", { name: "Audit Guard", type: "stormborn" });
@@ -216,6 +399,7 @@ describe("FoundryAssetService attach", () => {
       listSources: () => backing.listSources(),
       browse: (sourceId, path, extensions) => backing.browse(sourceId, path, extensions),
       exists: (sourceId, path) => backing.exists(sourceId, path),
+      decodeImage: (bytes, mimeType, limits) => backing.decodeImage(bytes, mimeType, limits),
       upload: (sourceId, path, bytes, mimeType, options) =>
         backing.upload(sourceId, path, bytes, mimeType, options),
     };
@@ -415,6 +599,7 @@ describe("FoundryAssetService attach", () => {
       ),
     ).toMatchObject({ assetPath: "tokens/imported.png", source: "data" });
     expect(imports).toEqual([["https://example.com/token.png", 20 * 1024 * 1024]]);
+    expect(assets.decodeCalls).toBe(1);
     expect(assets.get("data", "tokens/imported.png")).toBeDefined();
   });
 });

@@ -6,6 +6,7 @@ import {
   DEFAULT_IMAGE_EXTENSIONS,
   MAX_EMBEDDED_DEPTH,
   MAX_IMAGE_BYTES,
+  MAX_IMAGE_PIXELS,
   inspectImageBytes,
   makeError,
   type AssetCollisionPolicy,
@@ -23,7 +24,7 @@ import {
   type OperationResult,
 } from "@foundry-mcp/protocol";
 
-import type { FoundryAssetRuntimeAdapter } from "./asset-runtime.js";
+import { MAX_RUNTIME_IMAGE_DIMENSION, type FoundryAssetRuntimeAdapter } from "./asset-runtime.js";
 import { FoundryDocumentService } from "./documents.js";
 import type { FoundryRuntimeAdapter } from "./runtime.js";
 
@@ -36,6 +37,8 @@ export interface FoundryAssetServiceOptions {
   loadLocalFile?: (path: string, maxBytes: number) => Promise<AssetPayload>;
   importUrl?: (url: string, maxBytes: number) => Promise<AssetPayload>;
   maxImageBytes?: number;
+  maxImageWidth?: number;
+  maxImageHeight?: number;
   maxImagePixels?: number;
 }
 
@@ -75,6 +78,20 @@ function normalizedRuntimePath(path: string): string {
     .replaceAll("\\", "/")
     .replace(/^\/+/, "")
     .replace(/\/{2,}/g, "/");
+}
+
+function positiveImageLimit(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function boundedImageLimit(value: number, hardMaximum: number, label: string): number {
+  const validated = positiveImageLimit(value, label);
+  if (validated > hardMaximum)
+    throw new Error(`${label} cannot exceed the ${hardMaximum.toString()} hard limit`);
+  return validated;
 }
 
 export function validateAssetPath(path: string, options: { allowEmpty?: boolean } = {}): string {
@@ -236,6 +253,8 @@ type UploadCompensation = { kind: "delete" } | { kind: "restore"; snapshot: unkn
 
 export class FoundryAssetService {
   readonly #maxImageBytes: number;
+  readonly #maxImageWidth: number;
+  readonly #maxImageHeight: number;
   readonly #maxImagePixels: number;
 
   constructor(
@@ -244,8 +263,26 @@ export class FoundryAssetService {
     readonly documentRuntime: FoundryRuntimeAdapter,
     readonly options: FoundryAssetServiceOptions = {},
   ) {
-    this.#maxImageBytes = options.maxImageBytes ?? MAX_IMAGE_BYTES;
-    this.#maxImagePixels = options.maxImagePixels ?? 40_000_000;
+    this.#maxImageBytes = boundedImageLimit(
+      options.maxImageBytes ?? MAX_IMAGE_BYTES,
+      MAX_IMAGE_BYTES,
+      "maxImageBytes",
+    );
+    this.#maxImageWidth = boundedImageLimit(
+      options.maxImageWidth ?? MAX_RUNTIME_IMAGE_DIMENSION,
+      MAX_RUNTIME_IMAGE_DIMENSION,
+      "maxImageWidth",
+    );
+    this.#maxImageHeight = boundedImageLimit(
+      options.maxImageHeight ?? MAX_RUNTIME_IMAGE_DIMENSION,
+      MAX_RUNTIME_IMAGE_DIMENSION,
+      "maxImageHeight",
+    );
+    this.#maxImagePixels = boundedImageLimit(
+      options.maxImagePixels ?? MAX_IMAGE_PIXELS,
+      MAX_IMAGE_PIXELS,
+      "maxImagePixels",
+    );
   }
 
   async list(input: unknown = {}): Promise<OperationResult<AssetsImagesListOutput>> {
@@ -622,6 +659,43 @@ export class FoundryAssetService {
       requireDimensions: true,
     });
     if (!inspected.ok) operationError("INVALID_DATA", inspected.reason);
+    if (
+      (inspected.value.width !== undefined && inspected.value.width > this.#maxImageWidth) ||
+      (inspected.value.height !== undefined && inspected.value.height > this.#maxImageHeight)
+    ) {
+      operationError("INVALID_DATA", "Image header dimensions exceed the configured limits");
+    }
+    const decodeImage = this.assets.decodeImage;
+    if (typeof decodeImage !== "function")
+      operationError("INVALID_DATA", "Safe image decoding is unavailable");
+    let decoded: { width: number; height: number };
+    try {
+      decoded = await decodeImage.call(this.assets, payload.bytes, inspected.value.mimeType, {
+        maxBytes: this.#maxImageBytes,
+        maxWidth: this.#maxImageWidth,
+        maxHeight: this.#maxImageHeight,
+        maxPixels: this.#maxImagePixels,
+      });
+    } catch {
+      operationError("INVALID_DATA", "Image could not be decoded safely");
+    }
+    if (
+      !Number.isSafeInteger(decoded.width) ||
+      !Number.isSafeInteger(decoded.height) ||
+      decoded.width <= 0 ||
+      decoded.height <= 0 ||
+      decoded.width > this.#maxImageWidth ||
+      decoded.height > this.#maxImageHeight ||
+      decoded.width * decoded.height > this.#maxImagePixels
+    ) {
+      operationError("INVALID_DATA", "Decoded image dimensions exceed the configured limits");
+    }
+    if (
+      (inspected.value.width !== undefined && inspected.value.width !== decoded.width) ||
+      (inspected.value.height !== undefined && inspected.value.height !== decoded.height)
+    ) {
+      operationError("INVALID_DATA", "Decoded image dimensions do not match its image headers");
+    }
     void capability;
     return {
       sourceId,

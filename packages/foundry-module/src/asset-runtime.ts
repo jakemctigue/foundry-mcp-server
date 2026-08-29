@@ -1,4 +1,11 @@
-import type { AssetSourceCapability } from "@foundry-mcp/protocol";
+import {
+  MAX_IMAGE_BYTES,
+  MAX_IMAGE_PIXELS,
+  inspectImageBytes,
+  type AssetSourceCapability,
+} from "@foundry-mcp/protocol";
+
+export const MAX_RUNTIME_IMAGE_DIMENSION = 16_384;
 
 export interface RuntimeAssetEntry {
   path: string;
@@ -15,11 +22,28 @@ export interface RuntimeAssetUploadResult {
   path: string;
 }
 
+export interface RuntimeImageDecodeLimits {
+  maxBytes: number;
+  maxWidth: number;
+  maxHeight: number;
+  maxPixels: number;
+}
+
+export interface RuntimeDecodedImage {
+  width: number;
+  height: number;
+}
+
 export interface FoundryAssetRuntimeAdapter {
   isOnline(): boolean;
   listSources(): Promise<AssetSourceCapability[]>;
   browse(sourceId: string, path: string, extensions?: string[]): Promise<RuntimeAssetBrowseResult>;
   exists(sourceId: string, path: string): Promise<boolean>;
+  decodeImage(
+    bytes: Uint8Array,
+    mimeType: string,
+    limits: RuntimeImageDecodeLimits,
+  ): Promise<RuntimeDecodedImage>;
   upload(
     sourceId: string,
     path: string,
@@ -91,6 +115,42 @@ function pathFromPickerEntry(value: unknown): string | undefined {
   if (typeof value === "string") return value;
   const entry = record(value);
   return stringValue(entry.path) ?? stringValue(entry.url) ?? stringValue(entry.name);
+}
+
+const ACTIVE_MARKUP_PREFIXES = ["<svg", "<script", "<!doctype", "<?xml"] as const;
+
+function lowerAscii(byte: number): number {
+  return byte >= 0x41 && byte <= 0x5a ? byte + 0x20 : byte;
+}
+
+function containsActiveMarkup(bytes: Uint8Array): boolean {
+  for (let offset = 0; offset < bytes.length; offset += 1) {
+    if (bytes[offset] !== 0x3c) continue;
+    for (const prefix of ACTIVE_MARKUP_PREFIXES) {
+      if (offset + prefix.length > bytes.length) continue;
+      let matches = true;
+      for (let index = 0; index < prefix.length; index += 1) {
+        if (lowerAscii(bytes[offset + index] as number) !== prefix.charCodeAt(index)) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) return true;
+    }
+  }
+  return false;
+}
+
+function decodedDimension(value: unknown, name: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0) {
+    throw new Error(`Decoded image ${name} is invalid`);
+  }
+  return Number(value);
+}
+
+function boundedDecodeLimit(value: number, hardMaximum: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} is invalid`);
+  return Math.min(value, hardMaximum);
 }
 
 export interface BrowserFoundryAssetRuntimeOptions {
@@ -168,6 +228,76 @@ export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
     const directory = slash < 0 ? "" : path.slice(0, slash);
     const result = await this.browse(sourceId, directory);
     return result.entries.some((entry) => entry.kind === "file" && entry.path === path);
+  }
+
+  async decodeImage(
+    bytes: Uint8Array,
+    mimeType: string,
+    limits: RuntimeImageDecodeLimits,
+  ): Promise<RuntimeDecodedImage> {
+    const maxBytes = boundedDecodeLimit(limits.maxBytes, MAX_IMAGE_BYTES, "maxBytes");
+    const maxWidth = boundedDecodeLimit(limits.maxWidth, MAX_RUNTIME_IMAGE_DIMENSION, "maxWidth");
+    const maxHeight = boundedDecodeLimit(
+      limits.maxHeight,
+      MAX_RUNTIME_IMAGE_DIMENSION,
+      "maxHeight",
+    );
+    const maxPixels = boundedDecodeLimit(limits.maxPixels, MAX_IMAGE_PIXELS, "maxPixels");
+    if (bytes.byteLength === 0 || bytes.byteLength > maxBytes)
+      throw new Error("Image byte length exceeds the decode limit");
+    if (mimeType.toLowerCase().split(";", 1)[0]?.trim() === "image/svg+xml")
+      throw new Error("SVG images are not accepted");
+    if (containsActiveMarkup(bytes))
+      throw new Error("Image payload contains active markup and is not accepted");
+    const inspected = inspectImageBytes(bytes, {
+      expectedMimeType: mimeType,
+      maxBytes,
+      maxPixels,
+      requireDimensions: true,
+    });
+    if (!inspected.ok) throw new Error("Image headers are not valid for safe decoding");
+    if (
+      (inspected.value.width !== undefined && inspected.value.width > maxWidth) ||
+      (inspected.value.height !== undefined && inspected.value.height > maxHeight)
+    ) {
+      throw new Error("Image header dimensions exceed the configured limit");
+    }
+
+    const BlobValue = this.#global.Blob;
+    const createImageBitmapValue = this.#global.createImageBitmap;
+    if (typeof BlobValue !== "function" || typeof createImageBitmapValue !== "function") {
+      throw new Error("Browser-native safe image decoding is unavailable");
+    }
+
+    const blob = Reflect.construct(BlobValue as unknown as new () => object, [
+      [Uint8Array.from(bytes).buffer],
+      { type: mimeType },
+    ]);
+    let bitmap: unknown;
+    try {
+      bitmap = await createImageBitmapValue.call(this.#global, blob, {
+        imageOrientation: "none",
+      });
+      const decoded = record(bitmap);
+      const width = decodedDimension(decoded.width, "width");
+      const height = decodedDimension(decoded.height, "height");
+      if (width > maxWidth || height > maxHeight)
+        throw new Error("Decoded image dimensions exceed the configured limit");
+      if (width * height > maxPixels)
+        throw new Error("Decoded image pixel count exceeds the configured limit");
+      if (
+        (inspected.value.width !== undefined && inspected.value.width !== width) ||
+        (inspected.value.height !== undefined && inspected.value.height !== height)
+      ) {
+        throw new Error("Decoded image dimensions do not match its headers");
+      }
+      return { width, height };
+    } catch {
+      throw new Error("Image could not be decoded safely");
+    } finally {
+      const close = record(bitmap).close;
+      if (typeof close === "function") close.call(bitmap);
+    }
   }
 
   async upload(
