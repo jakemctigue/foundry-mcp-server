@@ -89,6 +89,42 @@ function loadConfig(options: DoctorOptions): LoadedConfig {
   }
 }
 
+function resolveWindowsIcaclsPath(): string | undefined {
+  const systemRoot = process.env["SystemRoot"];
+  if (!systemRoot || !path.win32.isAbsolute(systemRoot)) return undefined;
+
+  const normalizedRoot = path.win32.normalize(systemRoot);
+  if (!/^[a-z]:\\$/i.test(path.win32.parse(normalizedRoot).root)) return undefined;
+
+  const candidate = path.win32.join(normalizedRoot, "System32", "icacls.exe");
+  const relativeCandidate = path.win32.relative(normalizedRoot, candidate);
+  if (
+    !path.win32.isAbsolute(candidate) ||
+    path.win32.isAbsolute(relativeCandidate) ||
+    relativeCandidate === ".." ||
+    relativeCandidate.startsWith(`..${path.win32.sep}`)
+  ) {
+    return undefined;
+  }
+
+  try {
+    if (!fs.statSync(candidate).isFile()) return undefined;
+    const realRoot = fs.realpathSync.native(normalizedRoot);
+    const realCandidate = fs.realpathSync.native(candidate);
+    const relativeRealPath = path.win32.relative(realRoot, realCandidate);
+    if (
+      path.win32.isAbsolute(relativeRealPath) ||
+      relativeRealPath === ".." ||
+      relativeRealPath.startsWith(`..${path.win32.sep}`)
+    ) {
+      return undefined;
+    }
+    return realCandidate;
+  } catch {
+    return undefined;
+  }
+}
+
 function checkConfigPermissions(configPath: string | undefined): CheckResult {
   if (!configPath || !fs.existsSync(configPath)) {
     return {
@@ -101,16 +137,25 @@ function checkConfigPermissions(configPath: string | undefined): CheckResult {
   try {
     fs.accessSync(configPath, fs.constants.R_OK | fs.constants.W_OK);
     if (process.platform === "win32") {
-      const acl = spawnSync("icacls.exe", [configPath], {
+      const icaclsPath = resolveWindowsIcaclsPath();
+      if (!icaclsPath) {
+        return {
+          id: "config-permissions",
+          status: "FAIL",
+          message: "trusted Windows ACL inspection tool is unavailable",
+          hint: "verify that SystemRoot points to Windows and System32\\icacls.exe is present",
+        };
+      }
+      const acl = spawnSync(icaclsPath, [configPath], {
         encoding: "utf8",
         windowsHide: true,
       });
-      if (acl.status !== 0) {
+      if (acl.error || acl.status !== 0) {
         return {
           id: "config-permissions",
-          status: "WARN",
-          message: "config is accessible, but its Windows ACL could not be verified",
-          hint: "run icacls on the config and restrict access to the current user",
+          status: "FAIL",
+          message: "config is accessible, but its Windows ACL could not be verified safely",
+          hint: "run the trusted System32 icacls.exe and restrict access to the current user",
         };
       }
       if (/(?:Everyone|BUILTIN\\Users|Authenticated Users):/i.test(acl.stdout)) {

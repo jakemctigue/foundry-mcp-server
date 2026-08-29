@@ -195,6 +195,70 @@ describe("doctor", () => {
     expect(configResult?.hint).toBeTruthy();
   });
 
+  it.runIf(process.platform === "win32")(
+    "never executes an icacls.exe planted in the working directory or PATH",
+    async () => {
+      const appDataDir = tmpDir("trusted-icacls-app-");
+      const attackerDir = tmpDir("fake-icacls-");
+      const markerPath = path.join(attackerDir, "fake-icacls-executed.txt");
+      const configPath = path.join(attackerDir, "config.cjs");
+      fs.copyFileSync(process.execPath, path.join(attackerDir, "icacls.exe"));
+      fs.writeFileSync(
+        configPath,
+        `require("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "executed");`,
+      );
+
+      const originalCwd = process.cwd();
+      const originalPath = process.env["PATH"];
+      let results: CheckResult[];
+      try {
+        process.chdir(attackerDir);
+        process.env["PATH"] = `${attackerDir}${path.delimiter}${originalPath ?? ""}`;
+        results = await runDoctor({
+          appDataDir,
+          configPath,
+          pipeProbe: async () => false,
+          providerEnv: {},
+        });
+      } finally {
+        process.chdir(originalCwd);
+        if (originalPath === undefined) delete process.env["PATH"];
+        else process.env["PATH"] = originalPath;
+      }
+
+      expect(fs.existsSync(markerPath)).toBe(false);
+      expect(["OK", "WARN"]).toContain(index(results)["config-permissions"]?.status);
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "fails closed when the trusted System32 icacls.exe is unavailable",
+    async () => {
+      const appDataDir = tmpDir("missing-icacls-app-");
+      const configPath = path.join(appDataDir, "config.json");
+      fs.writeFileSync(configPath, JSON.stringify({ harmless: true }));
+
+      const originalSystemRoot = process.env["SystemRoot"];
+      let results: CheckResult[];
+      try {
+        process.env["SystemRoot"] = path.join(appDataDir, "missing-windows-root");
+        results = await runDoctor({
+          appDataDir,
+          configPath,
+          pipeProbe: async () => false,
+          providerEnv: {},
+        });
+      } finally {
+        if (originalSystemRoot === undefined) delete process.env["SystemRoot"];
+        else process.env["SystemRoot"] = originalSystemRoot;
+      }
+
+      const permissions = index(results)["config-permissions"];
+      expect(permissions?.status).toBe("FAIL");
+      expect(permissions?.message).toMatch(/trusted Windows ACL inspection tool is unavailable/i);
+    },
+  );
+
   it("never renders provider or URL credential secrets", async () => {
     const appDataDir = tmpDir();
     const configSecret = "config-secret-value";
