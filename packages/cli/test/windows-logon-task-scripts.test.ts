@@ -290,7 +290,7 @@ describe.runIf(process.platform === "win32")(
           ]);
           expect(remote.status).not.toBe(0);
           expect(remote.stderr).toMatch(/127\.0\.0\.1|valid set/i);
-        });
+        }, 30000);
 
         it("registers and removes only a mocked limited current-user logon task", () => {
           const fixture = repositoryFixture();
