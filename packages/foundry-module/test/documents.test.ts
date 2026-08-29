@@ -1121,6 +1121,10 @@ describe("FoundryDocumentService bounded snapshots and complete generic coverage
               "<p data-example=\"<section class='secret'>\">Visible note</p><section data-owner='gm' class='journal secret'><span data-example=\"</section>\">Hidden nested note</span></section><p>Visible tail</p>",
           },
         ],
+        selfClosing:
+          '<p>Visible before self-closing</p><section class="secret" />SELF_CLOSING_SECRET</section><p>Visible after self-closing</p>',
+        entityEncoded:
+          '<p>Visible before entity</p><section class="journal&#32;sec&#x72;et">ENTITY_CLASS_SECRET</section><p>Visible after entity</p>',
       },
     });
     const sourceBefore = actor.toObject();
@@ -1139,8 +1143,14 @@ describe("FoundryDocumentService bounded snapshots and complete generic coverage
     expect(serialized).toContain("Public conclusion");
     expect(serialized).toContain("Visible note");
     expect(serialized).toContain("Visible tail");
+    expect(serialized).toContain("Visible before self-closing");
+    expect(serialized).toContain("Visible after self-closing");
+    expect(serialized).toContain("Visible before entity");
+    expect(serialized).toContain("Visible after entity");
     expect(serialized).not.toContain("Hidden biography");
     expect(serialized).not.toContain("Hidden nested note");
+    expect(serialized).not.toContain("SELF_CLOSING_SECRET");
+    expect(serialized).not.toContain("ENTITY_CLASS_SECRET");
     expect(serialized).not.toContain('class=\\"secret\\"');
     expect(actor.toObject()).toEqual(sourceBefore);
   });

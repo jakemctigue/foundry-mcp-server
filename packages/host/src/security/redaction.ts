@@ -1,3 +1,5 @@
+import { redactFoundrySecretHtml } from "@foundry-mcp/protocol";
+
 const REDACTED = "[REDACTED]";
 const TRUNCATED = "[TRUNCATED]";
 const REDACTED_FOUNDRY_SECRET = "[REDACTED FOUNDRY SECRET]";
@@ -48,34 +50,7 @@ export function isSecretField(key: string): boolean {
  * redacted through the end of the string (fail closed).
  */
 export function redactFoundrySecretBlocks(value: string): string {
-  const openingTag = /<([a-z][\w:-]*)\b[^>]*>/gi;
-  let cursor = 0;
-  let output = "";
-  for (let match = openingTag.exec(value); match; match = openingTag.exec(value)) {
-    const tag = match[1];
-    if (!tag) continue;
-    const classAttribute = match[0].match(/\bclass\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
-    const classes = (classAttribute?.[1] ?? classAttribute?.[2] ?? "").split(/\s+/).filter(Boolean);
-    if (!classes.includes("secret")) continue;
-
-    output += value.slice(cursor, match.index);
-    const tagToken = new RegExp(`<\\/?${tag}\\b[^>]*>`, "gi");
-    tagToken.lastIndex = openingTag.lastIndex;
-    let depth = 1;
-    let end = value.length;
-    for (let token = tagToken.exec(value); token; token = tagToken.exec(value)) {
-      if (/^<\//.test(token[0])) depth -= 1;
-      else if (!/\/>$/.test(token[0])) depth += 1;
-      if (depth === 0) {
-        end = tagToken.lastIndex;
-        break;
-      }
-    }
-    output += REDACTED_FOUNDRY_SECRET;
-    cursor = end;
-    openingTag.lastIndex = end;
-  }
-  return cursor === 0 ? value : output + value.slice(cursor);
+  return redactFoundrySecretHtml(value, REDACTED_FOUNDRY_SECRET);
 }
 
 export function redactSecretText(value: string): string {

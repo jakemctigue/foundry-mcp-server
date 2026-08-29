@@ -288,6 +288,10 @@ describe("background intelligence reconciliation", () => {
       ...hero.data,
       biography:
         '<p>Visible history</p><section class="secret"><p>hidden-ritual</p></section><p>Visible ending</p>',
+      unquotedHtml: "<section class=secret>unquotedleak</section>",
+      entityHtml: '<section class="sec&#114;et">entityleak</section>',
+      quotedDecoyHtml:
+        '<section class="secret"><span title="</section>">quoteddecoyleak</span></section>',
     };
     const status = await new IntelligenceReconciler(db, bridge).reconcile(CONNECTION_ID, "initial");
 
@@ -338,6 +342,11 @@ describe("background intelligence reconciliation", () => {
     expect(searchIntelligence(db, { connectionId: CONNECTION_ID, query: "hidden-ritual" })).toEqual(
       [],
     );
+    for (const secretQuery of ["unquotedleak", "entityleak", "quoteddecoyleak"]) {
+      expect(searchIntelligence(db, { connectionId: CONNECTION_ID, query: secretQuery })).toEqual(
+        [],
+      );
+    }
     expect(
       searchIntelligence(db, { connectionId: CONNECTION_ID, query: "Visible history" }).length,
     ).toBeGreaterThan(0);
@@ -350,6 +359,18 @@ describe("background intelligence reconciliation", () => {
     expect(
       JSON.stringify(searchIntelligence(db, { connectionId: CONNECTION_ID, query: "must" })),
     ).not.toContain("must-not-be-indexed");
+    const persistedHero = db
+      .prepare(
+        "SELECT snapshot_json, search_text FROM intelligence_objects WHERE connection_id = ? AND uuid = ?",
+      )
+      .get(CONNECTION_ID, "Actor.hero");
+    expect(JSON.stringify(persistedHero)).not.toMatch(/unquotedleak|entityleak|quoteddecoyleak/);
+
+    const heroContext = buildContextPack(db, {
+      connectionId: CONNECTION_ID,
+      query: "Visible history",
+    });
+    expect(JSON.stringify(heroContext)).not.toMatch(/unquotedleak|entityleak|quoteddecoyleak/);
 
     const context = buildContextPack(db, {
       connectionId: CONNECTION_ID,
