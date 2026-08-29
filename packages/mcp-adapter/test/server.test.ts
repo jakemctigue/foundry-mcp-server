@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { PROTOCOL_VERSION } from "@foundry-mcp/protocol";
 import { createFoundryMcpServer } from "../src/server.js";
 import { createStubBridgeConnection, type BridgeConnection } from "../src/bridge-connection.js";
 
@@ -65,7 +66,7 @@ describe("foundry.capabilities.get", () => {
         protocolVersion: string;
         capabilities: unknown[];
       };
-      expect(structured.protocolVersion).toBe("2026-07-28");
+      expect(structured.protocolVersion).toBe(PROTOCOL_VERSION);
       expect(structured.capabilities.length).toBeGreaterThan(0);
     } finally {
       await cleanup();

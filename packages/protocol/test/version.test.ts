@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 import { PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSIONS } from "../src/version.js";
 
 describe("PROTOCOL_VERSION", () => {
-  it("is pinned to 2026-07-28", () => {
-    expect(PROTOCOL_VERSION).toBe("2026-07-28");
+  it("is pinned to the installed MCP SDK's LATEST_PROTOCOL_VERSION", () => {
+    expect(PROTOCOL_VERSION).toBe("2025-11-25");
   });
 
   it("declares at least one legacy compatible version", () => {
