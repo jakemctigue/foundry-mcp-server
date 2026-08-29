@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import type { IntelligenceObjectSnapshot } from "@foundry-mcp/protocol";
 import { deserializeEventRow, type StoredEvent } from "./event-ledger.js";
 
 interface EventRow {
@@ -23,6 +24,12 @@ export interface SearchOptions {
 export interface SearchResult extends StoredEvent {
   score: number;
 }
+
+export interface ObjectSearchResult extends IntelligenceObjectSnapshot {
+  score: number;
+}
+
+export type IntelligenceSearchResult = SearchResult | ObjectSearchResult;
 
 export interface TimelineOptions {
   connectionId: string;
@@ -61,6 +68,11 @@ interface TimelineCursor {
   id: number;
 }
 
+interface ObjectSnapshotRow {
+  snapshot_json: string;
+  search_text: string;
+}
+
 const EVENT_COLUMNS = `
   id, connection_id, sequence_id, category, payload, emitted_at,
   received_at, session_id, world_id, search_text
@@ -88,9 +100,9 @@ function encodeCursor(cursor: TimelineCursor): string {
 
 function decodeCursor(cursor: string): TimelineCursor {
   try {
-    const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Partial<
-      TimelineCursor
-    >;
+    const decoded = JSON.parse(
+      Buffer.from(cursor, "base64url").toString("utf8"),
+    ) as Partial<TimelineCursor>;
     if (
       typeof decoded.receivedAt !== "string" ||
       typeof decoded.id !== "number" ||
@@ -110,9 +122,9 @@ function encodeChangedSinceCursor(cursor: ChangedSinceCursor): string {
 
 function decodeChangedSinceCursor(cursor: string): ChangedSinceCursor {
   try {
-    const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Partial<
-      ChangedSinceCursor
-    >;
+    const decoded = JSON.parse(
+      Buffer.from(cursor, "base64url").toString("utf8"),
+    ) as Partial<ChangedSinceCursor>;
     if (decoded.mode === "sequence") {
       if (
         !Number.isSafeInteger(decoded.sequenceId) ||
@@ -164,16 +176,77 @@ function occurrences(haystack: string, needle: string): number {
 }
 
 function rank(row: EventRow, phrase: string, tokens: readonly string[]): number {
-  const text = row.search_text.toLowerCase();
-  const category = row.category.toLowerCase();
+  return rankText(row.search_text, row.category, phrase, tokens);
+}
+
+function rankText(
+  searchable: string,
+  category: string,
+  phrase: string,
+  tokens: readonly string[],
+): number {
+  const text = searchable.toLowerCase();
+  const normalizedCategory = category.toLowerCase();
   let score = text.includes(phrase) ? 25 : 0;
   for (const token of tokens) {
     score += occurrences(text, token);
-    if (category.includes(token)) {
+    if (normalizedCategory.includes(token)) {
       score += 5;
     }
   }
   return score;
+}
+
+export function searchObjectSnapshots(
+  db: Database.Database,
+  options: SearchOptions,
+): ObjectSearchResult[] {
+  const limit = boundedLimit(options.limit, 20);
+  const phrase = options.query.trim().toLowerCase();
+  const tokens = tokensFor(phrase);
+  if (tokens.length === 0) return [];
+  const tokenClauses = tokens.map(() => "instr(lower(search_text), ?) > 0").join(" OR ");
+  const rows = db
+    .prepare(
+      `SELECT snapshot_json, search_text
+       FROM intelligence_objects
+       WHERE connection_id = ? AND (${tokenClauses})
+       ORDER BY last_seen_at DESC, object_id ASC
+       LIMIT ?`,
+    )
+    .all(
+      options.connectionId,
+      ...tokens,
+      Math.min(Math.max(limit * 20, 100), 1_000),
+    ) as ObjectSnapshotRow[];
+  return rows
+    .map((row) => {
+      const snapshot = JSON.parse(row.snapshot_json) as IntelligenceObjectSnapshot;
+      return {
+        ...snapshot,
+        score: rankText(row.search_text, snapshot.documentType, phrase, tokens),
+      };
+    })
+    .sort((left, right) => right.score - left.score || left.objectId.localeCompare(right.objectId))
+    .slice(0, limit);
+}
+
+export function searchIntelligence(
+  db: Database.Database,
+  options: SearchOptions,
+): IntelligenceSearchResult[] {
+  const limit = boundedLimit(options.limit, 20);
+  return [
+    ...searchEvents(db, { ...options, limit }),
+    ...searchObjectSnapshots(db, { ...options, limit }),
+  ]
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      const leftKey = "objectId" in left ? left.objectId : `event:${left.id.toString()}`;
+      const rightKey = "objectId" in right ? right.objectId : `event:${right.id.toString()}`;
+      return leftKey.localeCompare(rightKey);
+    })
+    .slice(0, limit);
 }
 
 /** Local, deterministic FTS-equivalent ranker over bounded SQLite candidates. */

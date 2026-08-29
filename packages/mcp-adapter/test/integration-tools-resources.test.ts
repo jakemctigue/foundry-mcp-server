@@ -99,6 +99,19 @@ describe("document/intelligence tools and enumerable resources", () => {
         if (method === "sessions.get") return Promise.resolve({ session, pages: [] });
         if (method === "intelligence.timeline") return Promise.resolve({ events: [] });
         if (method === "intelligence.search") return Promise.resolve({ results: [] });
+        if (method === "intelligence.status")
+          return Promise.resolve({
+            connectionId: "world-a",
+            status: "complete",
+            queueDepth: 0,
+            indexedObjects: 3,
+            scannedObjects: 3,
+            changedObjects: 0,
+            privateFilteredObjects: 1,
+            retentionRemovedEvents: 2,
+            gap: false,
+            truncated: false,
+          });
         return Promise.resolve(null);
       },
       close: () => Promise.resolve(),
@@ -114,6 +127,7 @@ describe("document/intelligence tools and enumerable resources", () => {
           "foundry.documents.create",
           "foundry.documents.update",
           "foundry.intelligence.search",
+          "foundry.intelligence.status",
           "foundry.intelligence.timeline",
           "foundry.intelligence.changed-since",
           "foundry.intelligence.context",
@@ -142,6 +156,14 @@ describe("document/intelligence tools and enumerable resources", () => {
           })
         ).structuredContent,
       ).toEqual({ results: [] });
+      expect(
+        (
+          await context.client.callTool({
+            name: "foundry.intelligence.status",
+            arguments: { connectionId: "world-a" },
+          })
+        ).structuredContent,
+      ).toMatchObject({ status: "complete", indexedObjects: 3, privateFilteredObjects: 1 });
 
       const uris = (await context.client.listResources()).resources.map((resource) => resource.uri);
       expect(uris).toEqual(

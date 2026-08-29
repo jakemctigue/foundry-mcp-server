@@ -264,7 +264,9 @@ export type CompendiumIndexEntry = z.infer<typeof CompendiumIndexEntry>;
 export const CompendiumDocumentsListOutput = z.object({
   packId: z.string().min(1),
   hydrated: z.boolean(),
-  items: z.array(z.union([CompendiumIndexEntry, DocumentView])),
+  // A hydrated DocumentView is structurally also a valid index entry. Parse the richer shape
+  // first so read-only reconciliation does not silently discard its data and ownership fields.
+  items: z.array(z.union([DocumentView, CompendiumIndexEntry])),
   nextCursor: z.string().min(1).optional(),
 });
 export type CompendiumDocumentsListOutput = z.infer<typeof CompendiumDocumentsListOutput>;

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DocumentSourceHash,
+  CompendiumDocumentsListOutput,
   DocumentsCreateInput,
   DocumentsListInput,
   DocumentsSnapshotInput,
@@ -76,5 +77,30 @@ describe("generic document protocol schemas", () => {
         maxItems: 10,
       }).success,
     ).toBe(false);
+  });
+
+  it("preserves hydrated compendium document fields instead of narrowing them to index entries", () => {
+    const output = CompendiumDocumentsListOutput.parse({
+      packId: "world.bestiary",
+      hydrated: true,
+      items: [
+        {
+          id: "a",
+          uuid: "Compendium.world.bestiary.Actor.a",
+          type: "Actor",
+          name: "Wyrm",
+          sourceHash: "hash-a",
+          sourceVersion: 1,
+          data: { name: "Wyrm" },
+          ownershipSummary: { default: 1 },
+          schemaVersion: "14",
+        },
+      ],
+    });
+    expect(output.items[0]).toMatchObject({
+      data: { name: "Wyrm" },
+      ownershipSummary: { default: 1 },
+      schemaVersion: "14",
+    });
   });
 });

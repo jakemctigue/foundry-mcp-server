@@ -135,4 +135,70 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    id: 6,
+    name: "intelligence-reconciliation",
+    sql: `
+      CREATE TABLE IF NOT EXISTS intelligence_objects (
+        connection_id TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        uuid TEXT NOT NULL,
+        document_type TEXT NOT NULL,
+        subtype TEXT,
+        name TEXT,
+        parent_uuid TEXT,
+        pack_id TEXT,
+        snapshot_hash TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL,
+        search_text TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        last_seen_run_id TEXT NOT NULL,
+        PRIMARY KEY (connection_id, object_id)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_intelligence_objects_uuid
+        ON intelligence_objects (connection_id, uuid);
+      CREATE INDEX IF NOT EXISTS idx_intelligence_objects_type
+        ON intelligence_objects (connection_id, document_type, subtype, object_id);
+      CREATE INDEX IF NOT EXISTS idx_intelligence_objects_seen
+        ON intelligence_objects (connection_id, last_seen_at, object_id);
+
+      CREATE TABLE IF NOT EXISTS reconciliation_jobs (
+        connection_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('running', 'incomplete', 'complete', 'failed')),
+        reason TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_completed_at TEXT,
+        scanned_count INTEGER NOT NULL DEFAULT 0,
+        changed_count INTEGER NOT NULL DEFAULT 0,
+        private_filtered_count INTEGER NOT NULL DEFAULT 0,
+        queue_depth INTEGER NOT NULL DEFAULT 0,
+        gap INTEGER NOT NULL DEFAULT 0 CHECK (gap IN (0, 1)),
+        truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
+        last_error TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS reconciliation_tasks (
+        connection_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        task_key TEXT NOT NULL,
+        task_kind TEXT NOT NULL CHECK (task_kind IN ('root', 'embedded', 'compendium')),
+        params_json TEXT NOT NULL,
+        cursor TEXT,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'complete')),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (connection_id, run_id, task_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_reconciliation_tasks_pending
+        ON reconciliation_tasks (connection_id, run_id, status, task_key);
+
+      CREATE TABLE IF NOT EXISTS intelligence_retention_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        last_run_at TEXT NOT NULL,
+        removed_events INTEGER NOT NULL DEFAULT 0
+      );
+    `,
+  },
 ];

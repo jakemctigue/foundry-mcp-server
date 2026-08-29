@@ -13,6 +13,7 @@ import {
 
 import { connectPipeClient, type PipeClient } from "../src/bridge/pipe-client.js";
 import { startDaemon, type Daemon } from "../src/daemon.js";
+import { getIntelligenceStatus } from "../src/intelligence/reconciliation.js";
 import { setCapabilityGrant } from "../src/security/policy.js";
 
 const PAIRING_SECRET = Buffer.alloc(32, 11);
@@ -95,25 +96,27 @@ describe("daemon to mocked browser companion end-to-end", () => {
       const value =
         message.method === "documents.types"
           ? { ok: true, value: { types: [] } }
-          : message.method === "documents.update"
-            ? {
-                ok: false,
-                error: {
-                  code: "FOUNDRY_ERROR",
-                  message: "mocked Foundry update failed",
-                  retryable: false,
-                },
-              }
-            : {
-                ok: true,
-                value: {
-                  assetPath: "art/hero.png",
-                  source: "data",
-                  mimeType: "image/png",
-                  size: 100,
-                  collision: "created",
-                },
-              };
+          : message.method === "compendiums.list"
+            ? { ok: true, value: { packs: [] } }
+            : message.method === "documents.update"
+              ? {
+                  ok: false,
+                  error: {
+                    code: "FOUNDRY_ERROR",
+                    message: "mocked Foundry update failed",
+                    retryable: false,
+                  },
+                }
+              : {
+                  ok: true,
+                  value: {
+                    assetPath: "art/hero.png",
+                    source: "data",
+                    mimeType: "image/png",
+                    size: 100,
+                    collision: "created",
+                  },
+                };
       socket?.send(JSON.stringify({ type: "response", id: message.id, ok: true, value }));
     });
     await authenticate(socket, {
@@ -138,6 +141,14 @@ describe("daemon to mocked browser companion end-to-end", () => {
       ],
     });
     await vi.waitFor(() => expect(daemon?.companion.listConnections()).toHaveLength(1));
+    await vi.waitFor(() =>
+      expect(getIntelligenceStatus(daemon?.db as Daemon["db"], "world-a")).toMatchObject({
+        status: "complete",
+        gap: false,
+        truncated: false,
+      }),
+    );
+    const backgroundRequests = companionRequests;
 
     pipe = await connectPipeClient(daemon.pipePath, { appDataDir });
     const responses = new Map<string, unknown>();
@@ -326,7 +337,8 @@ describe("daemon to mocked browser companion end-to-end", () => {
         },
       },
     });
-    expect(companionRequests).toBe(4);
+    expect(backgroundRequests).toBeGreaterThanOrEqual(2);
+    expect(companionRequests).toBe(backgroundRequests + 4);
     expect(daemon.db.prepare("SELECT outcome, tool, correlation_id FROM audit_log").all()).toEqual([
       {
         outcome: "success",

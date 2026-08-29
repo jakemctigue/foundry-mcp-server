@@ -53,6 +53,10 @@ describe("SQLite init and migrations", () => {
     expect(tables).toContain("audit_log");
     expect(tables).toContain("summary_provenance");
     expect(tables).toContain("capability_grants");
+    expect(tables).toContain("intelligence_objects");
+    expect(tables).toContain("reconciliation_jobs");
+    expect(tables).toContain("reconciliation_tasks");
+    expect(tables).toContain("intelligence_retention_state");
 
     const eventColumns = db
       .prepare("PRAGMA table_info(events)")
@@ -120,7 +124,7 @@ describe("SQLite init and migrations", () => {
       '{"name":"Old note"}',
     );
 
-    expect(runMigrations(db).applied).toEqual([2, 3, 4, 5]);
+    expect(runMigrations(db).applied).toEqual([2, 3, 4, 5, 6]);
     const row = db
       .prepare(
         `SELECT connection_id, sequence_id, category, payload, received_at, search_text

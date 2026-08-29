@@ -2,6 +2,7 @@ import {
   IntelligenceChangedSinceOutput,
   IntelligenceContextOutput,
   IntelligenceSearchOutput,
+  IntelligenceStatusOutput,
   IntelligenceTimelineOutput,
   type IntelligenceChangedSinceInput,
   type IntelligenceChangedSinceOutput as IntelligenceChangedSinceOutputData,
@@ -9,6 +10,8 @@ import {
   type IntelligenceContextOutput as IntelligenceContextOutputData,
   type IntelligenceSearchInput,
   type IntelligenceSearchOutput as IntelligenceSearchOutputData,
+  type IntelligenceStatusInput,
+  type IntelligenceStatusOutput as IntelligenceStatusOutputData,
   type IntelligenceTimelineInput,
   type IntelligenceTimelineOutput as IntelligenceTimelineOutputData,
 } from "@foundry-mcp/protocol";
@@ -21,12 +24,11 @@ export class IntelligenceBridgeApi {
   constructor(readonly bridge: BridgeConnection) {}
 
   search(input: IntelligenceSearchInput): Promise<IntelligenceSearchOutputData> {
-    return requestBridgeValue(
-      this.bridge,
-      "intelligence.search",
-      input,
-      IntelligenceSearchOutput,
-    );
+    return requestBridgeValue(this.bridge, "intelligence.search", input, IntelligenceSearchOutput);
+  }
+
+  status(input: IntelligenceStatusInput): Promise<IntelligenceStatusOutputData> {
+    return requestBridgeValue(this.bridge, "intelligence.status", input, IntelligenceStatusOutput);
   }
 
   timeline(input: IntelligenceTimelineInput): Promise<IntelligenceTimelineOutputData> {
@@ -38,9 +40,7 @@ export class IntelligenceBridgeApi {
     );
   }
 
-  changedSince(
-    input: IntelligenceChangedSinceInput,
-  ): Promise<IntelligenceChangedSinceOutputData> {
+  changedSince(input: IntelligenceChangedSinceInput): Promise<IntelligenceChangedSinceOutputData> {
     return requestBridgeValue(
       this.bridge,
       "intelligence.changed-since",

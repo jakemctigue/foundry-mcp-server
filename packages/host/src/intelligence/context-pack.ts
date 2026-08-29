@@ -1,7 +1,9 @@
 import type Database from "better-sqlite3";
+import type { IntelligenceObjectSnapshot } from "@foundry-mcp/protocol";
 import { redactSecrets } from "../security/redaction.js";
 import type { StoredEvent } from "./event-ledger.js";
-import { getChangedSince, getTimeline, searchEvents } from "./queries.js";
+import { getIntelligenceStatus } from "./reconciliation.js";
+import { getChangedSince, getTimeline, searchIntelligence } from "./queries.js";
 
 export interface ContextPackOptions {
   connectionId: string;
@@ -13,6 +15,7 @@ export interface ContextPackOptions {
   from?: string;
   to?: string;
   maxEvents?: number;
+  maxObjects?: number;
   maxBytes?: number;
   generatedAt?: Date;
 }
@@ -23,12 +26,16 @@ export interface ContextPack {
   generatedAt: string;
   source: "search" | "changed-since" | "timeline";
   events: StoredEvent[];
+  objects: IntelligenceObjectSnapshot[];
   sourceEventIds: number[];
+  sourceObjectIds: string[];
   truncated: boolean;
   limits: {
     maxEvents: number;
+    maxObjects: number;
     maxBytes: number;
   };
+  reconciliation: ReturnType<typeof getIntelligenceStatus>;
   byteLength: number;
 }
 
@@ -73,23 +80,30 @@ function withoutSearchScore(event: StoredEvent & { score?: number }): StoredEven
  * Produces a redacted prompt-ready pack with hard event-count and UTF-8 byte
  * bounds. It contains provenance IDs only; it performs no external calls.
  */
-export function buildContextPack(
-  db: Database.Database,
-  options: ContextPackOptions,
-): ContextPack {
+export function buildContextPack(db: Database.Database, options: ContextPackOptions): ContextPack {
   const maxEvents = boundedInteger(options.maxEvents, 25, 1, 100, "maxEvents");
+  const maxObjects = boundedInteger(options.maxObjects, 25, 1, 100, "maxObjects");
   const maxBytes = boundedInteger(options.maxBytes, 64 * 1024, 1_024, 512 * 1024, "maxBytes");
   let source: ContextPack["source"];
   let candidates: StoredEvent[];
+  let objectCandidates: IntelligenceObjectSnapshot[] = [];
   let sourceTruncated = false;
 
   if (options.query !== undefined) {
     source = "search";
-    candidates = searchEvents(db, {
+    const hits = searchIntelligence(db, {
       connectionId: options.connectionId,
       query: options.query,
-      limit: maxEvents,
-    }).map(withoutSearchScore);
+      limit: Math.min(100, maxEvents + maxObjects),
+    });
+    candidates = hits
+      .filter((hit): hit is StoredEvent & { score: number } => "sequenceId" in hit)
+      .slice(0, maxEvents)
+      .map(withoutSearchScore);
+    objectCandidates = hits
+      .filter((hit): hit is IntelligenceObjectSnapshot & { score: number } => "objectId" in hit)
+      .slice(0, maxObjects)
+      .map(({ score: _score, ...snapshot }) => snapshot);
   } else if (options.afterSequenceId !== undefined || options.afterTimestamp !== undefined) {
     source = "changed-since";
     candidates = getChangedSince(db, {
@@ -119,9 +133,12 @@ export function buildContextPack(
     generatedAt: (options.generatedAt ?? new Date()).toISOString(),
     source,
     events: [],
+    objects: [],
     sourceEventIds: [],
+    sourceObjectIds: [],
     truncated: sourceTruncated,
-    limits: { maxEvents, maxBytes },
+    limits: { maxEvents, maxObjects, maxBytes },
+    reconciliation: getIntelligenceStatus(db, options.connectionId),
     byteLength: 0,
   };
 
@@ -149,12 +166,39 @@ export function buildContextPack(
   if (pack.events.length < candidates.length) {
     pack.truncated = true;
   }
+  for (const candidate of objectCandidates.slice(0, maxObjects)) {
+    const safeObject = redactSecrets(candidate) as IntelligenceObjectSnapshot;
+    pack.objects.push(safeObject);
+    pack.sourceObjectIds.push(candidate.objectId);
+    if (serializedBytes(pack) <= maxBytes) continue;
+    pack.objects.pop();
+    pack.sourceObjectIds.pop();
+    const compactObject: IntelligenceObjectSnapshot = {
+      ...safeObject,
+      data: { _reconciliationTruncated: true },
+    };
+    pack.objects.push(compactObject);
+    pack.sourceObjectIds.push(candidate.objectId);
+    if (serializedBytes(pack) > maxBytes) {
+      pack.objects.pop();
+      pack.sourceObjectIds.pop();
+    }
+    pack.truncated = true;
+    break;
+  }
+  if (pack.objects.length < objectCandidates.length) pack.truncated = true;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     pack.byteLength = serializedBytes(pack);
   }
   while (pack.byteLength > maxBytes && pack.events.length > 0) {
     pack.events.pop();
     pack.sourceEventIds.pop();
+    pack.truncated = true;
+    pack.byteLength = serializedBytes(pack);
+  }
+  while (pack.byteLength > maxBytes && pack.objects.length > 0) {
+    pack.objects.pop();
+    pack.sourceObjectIds.pop();
     pack.truncated = true;
     pack.byteLength = serializedBytes(pack);
   }

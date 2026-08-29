@@ -2,6 +2,7 @@ import {
   IntelligenceChangedSinceInput,
   IntelligenceContextInput,
   IntelligenceSearchInput,
+  IntelligenceStatusInput,
   IntelligenceTimelineInput,
   makeError,
 } from "@foundry-mcp/protocol";
@@ -37,10 +38,21 @@ export function registerIntelligenceTools(server: ToolServer, api: IntelligenceB
     "foundry.intelligence.search",
     {
       title: "Search Foundry intelligence",
-      description: "Searches the local redacted event ledger with deterministic relevance ranking.",
+      description:
+        "Searches the local redacted event ledger and reconciled object snapshots with deterministic relevance ranking.",
       inputSchema: IntelligenceSearchInput,
     },
     (args) => toolResult(() => api.search(args))(),
+  );
+  server.registerTool(
+    "foundry.intelligence.status",
+    {
+      title: "Read Foundry intelligence health",
+      description:
+        "Reports durable reconciliation, event, retention, queue, gap, and truncation health.",
+      inputSchema: IntelligenceStatusInput,
+    },
+    (args) => toolResult(() => api.status(args))(),
   );
   server.registerTool(
     "foundry.intelligence.timeline",
@@ -64,7 +76,8 @@ export function registerIntelligenceTools(server: ToolServer, api: IntelligenceB
     "foundry.intelligence.context",
     {
       title: "Build Foundry AI context",
-      description: "Builds a bounded, redacted context pack with source-event provenance.",
+      description:
+        "Builds a bounded, redacted context pack with event and reconciled-object provenance.",
       inputSchema: IntelligenceContextInput,
     },
     (args) => toolResult(() => api.context(args))(),

@@ -10,6 +10,8 @@ export * from "./intelligence/event-stream.js";
 export * from "./intelligence/queries.js";
 export * from "./intelligence/context-pack.js";
 export * from "./intelligence/summarization.js";
+export * from "./intelligence/reconciliation.js";
+export * from "./intelligence/coordinator.js";
 export * from "./security/redaction.js";
 export * from "./security/policy.js";
 export * from "./security/mutation-authorizer.js";

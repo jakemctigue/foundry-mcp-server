@@ -15,6 +15,8 @@ import { createImageProviderRegistry } from "./providers/images.js";
 import { createSecretStorage } from "./secrets/storage.js";
 import { writeHostStatusAtomic } from "./status.js";
 import { createLocalImageLoader } from "./assets/local-file.js";
+import { IntelligenceCoordinator } from "./intelligence/coordinator.js";
+import { IntelligenceReconciler } from "./intelligence/reconciliation.js";
 
 export interface Daemon {
   config: HostConfig;
@@ -87,6 +89,7 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
     db.close();
     throw new Error("companion pairing secret is missing; run the pairing workflow first");
   }
+  let intelligenceCoordinator: IntelligenceCoordinator | undefined;
   const companion = await startHostCompanionServer({
     port: config.port,
     allowedOrigins: config.allowedOrigins,
@@ -96,7 +99,12 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
       categories: config.eventCategories,
       capturePrivateContent: config.capturePrivateContent,
     },
-    onConnectionsChanged: (connections) => updateStatus(connections.length),
+    onConnectionsChanged: (connections) => {
+      updateStatus(connections.length);
+      intelligenceCoordinator?.updateConnections(
+        connections.map(({ connectionId }) => connectionId),
+      );
+    },
   });
   const companionEndpoint = companion.address().endpoint;
   let companionClosed = false;
@@ -104,6 +112,17 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
     secretStorage,
     openAi: { logger },
   });
+  const reconciler = new IntelligenceReconciler(db, companion, {
+    capturePrivateContent: config.capturePrivateContent,
+  });
+  intelligenceCoordinator = new IntelligenceCoordinator(db, reconciler, {
+    retentionDays: config.eventRetentionDays,
+    logger,
+  });
+  intelligenceCoordinator.start();
+  intelligenceCoordinator.updateConnections(
+    companion.listConnections().map(({ connectionId }) => connectionId),
+  );
   const router = new HostBridgeRouter(
     db,
     companion,
@@ -123,7 +142,9 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
     onMessage: (message, respond) => router.handle(message, respond),
   });
   if (!pipe.ready) {
+    intelligenceCoordinator.stop();
     await companion.close();
+    await intelligenceCoordinator.drain();
     companionClosed = true;
   }
   updateStatus(companion.listConnections().length);
@@ -133,6 +154,7 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
     if (shutdownPromise) return shutdownPromise;
     shutdownPromise = (async () => {
       const failures: unknown[] = [];
+      intelligenceCoordinator?.stop();
       try {
         await pipe.close();
       } catch (error) {
@@ -142,6 +164,13 @@ export async function startDaemon(options: StartDaemonOptions = {}): Promise<Dae
         try {
           await companion.close();
           companionClosed = true;
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      if (intelligenceCoordinator) {
+        try {
+          await intelligenceCoordinator.drain();
         } catch (error) {
           failures.push(error);
         }

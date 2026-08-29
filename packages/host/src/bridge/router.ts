@@ -7,6 +7,7 @@ import {
   IntelligenceChangedSinceInput,
   IntelligenceContextInput,
   IntelligenceSearchInput,
+  IntelligenceStatusInput,
   IntelligenceTimelineInput,
   makeError,
   type JsonValue,
@@ -21,7 +22,8 @@ import {
   type LocalImageLoader,
 } from "../assets/local-file.js";
 import { buildContextPack } from "../intelligence/context-pack.js";
-import { getChangedSincePage, getTimeline, searchEvents } from "../intelligence/queries.js";
+import { getChangedSincePage, getTimeline, searchIntelligence } from "../intelligence/queries.js";
+import { getIntelligenceStatus } from "../intelligence/reconciliation.js";
 import {
   DeterministicImageProvider,
   ImageProviderError,
@@ -225,7 +227,11 @@ export class HostBridgeRouter {
     }
     if (method === "intelligence.search") {
       const input = IntelligenceSearchInput.parse(params);
-      return { results: searchEvents(this.db, input) };
+      return { results: searchIntelligence(this.db, input) };
+    }
+    if (method === "intelligence.status") {
+      const input = IntelligenceStatusInput.parse(params);
+      return getIntelligenceStatus(this.db, input.connectionId);
     }
     if (method === "intelligence.timeline") {
       const input = IntelligenceTimelineInput.parse(params);
@@ -257,6 +263,7 @@ export class HostBridgeRouter {
       return buildContextPack(this.db, {
         connectionId: input.connectionId,
         maxEvents: input.maxEvents,
+        maxObjects: input.maxObjects,
         maxBytes: input.maxBytes,
         ...(input.query === undefined ? {} : { query: input.query }),
         ...(input.afterSequenceId === undefined ? {} : { afterSequenceId: input.afterSequenceId }),

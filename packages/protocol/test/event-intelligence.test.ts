@@ -6,6 +6,9 @@ import {
   EventEnvelopeSchema,
   IntelligenceChangedSinceInput,
   IntelligenceContextInput,
+  IntelligenceObjectSnapshot,
+  IntelligenceSearchOutput,
+  IntelligenceStatusOutput,
   companionAuthPayload,
   type CompanionHelloMessage,
 } from "../src/index.js";
@@ -133,5 +136,41 @@ describe("event and intelligence protocol schemas", () => {
     expect(
       IntelligenceContextInput.safeParse({ connectionId: "world-a", maxEvents: 101 }).success,
     ).toBe(false);
+    expect(IntelligenceContextInput.parse({ connectionId: "world-a" }).maxObjects).toBe(25);
+  });
+
+  it("validates durable object snapshots, mixed search results, and reconciliation health", () => {
+    const snapshot = IntelligenceObjectSnapshot.parse({
+      source: "snapshot",
+      objectId: "a".repeat(64),
+      connectionId: "world-a",
+      uuid: "Actor.a",
+      documentType: "Actor",
+      subtype: "npc",
+      name: "Ancient Wyrm",
+      snapshotHash: "b".repeat(64),
+      data: { name: "Ancient Wyrm" },
+      reconciledAt: "2026-08-29T12:00:00.000Z",
+    });
+    expect(
+      IntelligenceSearchOutput.parse({ results: [{ ...snapshot, score: 12 }] }).results,
+    ).toHaveLength(1);
+    expect(
+      IntelligenceObjectSnapshot.safeParse({ ...snapshot, objectId: "not-a-hash" }).success,
+    ).toBe(false);
+    expect(
+      IntelligenceStatusOutput.parse({
+        connectionId: "world-a",
+        status: "incomplete",
+        queueDepth: 4,
+        indexedObjects: 20,
+        scannedObjects: 10,
+        changedObjects: 3,
+        privateFilteredObjects: 2,
+        retentionRemovedEvents: 1,
+        gap: false,
+        truncated: false,
+      }),
+    ).toMatchObject({ status: "incomplete", queueDepth: 4, indexedObjects: 20 });
   });
 });

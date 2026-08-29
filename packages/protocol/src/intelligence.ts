@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { JsonValueSchema } from "./document.js";
+import { JsonObjectSchema, JsonValueSchema } from "./document.js";
 
 export const IntelligenceEvent = z
   .object({
@@ -17,6 +17,49 @@ export const IntelligenceEvent = z
   .strict();
 export type IntelligenceEvent = z.infer<typeof IntelligenceEvent>;
 
+export const IntelligenceObjectSnapshot = z
+  .object({
+    source: z.literal("snapshot"),
+    objectId: z.string().regex(/^[0-9a-f]{64}$/),
+    connectionId: z.string().min(1),
+    uuid: z.string().min(1),
+    documentType: z.string().min(1),
+    subtype: z.string().min(1).optional(),
+    name: z.string().optional(),
+    parentUuid: z.string().min(1).optional(),
+    packId: z.string().min(1).optional(),
+    snapshotHash: z.string().regex(/^[0-9a-f]{64}$/),
+    data: JsonObjectSchema,
+    reconciledAt: z.iso.datetime({ offset: true }),
+  })
+  .strict();
+export type IntelligenceObjectSnapshot = z.infer<typeof IntelligenceObjectSnapshot>;
+
+export const IntelligenceStatusInput = z
+  .object({ connectionId: z.string().trim().min(1).max(512) })
+  .strict();
+export const IntelligenceStatusOutput = z
+  .object({
+    connectionId: z.string().min(1),
+    status: z.enum(["never", "running", "incomplete", "complete", "failed"]),
+    lastAttemptAt: z.iso.datetime({ offset: true }).optional(),
+    lastReconcileAt: z.iso.datetime({ offset: true }).optional(),
+    lastEventAt: z.iso.datetime({ offset: true }).optional(),
+    lastRetentionAt: z.iso.datetime({ offset: true }).optional(),
+    queueDepth: z.number().int().nonnegative(),
+    indexedObjects: z.number().int().nonnegative(),
+    scannedObjects: z.number().int().nonnegative(),
+    changedObjects: z.number().int().nonnegative(),
+    privateFilteredObjects: z.number().int().nonnegative(),
+    retentionRemovedEvents: z.number().int().nonnegative(),
+    gap: z.boolean(),
+    truncated: z.boolean(),
+    lastError: z.string().max(2_000).optional(),
+  })
+  .strict();
+export type IntelligenceStatusInput = z.infer<typeof IntelligenceStatusInput>;
+export type IntelligenceStatusOutput = z.infer<typeof IntelligenceStatusOutput>;
+
 export const IntelligenceSearchInput = z
   .object({
     connectionId: z.string().min(1),
@@ -25,7 +68,12 @@ export const IntelligenceSearchInput = z
   })
   .strict();
 export const IntelligenceSearchOutput = z.object({
-  results: z.array(IntelligenceEvent.extend({ score: z.number().nonnegative() })),
+  results: z.array(
+    z.union([
+      IntelligenceEvent.extend({ score: z.number().nonnegative() }),
+      IntelligenceObjectSnapshot.extend({ score: z.number().nonnegative() }),
+    ]),
+  ),
 });
 
 export const IntelligenceTimelineInput = z
@@ -77,7 +125,13 @@ export const IntelligenceContextInput = z
     from: z.iso.datetime({ offset: true }).optional(),
     to: z.iso.datetime({ offset: true }).optional(),
     maxEvents: z.number().int().min(1).max(100).default(25),
-    maxBytes: z.number().int().min(1_024).max(512 * 1_024).default(64 * 1_024),
+    maxObjects: z.number().int().min(1).max(100).default(25),
+    maxBytes: z
+      .number()
+      .int()
+      .min(1_024)
+      .max(512 * 1_024)
+      .default(64 * 1_024),
   })
   .strict()
   .superRefine((value, context) => {
@@ -96,9 +150,16 @@ export const IntelligenceContextOutput = z
     generatedAt: z.iso.datetime({ offset: true }),
     source: z.enum(["search", "changed-since", "timeline"]),
     events: z.array(IntelligenceEvent),
+    objects: z.array(IntelligenceObjectSnapshot),
     sourceEventIds: z.array(z.number().int().positive()),
+    sourceObjectIds: z.array(z.string().regex(/^[0-9a-f]{64}$/)),
     truncated: z.boolean(),
-    limits: z.object({ maxEvents: z.number().int().positive(), maxBytes: z.number().int().positive() }),
+    limits: z.object({
+      maxEvents: z.number().int().positive(),
+      maxObjects: z.number().int().positive(),
+      maxBytes: z.number().int().positive(),
+    }),
+    reconciliation: IntelligenceStatusOutput,
     byteLength: z.number().int().nonnegative(),
   })
   .strict();
