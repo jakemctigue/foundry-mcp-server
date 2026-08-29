@@ -171,6 +171,56 @@ describe("BrowserFoundryAssetRuntime destination writability", () => {
     });
   });
 
+  it.each([
+    "campaign/art/.. /outside.png",
+    "campaign/art/%2e%2e%20/outside.png",
+    "campaign/art/CON.png",
+    "campaign/art/%43%4f%4e.png",
+  ])("rejects unsafe destination %s before a writable-prefix probe", async (destinationPath) => {
+    const global = foundryGlobal();
+    const runtime = new BrowserFoundryAssetRuntime({
+      global,
+      sourceCapabilities: {
+        s3: {
+          writable: true,
+          bucket: "campaign-bucket",
+          writablePathPrefixes: ["campaign/art"],
+        },
+      },
+    });
+
+    await expect(runtime.getWriteCapability("s3", destinationPath)).resolves.toMatchObject({
+      writable: false,
+      reason: expect.stringContaining("safe relative Foundry path"),
+    });
+    expect(global.FilePicker.browse).not.toHaveBeenCalled();
+    await expect(
+      runtime.upload("s3", destinationPath, VALID_PNG, "image/png", { overwrite: false }),
+    ).rejects.toThrow();
+    expect(global.FilePicker.upload).not.toHaveBeenCalled();
+  });
+
+  it("canonicalizes encoded valid paths before checking their writable prefix", async () => {
+    const global = foundryGlobal();
+    const runtime = new BrowserFoundryAssetRuntime({
+      global,
+      sourceCapabilities: {
+        s3: {
+          writable: true,
+          bucket: "campaign-bucket",
+          writablePathPrefixes: ["campaign/Café art"],
+        },
+      },
+    });
+
+    await expect(
+      runtime.getWriteCapability("s3", "campaign/Caf%C3%A9%20art/token%20one.png"),
+    ).resolves.toEqual({ id: "s3", writable: true });
+    expect(global.FilePicker.browse).toHaveBeenCalledWith("s3", "campaign/Café art", {
+      bucket: "campaign-bucket",
+    });
+  });
+
   it("fails closed when programmatic non-core configuration omits its path bound", async () => {
     const global = foundryGlobal();
     const runtime = new BrowserFoundryAssetRuntime({
@@ -211,7 +261,7 @@ describe("Foundry module asset-source capability setting", () => {
       "s3": {
         "writable": true,
         "bucket": "campaign-bucket",
-        "writablePathPrefixes": [" campaign/art ", "campaign/art"]
+        "writablePathPrefixes": ["campaign/art", "campaign%2Fart"]
       },
       "forge": {
         "writable": false,
@@ -243,6 +293,14 @@ describe("Foundry module asset-source capability setting", () => {
       ['{"data":{"writable":false}}', "not allowed"],
       [
         '{"forge":{"writable":true,"writablePathPrefixes":["../outside"]}}',
+        "invalid relative Foundry path",
+      ],
+      [
+        '{"forge":{"writable":true,"writablePathPrefixes":["safe/.. "]}}',
+        "invalid relative Foundry path",
+      ],
+      [
+        '{"forge":{"writable":true,"writablePathPrefixes":["safe/%43%4f%4e"]}}',
         "invalid relative Foundry path",
       ],
       ['{"forge":{"writable":true}}', "must authorize at least one path"],

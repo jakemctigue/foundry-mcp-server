@@ -5,6 +5,8 @@ import {
   type AssetSourceCapability,
 } from "@foundry-mcp/protocol";
 
+import { AssetPathValidationError, canonicalAssetPath } from "./asset-path.js";
+
 export const MAX_RUNTIME_IMAGE_DIMENSION = 16_384;
 export const MAX_ASSET_SOURCE_CAPABILITIES_SETTING_LENGTH = 16_384;
 
@@ -212,19 +214,21 @@ function parsePathPrefixes(
     if (typeof candidate !== "string") {
       return { ok: false, error: `${sourceId}.writablePathPrefixes must contain only strings` };
     }
-    const prefix = candidate.trim();
-    const segments = prefix.split("/");
+    let prefix: string;
+    try {
+      prefix = canonicalAssetPath(candidate);
+    } catch (error) {
+      if (!(error instanceof AssetPathValidationError)) throw error;
+      return {
+        ok: false,
+        error: `${sourceId}.writablePathPrefixes contains an invalid relative Foundry path`,
+      };
+    }
     if (
-      prefix.length === 0 ||
+      candidate.length > MAX_PATH_PREFIX_LENGTH ||
       prefix.length > MAX_PATH_PREFIX_LENGTH ||
-      prefix.startsWith("/") ||
-      prefix.endsWith("/") ||
-      prefix.includes("\\") ||
-      prefix.includes(":") ||
-      prefix.includes("?") ||
       prefix.includes("#") ||
-      containsControlCharacter(prefix) ||
-      segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
+      containsControlCharacter(prefix)
     ) {
       return {
         ok: false,
@@ -446,10 +450,30 @@ export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
         writable: false,
         reason: configured.reason ?? `Asset source ${sourceId} is configured read-only`,
       };
-    const normalizedPath = destinationPath.replaceAll("\\", "/").replace(/^\/+|\/+$/g, "");
-    const prefixes = configured?.writablePathPrefixes?.map((prefix) =>
-      prefix.replaceAll("\\", "/").replace(/^\/+|\/+$/g, ""),
-    );
+    let normalizedPath: string;
+    try {
+      normalizedPath = canonicalAssetPath(destinationPath);
+    } catch (error) {
+      if (!(error instanceof AssetPathValidationError)) throw error;
+      return {
+        id: sourceId,
+        writable: false,
+        reason: `Destination ${destinationPath} is not a safe relative Foundry path`,
+      };
+    }
+    const prefixes: string[] = [];
+    for (const configuredPrefix of configured?.writablePathPrefixes ?? []) {
+      try {
+        prefixes.push(canonicalAssetPath(configuredPrefix));
+      } catch (error) {
+        if (!(error instanceof AssetPathValidationError)) throw error;
+        return {
+          id: sourceId,
+          writable: false,
+          reason: `Foundry source ${sourceId} contains an invalid configured writable path`,
+        };
+      }
+    }
     if (sourceId !== "data" && configured?.writable === true && !prefixes?.length) {
       return {
         id: sourceId,
@@ -517,8 +541,9 @@ export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
     const FilePicker = filePickerConstructor(this.#global);
     const browse = FilePicker.browse;
     if (typeof browse !== "function") throw new Error("Foundry FilePicker.browse() is unavailable");
+    const normalizedPath = canonicalAssetPath(path, { allowEmpty: true });
     const raw = record(
-      await browse.call(FilePicker, sourceId, path, {
+      await browse.call(FilePicker, sourceId, normalizedPath, {
         ...(extensions ? { extensions } : {}),
         ...(this.#configuredCapabilities[sourceId]?.bucket
           ? { bucket: this.#configuredCapabilities[sourceId]?.bucket }
@@ -547,10 +572,11 @@ export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
   }
 
   async exists(sourceId: string, path: string): Promise<boolean> {
-    const slash = path.lastIndexOf("/");
-    const directory = slash < 0 ? "" : path.slice(0, slash);
+    const normalizedPath = canonicalAssetPath(path);
+    const slash = normalizedPath.lastIndexOf("/");
+    const directory = slash < 0 ? "" : normalizedPath.slice(0, slash);
     const result = await this.browse(sourceId, directory);
-    return result.entries.some((entry) => entry.kind === "file" && entry.path === path);
+    return result.entries.some((entry) => entry.kind === "file" && entry.path === normalizedPath);
   }
 
   async decodeImage(
@@ -633,9 +659,10 @@ export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
     const FilePicker = filePickerConstructor(this.#global);
     const upload = FilePicker.upload;
     if (typeof upload !== "function") throw new Error("Foundry FilePicker.upload() is unavailable");
-    const slash = path.lastIndexOf("/");
-    const directory = slash < 0 ? "" : path.slice(0, slash);
-    const name = slash < 0 ? path : path.slice(slash + 1);
+    const normalizedPath = canonicalAssetPath(path);
+    const slash = normalizedPath.lastIndexOf("/");
+    const directory = slash < 0 ? "" : normalizedPath.slice(0, slash);
+    const name = slash < 0 ? normalizedPath : normalizedPath.slice(slash + 1);
     const FileValue = this.#global.File;
     if (typeof FileValue !== "function")
       throw new Error("The browser File constructor is unavailable");
@@ -659,6 +686,6 @@ export class BrowserFoundryAssetRuntime implements FoundryAssetRuntimeAdapter {
         { notify: false },
       ),
     );
-    return { path: stringValue(response.path) ?? path };
+    return { path: stringValue(response.path) ?? normalizedPath };
   }
 }

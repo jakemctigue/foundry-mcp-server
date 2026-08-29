@@ -40,6 +40,7 @@ interface Harness {
 function createHarness(
   localImageLoader?: LocalImageLoader,
   imageProviders?: ImageProviderRegistry,
+  urlImporter?: ConstructorParameters<typeof HostBridgeRouter>[3],
 ): Harness {
   const db = openDatabase(":memory:");
   runMigrations(db);
@@ -82,7 +83,7 @@ function createHarness(
       db,
       companion,
       imageProviders,
-      undefined,
+      urlImporter,
       undefined,
       localImageLoader,
     ),
@@ -154,8 +155,12 @@ describe("host-local image routing", () => {
     return directory;
   }
 
-  function harness(loader?: LocalImageLoader, imageProviders?: ImageProviderRegistry): Harness {
-    const value = createHarness(loader, imageProviders);
+  function harness(
+    loader?: LocalImageLoader,
+    imageProviders?: ImageProviderRegistry,
+    urlImporter?: ConstructorParameters<typeof HostBridgeRouter>[3],
+  ): Harness {
+    const value = createHarness(loader, imageProviders, urlImporter);
     databases.push(value.db);
     return value;
   }
@@ -383,6 +388,54 @@ describe("host-local image routing", () => {
     expect(loader).not.toHaveBeenCalled();
     expect(runtime.request).not.toHaveBeenCalled();
     expect(auditJson(runtime.db)).not.toContain("C:/sensitive/image.png");
+  });
+
+  it("requires upload and network grants before importing a URL attachment", async () => {
+    const urlImporter = vi.fn<NonNullable<ConstructorParameters<typeof HostBridgeRouter>[3]>>(
+      async (url) => ({
+        bytes: PNG_BYTES,
+        mimeType: "image/png",
+        finalUrl: url,
+      }),
+    );
+    const runtime = harness(undefined, undefined, urlImporter);
+    grant(runtime.db, "assets:attach", "assets:upload");
+    const request = mutation("assets.images.attach", "assets:attach", {
+      documentUuid: "Actor.hero",
+      fieldPath: "img",
+      asset: {
+        kind: "url",
+        url: "https://example.test/hero.png",
+        sourceId: "data",
+        destinationPath: "art/hero.png",
+        onCollision: "error",
+      },
+    });
+
+    const denied = await handleMutation(runtime.router, request);
+
+    expect(denied.result).toMatchObject({
+      ok: false,
+      error: {
+        code: "PERMISSION_DENIED",
+        details: { missingCapability: "ai:network", connectionId: CONNECTION_ID },
+      },
+    });
+    expect(urlImporter).not.toHaveBeenCalled();
+    expect(runtime.request).not.toHaveBeenCalled();
+
+    grant(runtime.db, "ai:network");
+    const allowed = await handleMutation(runtime.router, request);
+
+    expect(allowed.result.ok).toBe(true);
+    expect(urlImporter).toHaveBeenCalledOnce();
+    expect(runtime.request).toHaveBeenCalledOnce();
+    expect(runtime.request.mock.calls[0]?.[2]).toMatchObject({
+      asset: {
+        kind: "upload",
+        source: { kind: "base64", data: PNG_BYTES.toString("base64"), mimeType: "image/png" },
+      },
+    });
   });
 
   it("requires ai:network before invoking a network image provider", async () => {

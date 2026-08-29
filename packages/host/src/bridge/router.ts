@@ -487,6 +487,9 @@ export class HostBridgeRouter {
     if (method === "assets.images.attach" && (assetKind === "upload" || assetKind === "url")) {
       additionalCapabilities.push("assets:upload");
     }
+    if (method === "assets.images.attach" && assetKind === "url") {
+      additionalCapabilities.push("ai:network");
+    }
     if (method === "assets.images.generate") {
       const provider =
         typeof operationParams["provider"] === "string"

@@ -119,18 +119,20 @@ intelligence exclusion. List and get are cursor paginated.
 
 ## Intelligence tools
 
-| Tool                                 | Input schema                                                          | Example arguments                                                              |
-| ------------------------------------ | --------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `foundry.intelligence.search`        | `{ connectionId, query, limit? }`                                     | `{"connectionId":"world-a:gm","query":"astral gate","limit":20}`               |
-| `foundry.intelligence.timeline`      | `{ connectionId, sessionId?, worldId?, from?, to?, cursor?, limit? }` | `{"connectionId":"world-a:gm","from":"2026-08-29T12:00:00Z","limit":50}`       |
-| `foundry.intelligence.changed-since` | `{ connectionId, afterSequenceId                                      | afterTimestamp, cursor?, limit? }`; exactly one starting position is required. | `{"connectionId":"world-a:gm","afterSequenceId":120,"limit":100}`                                        |
-| `foundry.intelligence.context`       | `{ connectionId, query?, afterSequenceId?                             | afterTimestamp?, sessionId?, worldId?, from?, to?, maxEvents?, maxBytes? }`    | `{"connectionId":"world-a:gm","query":"recent actor and scene changes","maxEvents":25,"maxBytes":65536}` |
+| Tool                                 | Input schema                                                                                                                          | Example arguments                                                                                        |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `foundry.intelligence.search`        | `{ connectionId, query, limit? }`                                                                                                     | `{"connectionId":"world-a:gm","query":"astral gate","limit":20}`                                         |
+| `foundry.intelligence.status`        | `{ connectionId }`                                                                                                                    | `{"connectionId":"world-a:gm"}`                                                                          |
+| `foundry.intelligence.timeline`      | `{ connectionId, sessionId?, worldId?, from?, to?, cursor?, limit? }`                                                                 | `{"connectionId":"world-a:gm","from":"2026-08-29T12:00:00Z","limit":50}`                                 |
+| `foundry.intelligence.changed-since` | `{ connectionId, afterSequenceId? or afterTimestamp?, cursor?, limit? }`; exactly one starting position is required.                  | `{"connectionId":"world-a:gm","afterSequenceId":120,"limit":100}`                                        |
+| `foundry.intelligence.context`       | `{ connectionId, query?, afterSequenceId? or afterTimestamp?, sessionId?, worldId?, from?, to?, maxEvents?, maxObjects?, maxBytes? }` | `{"connectionId":"world-a:gm","query":"recent actor and scene changes","maxEvents":25,"maxBytes":65536}` |
 
 Intelligence is built from the local, redacted, resumable event ledger. Search is deterministic;
-timeline and timestamp paging use opaque stable cursors; changed-since accepts a sequence or
-timestamp boundary; context returns bounded source events plus their provenance IDs. Private chat
-or journal content is off by default and configurable event categories are filtered before
-persistence.
+status reports reconciliation state and timestamps, queue depth, indexed/scanned/changed/private-
+filtered/retention counts, gap and truncation flags, and a bounded last error; timeline and
+timestamp paging use opaque stable cursors; changed-since accepts a sequence or timestamp boundary;
+context returns bounded source events plus their provenance IDs. Private chat or journal content is
+off by default and configurable event categories are filtered before persistence.
 
 ## Enumerable resources
 

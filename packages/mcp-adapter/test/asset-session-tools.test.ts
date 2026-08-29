@@ -179,6 +179,81 @@ describe("asset and session MCP tool registration", () => {
     }
   });
 
+  it("requires upload and network authorization metadata for URL attachments", async () => {
+    const request = vi.fn(async () => ({
+      documentUuid: "Actor.hero",
+      fieldPath: "img",
+      assetPath: "tokens/hero.png",
+      source: "data",
+      document: { name: "Hero", img: "tokens/hero.png" },
+    }));
+    const bridge: BridgeConnection = {
+      request,
+      close: () => Promise.resolve(),
+    };
+    const grants = new Set(["assets:attach", "assets:upload"]);
+    const authorizations: Parameters<MutationAuthorizer["run"]>[0][] = [];
+    const authorizer: MutationAuthorizer = {
+      run: async (authorization, operation) => {
+        authorizations.push(authorization);
+        const required = [
+          authorization.requestedCapability,
+          ...(authorization.additionalCapabilities ?? []),
+        ];
+        const missingCapability = required.find((capability) => !grants.has(capability));
+        if (missingCapability) {
+          throw {
+            message: `Permission denied: missing capability ${missingCapability}`,
+            missingCapability,
+            connectionId: authorization.connectionId,
+          };
+        }
+        return operation();
+      },
+    };
+    const context = await setup(bridge, authorizer);
+    const argumentsValue = {
+      connectionId: "world-a",
+      documentUuid: "Actor.hero",
+      asset: {
+        kind: "url",
+        url: "https://example.test/hero.png",
+        destinationPath: "tokens/hero.png",
+      },
+    };
+    try {
+      const denied = await context.client.callTool({
+        name: "foundry.assets.images.attach",
+        arguments: argumentsValue,
+      });
+      expect(denied.isError).toBe(true);
+      expect(denied.content).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ text: expect.stringContaining("ai:network") }),
+        ]),
+      );
+      expect(request).not.toHaveBeenCalled();
+      expect(authorizations[0]).toMatchObject({
+        requestedCapability: "assets:attach",
+        additionalCapabilities: ["assets:upload", "ai:network"],
+      });
+
+      grants.add("ai:network");
+      const allowed = await context.client.callTool({
+        name: "foundry.assets.images.attach",
+        arguments: argumentsValue,
+      });
+      expect(allowed.isError).not.toBe(true);
+      expect(request).toHaveBeenCalledOnce();
+      expect(authorizations[1]).toMatchObject({
+        requestedCapability: "assets:attach",
+        additionalCapabilities: ["assets:upload", "ai:network"],
+      });
+    } finally {
+      await context.close();
+    }
+  });
+
   it("forwards opaque session cursors unchanged and rejects unsafe legacy offsets", async () => {
     const opaqueCursor = "sc1.eyJrZXkiOiJ2YWx1ZSJ9.1234abcd";
     const calls: Array<{ method: string; params?: Record<string, unknown> }> = [];

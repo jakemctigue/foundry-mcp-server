@@ -26,6 +26,7 @@ import {
 } from "@foundry-mcp/protocol";
 
 import { MAX_RUNTIME_IMAGE_DIMENSION, type FoundryAssetRuntimeAdapter } from "./asset-runtime.js";
+import { AssetPathValidationError, canonicalAssetPath } from "./asset-path.js";
 import { FoundryDocumentService } from "./documents.js";
 import type { FoundryRuntimeAdapter } from "./runtime.js";
 
@@ -96,41 +97,12 @@ function boundedImageLimit(value: number, hardMaximum: number, label: string): n
 }
 
 export function validateAssetPath(path: string, options: { allowEmpty?: boolean } = {}): string {
-  if (path.length === 0 && options.allowEmpty) return "";
-  if (path.length === 0) operationError("INVALID_DATA", "Asset path is required");
-  if (path.includes("\0") || path.includes("\\"))
-    operationError("INVALID_DATA", "Asset paths must use relative forward-slash paths");
-  if (/^(?:[a-z]:|\/|\\|[a-z][a-z0-9+.-]*:)/i.test(path))
-    operationError(
-      "INVALID_DATA",
-      "Absolute, drive-letter, UNC, and URL asset paths are forbidden",
-    );
-  let decoded = path;
   try {
-    for (let pass = 0; pass < 4; pass += 1) {
-      const next = decodeURIComponent(decoded);
-      if (next === decoded) break;
-      decoded = next;
-    }
-  } catch {
-    operationError("INVALID_DATA", "Asset path contains malformed percent encoding");
+    return canonicalAssetPath(path, options);
+  } catch (error) {
+    if (error instanceof AssetPathValidationError) operationError("INVALID_DATA", error.message);
+    throw error;
   }
-  if (/%[0-9a-f]{2}/i.test(decoded))
-    operationError("INVALID_DATA", "Asset path contains excessive nested percent encoding");
-  if (decoded.includes("\\") || decoded.startsWith("/"))
-    operationError("INVALID_DATA", "Encoded absolute or backslash asset paths are forbidden");
-  const segments = decoded.split("/");
-  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === ".."))
-    operationError("INVALID_DATA", "Asset path traversal and empty segments are forbidden");
-  if (
-    segments.some(
-      (segment) =>
-        /[<>:"|?*]/.test(segment) ||
-        [...segment].some((character) => (character.codePointAt(0) ?? 0) < 0x20),
-    )
-  )
-    operationError("INVALID_DATA", "Asset path contains characters unsafe on Windows");
-  return decoded;
 }
 
 function decodeBase64(value: string, maxBytes: number): Uint8Array {

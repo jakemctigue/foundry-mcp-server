@@ -123,6 +123,12 @@ export function registerAssetTools(
     },
     (args, context) => {
       const options = bridgeRequestOptions(context);
+      const additionalCapabilities =
+        args.asset.kind === "url"
+          ? (["assets:upload", "ai:network"] as const)
+          : args.asset.kind === "upload"
+            ? (["assets:upload"] as const)
+            : [];
       return forwardAuthorizedBridgeTool(
         authorizer,
         mutationContext(
@@ -130,6 +136,7 @@ export function registerAssetTools(
           args,
           "assets:attach",
           options.correlationId,
+          additionalCapabilities,
         ),
         bridge,
         "assets.images.attach",

@@ -644,9 +644,35 @@ describe("FoundryAssetService attach", () => {
 });
 
 describe("validateAssetPath", () => {
-  it("allows a normalized relative Foundry asset path", () => {
+  it("allows and canonicalizes relative paths with valid Unicode and spaces", () => {
     expect(validateAssetPath("worlds/campaign/art/token.png")).toBe(
       "worlds/campaign/art/token.png",
     );
+    expect(validateAssetPath("worlds/Caf%C3%A9%20du%20Monde/%E8%8B%B1%E9%9B%84%20token.png")).toBe(
+      "worlds/Café du Monde/英雄 token.png",
+    );
+    expect(validateAssetPath("worlds/COM10 portraits/auxiliary hero.png")).toBe(
+      "worlds/COM10 portraits/auxiliary hero.png",
+    );
+  });
+
+  it.each([
+    ".. ",
+    "safe/.. /outside.png",
+    "safe/%2e%2e%20/outside.png",
+    "safe/trailing./outside.png",
+    "safe/trailing%2e/outside.png",
+    "CON",
+    "con.png",
+    "safe/PRN.jpg",
+    "safe/%43%4f%4e.png",
+    "safe/AUX.webp",
+    "safe/NUL.gif",
+    "safe/COM1.png",
+    "safe/COM9.png",
+    "safe/LPT1.png",
+    "safe/LPT9.png",
+  ])("rejects the Windows-canonicalization hazard %s", (path) => {
+    expect(() => validateAssetPath(path)).toThrow();
   });
 });

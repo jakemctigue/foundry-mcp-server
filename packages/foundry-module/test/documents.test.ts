@@ -1105,6 +1105,46 @@ describe("FoundryDocumentService bounded snapshots and complete generic coverage
     expect(output.truncationReasons).toContain("maxItems");
   });
 
+  it("redacts native Foundry secret HTML recursively by default without mutating the source", async () => {
+    const runtime = createRichFakeRuntime(FakeRole.PLAYER);
+    const actor = runtime.seedDocument("Actor", {
+      name: "Public actor",
+      type: "stormborn",
+      system: {
+        biography: {
+          value:
+            '<p>Public introduction</p><section class="secret"><p>Hidden biography</p></section><p>Public conclusion</p>',
+        },
+        nested: [
+          {
+            value:
+              "<p data-example=\"<section class='secret'>\">Visible note</p><section data-owner='gm' class='journal secret'><span data-example=\"</section>\">Hidden nested note</span></section><p>Visible tail</p>",
+          },
+        ],
+      },
+    });
+    const sourceBefore = actor.toObject();
+
+    const output = unwrap(
+      await new FoundryDocumentService(runtime).snapshot({
+        uuids: [actor.uuid],
+        maxDepth: 8,
+        maxItems: 10,
+        maxBytes: 10_000,
+      }),
+    );
+    const serialized = JSON.stringify(output.snapshot);
+
+    expect(serialized).toContain("Public introduction");
+    expect(serialized).toContain("Public conclusion");
+    expect(serialized).toContain("Visible note");
+    expect(serialized).toContain("Visible tail");
+    expect(serialized).not.toContain("Hidden biography");
+    expect(serialized).not.toContain("Hidden nested note");
+    expect(serialized).not.toContain('class=\\"secret\\"');
+    expect(actor.toObject()).toEqual(sourceBefore);
+  });
+
   it("detects UUID cycles, redacts configured paths, and reports each bound", async () => {
     const runtime = createRichFakeRuntime();
     runtime.seedDocument(
