@@ -103,7 +103,10 @@ jobs:
   foundry-module-release:
     name: Foundry v14 module package
     needs: build-test
-    runs-on: windows-latest
+    # Keep packaging on the same image exercised by the Windows build. The
+    # windows-latest alias can advance to a Visual Studio version unsupported
+    # by pnpm's bundled node-gyp before the dependency ecosystem catches up.
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
