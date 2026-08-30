@@ -7,11 +7,12 @@ import { CapturingChildStdioTransport } from "./child-stdio-transport.js";
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(packageDir, "dist", "cli.js");
+const responseTimeoutMs = process.platform === "win32" ? 15_000 : 5_000;
 
 function waitForResponse(
   transport: CapturingChildStdioTransport,
   id: number,
-  timeoutMs = 5000,
+  timeoutMs = responseTimeoutMs,
 ): Promise<JSONRPCMessage> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(
@@ -99,5 +100,5 @@ describe.each([...LEGACY_MCP_PROTOCOL_VERSIONS])("legacy MCP initialize %s", (pr
     for (const line of transport.stdoutLines) {
       expect(JSON.parse(line)).toMatchObject({ jsonrpc: "2.0" });
     }
-  }, 20000);
+  }, 20_000);
 });

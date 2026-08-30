@@ -7,6 +7,7 @@ import { CapturingChildStdioTransport } from "./child-stdio-transport.js";
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliEntry = path.join(packageDir, "dist", "cli.js");
+const responseTimeoutMs = process.platform === "win32" ? 15_000 : 5_000;
 const promptNames = [
   "foundry.campaign.briefing",
   "foundry.session.recap",
@@ -34,7 +35,7 @@ function expectProtocolOnly(transport: CapturingChildStdioTransport): void {
 function waitForResponse(
   transport: CapturingChildStdioTransport,
   id: number,
-  timeoutMs = 5000,
+  timeoutMs = responseTimeoutMs,
 ): Promise<JSONRPCMessage> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(

@@ -54,7 +54,7 @@ describe("modern MCP negotiation against the built adapter", () => {
     );
     expect(connections.isError).not.toBe(true);
     expect(connections.structuredContent).toEqual({ connections: [] });
-    await vi.waitFor(() => expect(progress).toHaveLength(2));
+    await vi.waitFor(() => expect(progress).toHaveLength(2), { timeout: 5_000 });
     expect(progress).toEqual([
       expect.objectContaining({ progress: 0, total: 1_000 }),
       expect.objectContaining({ progress: 1_000, total: 1_000 }),
