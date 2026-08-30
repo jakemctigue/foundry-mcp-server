@@ -1,4 +1,4 @@
-import net from "node:net";
+import net, { type Socket } from "node:net";
 import {
   BridgeAuthenticator,
   createBridgeAuthInit,
@@ -11,6 +11,9 @@ import {
 import { encodeFrame, FrameDecoder } from "./pipe-server.js";
 
 const AUTH_HANDSHAKE_TIMEOUT_MS = 15_000;
+const PIPE_CONNECT_RETRY_TIMEOUT_MS = 2_000;
+const PIPE_CONNECT_RETRY_DELAY_MS = 25;
+const TRANSIENT_WINDOWS_PIPE_ERRORS = new Set(["ENOENT", "ECONNREFUSED", "EBUSY"]);
 
 export interface PipeClient {
   send: (message: unknown) => void;
@@ -42,12 +45,43 @@ async function resolveClientAuthKey(
   return key;
 }
 
+function openPipeSocket(pipePath: string): Promise<Socket> {
+  const retryDeadline = Date.now() + PIPE_CONNECT_RETRY_TIMEOUT_MS;
+
+  return new Promise((resolve, reject) => {
+    const attempt = (): void => {
+      const socket = net.createConnection(pipePath);
+      const onConnect = (): void => {
+        socket.removeListener("error", onError);
+        resolve(socket);
+      };
+      const onError = (error: NodeJS.ErrnoException): void => {
+        socket.removeListener("connect", onConnect);
+        socket.destroy();
+        if (
+          process.platform === "win32" &&
+          TRANSIENT_WINDOWS_PIPE_ERRORS.has(error.code ?? "") &&
+          Date.now() < retryDeadline
+        ) {
+          setTimeout(attempt, PIPE_CONNECT_RETRY_DELAY_MS);
+          return;
+        }
+        reject(error);
+      };
+      socket.once("connect", onConnect);
+      socket.once("error", onError);
+    };
+
+    attempt();
+  });
+}
+
 export async function connectPipeClient(
   pipePath: string,
   options: ConnectPipeClientOptions = {},
 ): Promise<PipeClient> {
   const authKey = await resolveClientAuthKey(pipePath, options);
-  const socket = net.createConnection(pipePath);
+  const socket = await openPipeSocket(pipePath);
   const decoder = new FrameDecoder();
   let authenticator: BridgeAuthenticator | undefined;
   const handlers: Array<(message: unknown) => void> = [];
@@ -132,14 +166,7 @@ export async function connectPipeClient(
     }
   });
 
-  await new Promise<void>((resolve, reject) => {
-    socket.once("connect", () => {
-      socket.removeListener("error", reject);
-      socket.write(encodeFrame(createBridgeAuthInit()));
-      resolve();
-    });
-    socket.once("error", reject);
-  });
+  socket.write(encodeFrame(createBridgeAuthInit()));
 
   const handshakeTimer = setTimeout(() => {
     const error = new Error("bridge authentication challenge timed out");
