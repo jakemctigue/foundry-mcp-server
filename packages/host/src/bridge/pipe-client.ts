@@ -11,7 +11,7 @@ import {
 import { encodeFrame, FrameDecoder } from "./pipe-server.js";
 
 const AUTH_HANDSHAKE_TIMEOUT_MS = 15_000;
-const PIPE_CONNECT_RETRY_TIMEOUT_MS = 2_000;
+const PIPE_CONNECT_RETRY_TIMEOUT_MS = 5_000;
 const PIPE_CONNECT_RETRY_DELAY_MS = 25;
 const TRANSIENT_WINDOWS_PIPE_ERRORS = new Set(["ENOENT", "ECONNREFUSED", "EBUSY"]);
 
