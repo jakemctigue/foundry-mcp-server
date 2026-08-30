@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/client";
 import {
   BRIDGE_PROTOCOL_VERSION,
@@ -54,6 +54,7 @@ describe("modern MCP negotiation against the built adapter", () => {
     );
     expect(connections.isError).not.toBe(true);
     expect(connections.structuredContent).toEqual({ connections: [] });
+    await vi.waitFor(() => expect(progress).toHaveLength(2));
     expect(progress).toEqual([
       expect.objectContaining({ progress: 0, total: 1_000 }),
       expect.objectContaining({ progress: 1_000, total: 1_000 }),
