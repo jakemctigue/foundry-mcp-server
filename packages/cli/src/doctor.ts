@@ -57,7 +57,7 @@ interface PipeProbeDependencies {
 }
 
 const DEFAULT_PIPE_PROBE_TIMEOUT_MS = 2_000;
-const WINDOWS_ACL_INSPECTION_TIMEOUT_MS = 15_000;
+const WINDOWS_ACL_INSPECTION_TIMEOUT_MS = 60_000;
 
 interface LoadedConfig {
   result: CheckResult;
