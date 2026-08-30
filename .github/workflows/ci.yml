@@ -43,6 +43,9 @@ jobs:
 
       - name: Build, typecheck, lint, test
         run: pnpm exec turbo run build typecheck lint test
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
 
   windows-broker-artifacts:
     name: Windows broker (${{ matrix.rid }})
