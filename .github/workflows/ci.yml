@@ -42,7 +42,15 @@ jobs:
         run: ./packages/host/native/publish.ps1 -RuntimeIdentifiers win-x64
 
       - name: Build, typecheck, lint, test
+        if: runner.os != 'Windows'
         run: pnpm exec turbo run build typecheck lint test
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+
+      - name: Build, typecheck, lint, test serially on Windows
+        if: runner.os == 'Windows'
+        run: pnpm exec turbo run build typecheck lint test --concurrency=1
         env:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
