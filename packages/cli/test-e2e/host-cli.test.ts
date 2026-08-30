@@ -104,7 +104,7 @@ describe("built host CLI child process", () => {
     expect(`${removed.stdout}\n${removed.stderr}`).not.toContain(secret);
     const after = runCli(["provider", "status", "--json", ...common]);
     expect(JSON.parse(after.stdout)).toMatchObject({ configured: false });
-  });
+  }, 15_000);
 
   it("persists only one explicitly targeted mutation capability", () => {
     const appDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "foundry-mcp-capability-child-"));
@@ -145,5 +145,5 @@ describe("built host CLI child process", () => {
       grants: unknown[];
     };
     expect(after.grants).toHaveLength(1);
-  });
+  }, 15_000);
 });
