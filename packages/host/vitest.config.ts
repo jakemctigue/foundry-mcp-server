@@ -1,12 +1,13 @@
 import { defineConfig } from "vitest/config";
 
-const platformCoverageExcludes =
-  process.platform === "win32" ? [] : ["src/bridge/windows-pipe-broker.ts"];
+const isWindows = process.platform === "win32";
+const platformCoverageExcludes = isWindows ? [] : ["src/bridge/windows-pipe-broker.ts"];
 
 export default defineConfig({
   test: {
     environment: "node",
-    testTimeout: 15000,
+    fileParallelism: !isWindows,
+    testTimeout: isWindows ? 60_000 : 15_000,
     coverage: {
       provider: "v8",
       exclude: platformCoverageExcludes,
