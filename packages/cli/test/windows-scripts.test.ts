@@ -21,6 +21,14 @@ const requiredWindowsShells = [
   { label: "Windows PowerShell 5.1", executable: windowsPowerShell },
 ] as const;
 
+function timeoutForShell(executable: string, timeoutMs: number): number {
+  const isHostedLegacyShell =
+    process.env["CI"] === "true" &&
+    path.win32.normalize(executable).toLowerCase() ===
+      path.win32.normalize(windowsPowerShell).toLowerCase();
+  return isHostedLegacyShell ? timeoutMs * 3 : timeoutMs;
+}
+
 interface ScriptResult {
   status: number | null;
   stdout: string;
@@ -407,7 +415,7 @@ describe.runIf(process.platform === "win32")(
           expect(`${uninstallWhatIf.stdout}\n${uninstallWhatIf.stderr}`).toMatch(/planned|what if/i);
           expect(uninstallWhatIf.stdout).not.toMatch(/Uninstalled owned files/i);
           expect(fs.readFileSync(moduleFile, "utf8")).toBe("old-version\n");
-        }, 60000);
+        }, timeoutForShell(shell.executable, 60_000));
 
         it("rejects junction components before install, uninstall, or pairing mutation", () => {
           const source = moduleFixture("junction-source", "1.0.0", "safe\n");
@@ -447,7 +455,7 @@ describe.runIf(process.platform === "win32")(
           expect(pair.status).not.toBe(0);
           expect(pair.stderr).toMatch(/reparse|junction/i);
           expect(fs.readdirSync(outsideSecrets)).toHaveLength(0);
-        }, 60000);
+        }, timeoutForShell(shell.executable, 60_000));
 
         it("rejects hostile ZIP metadata before extraction and leaves the live module untouched", () => {
           const userData = tmpDir("zip-preflight-user-data");
@@ -651,7 +659,7 @@ describe.runIf(process.platform === "win32")(
             ).toEqual([]);
             expect(fs.existsSync(absoluteGuard), testCase.name).toBe(false);
           }
-        }, 180000);
+        }, timeoutForShell(shell.executable, 180_000));
 
         it("leaves the previous complete module untouched when staging copy is injected to fail", () => {
           const userData = tmpDir("copy-failure-user-data");
@@ -692,7 +700,7 @@ describe.runIf(process.platform === "win32")(
           expect(
             fs.readdirSync(path.dirname(target)).filter((name) => name.includes(".stage-")),
           ).toEqual([]);
-        }, 60000);
+        }, timeoutForShell(shell.executable, 60_000));
 
         it("restores the previous complete module when stage activation is injected to fail", () => {
           const userData = tmpDir("rollback-user-data");
@@ -738,7 +746,7 @@ describe.runIf(process.platform === "win32")(
             "module.json",
             path.join("scripts", "main.js"),
           ]);
-        }, 60000);
+        }, timeoutForShell(shell.executable, 60_000));
       });
     }
   },

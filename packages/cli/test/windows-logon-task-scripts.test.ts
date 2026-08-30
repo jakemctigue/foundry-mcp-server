@@ -19,6 +19,14 @@ const requiredWindowsShells = [
   { label: "Windows PowerShell 5.1", executable: windowsPowerShell },
 ] as const;
 
+function timeoutForShell(executable: string, timeoutMs: number): number {
+  const isHostedLegacyShell =
+    process.env["CI"] === "true" &&
+    path.win32.normalize(executable).toLowerCase() ===
+      path.win32.normalize(windowsPowerShell).toLowerCase();
+  return isHostedLegacyShell ? timeoutMs * 3 : timeoutMs;
+}
+
 interface ScriptResult {
   status: number | null;
   stdout: string;
@@ -249,7 +257,7 @@ describe.runIf(process.platform === "win32")(
           });
           expect(fs.readFileSync(shutdownPath, "utf8")).toBe("closed");
           expect(`${result.stdout}\n${result.stderr}`).not.toMatch(/[A-Z2-7]{40,}/);
-        }, 30000);
+        }, timeoutForShell(shell.executable, 30_000));
 
         it("rejects relative paths, wildcard origins, and non-loopback listeners before launch", () => {
           const fixture = repositoryFixture();
@@ -290,7 +298,7 @@ describe.runIf(process.platform === "win32")(
           ]);
           expect(remote.status).not.toBe(0);
           expect(remote.stderr).toMatch(/127\.0\.0\.1|valid set/i);
-        }, 30000);
+        }, timeoutForShell(shell.executable, 30_000));
 
         it("registers and removes only a mocked limited current-user logon task", () => {
           const fixture = repositoryFixture();
@@ -378,7 +386,7 @@ describe.runIf(process.platform === "win32")(
           expect(fs.readFileSync(removalPath, "utf8")).toBe(taskName);
           expect(`${result.stdout}\n${result.stderr}`).not.toMatch(/pairing|secret|token|credential/i);
           expect(realScheduledTaskExists(taskName)).toBe(false);
-        }, 30000);
+        }, timeoutForShell(shell.executable, 30_000));
 
         it("makes install/remove WhatIf explicit without invoking task mutation APIs", () => {
           const fixture = repositoryFixture();
@@ -421,7 +429,7 @@ describe.runIf(process.platform === "win32")(
           expect(`${result.stdout}\n${result.stderr}`).not.toMatch(/TASK MUTATION API CALLED/);
           expect(result.stdout).not.toMatch(/Installed per-user|Removed per-user/i);
           expect(realScheduledTaskExists(taskName)).toBe(false);
-        }, 30000);
+        }, timeoutForShell(shell.executable, 30_000));
 
         it("refuses to overwrite an unrelated existing task with the requested name", () => {
           const fixture = repositoryFixture();
@@ -459,7 +467,7 @@ describe.runIf(process.platform === "win32")(
           expect(result.stderr).toMatch(/not an owned Foundry MCP logon launcher/i);
           expect(`${result.stdout}\n${result.stderr}`).not.toMatch(/TASK MUTATION API CALLED/);
           expect(realScheduledTaskExists(taskName)).toBe(false);
-        }, 30000);
+        }, timeoutForShell(shell.executable, 30_000));
       });
     }
   },

@@ -57,6 +57,7 @@ interface PipeProbeDependencies {
 }
 
 const DEFAULT_PIPE_PROBE_TIMEOUT_MS = 2_000;
+const WINDOWS_ACL_INSPECTION_TIMEOUT_MS = 15_000;
 
 interface LoadedConfig {
   result: CheckResult;
@@ -229,7 +230,7 @@ function inspectWindowsAclSddl(configPath: string): string | undefined {
       encoding: "utf8",
       env: { ...process.env, FOUNDRY_MCP_ACL_TARGET: configPath },
       maxBuffer: 64 * 1024,
-      timeout: 5_000,
+      timeout: WINDOWS_ACL_INSPECTION_TIMEOUT_MS,
       windowsHide: true,
     },
   );
