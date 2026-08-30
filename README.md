@@ -16,6 +16,7 @@ A Windows-first Model Context Protocol server for Foundry Virtual Tabletop v14. 
 ## Start here
 
 - [Windows quick start](./docs/windows-quickstart.md) — build the module ZIP, install and pair it, run the host, grant capabilities, and configure an MCP client.
+- [Claude Code, Codex, and Cursor setup](./docs/mcp-client-setup.md) — instantiate the source checkout and register its stdio adapter in each supported MCP client.
 - [Docker-hosted Foundry](./docs/docker-foundry.md) — use a writable User Data bind mount with the checked-in Compose example or overlay.
 - [Configuration, privacy, and providers](./docs/configuration.md) — typed settings, precedence, safe defaults, and opt-in provider setup.
 - [Tools, resources, and prompts](./docs/tools-reference.md) — the exact public MCP surface.
