@@ -91,8 +91,9 @@ it is not a requirement to repeat the automated file preparation.
    this behavior for this private test instance. This bundle does **not** accept
    the Foundry EULA. The owner has explicitly authorized agent-assisted acceptance
    and setup through the protected UI. Confirm the intended license, accept the
-   displayed agreement, create the disposable world, secure its GM account, and
-   install D&D 5E. Keep access owner-only; do not invite players to this backend.
+   displayed agreement, install D&D 5E, create the disposable world, and retain
+   the owner-approved GM configuration described below. Keep access owner-only;
+   do not invite players to this backend.
 
 Never set `CONTAINER_VERBOSE`, even to `false`: parts of the upstream startup code
 test whether it exists. Do not enable proxy credential logging or print expanded
@@ -160,14 +161,23 @@ the installed manifest's update pointer targets the moving `master` branch.
 From **Game Worlds > Create World**, create a new disposable world with a simple
 hyphenated data path and choose Dungeons & Dragons Fifth Edition as its system.
 In the observed 14.367 flow, select the system tile before **Continue**. Creation
-opens **User Management** for the new world. The default Gamemaster has no
-password: the owner should set a unique GM password and choose **Save and Continue**
-before proceeding. If an existing world opens its Join page instead, use
-**Game Settings > User Management** after GM login to secure its account.
-That world password is distinct from the gateway and Setup administrator passwords.
+opens **User Management** for the new world. For this campaign, the owner
+explicitly requested that the existing **Gamemaster** account retain its already
+blank password and Gamemaster role. That configuration was saved with **Save and
+Continue**, and the world was launched. Do not replace this authorized choice
+with a new GM password. The separate owner gateway and Foundry Setup
+administrator passwords remain unchanged; the test world stays owner-only.
 No premium adventure/world package is required for the system's SRD compendia.
 These UI instructions follow the official knowledge base; exact button placement
 must be checked against the running 14.367 interface.
+
+The separately provisioned [private MCP workflow](docs/private-integration-notes.md)
+documents the host, companion, stdio adapter, and owner-IAP browser path; it is
+not part of this Compose bundle. The current campaign uses that interactive
+owner browser, not an unattended VM browser worker. See the
+[dated evidence and remaining gates](docs/deployment-verification.md) for the
+saved catalog, deployed response-cache recovery, representative native dice/save
+and damage-application results, and pending generator delivery and teardown.
 
 The eventual GM browser worker runs on the host and uses `http://127.0.0.1:30000`
 so its private loopback MCP websocket is not blocked as mixed content from a
