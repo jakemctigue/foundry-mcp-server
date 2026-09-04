@@ -1,0 +1,30 @@
+{
+	admin off
+	persist_config off
+	servers {
+		protocols h1 h2
+		strict_sni_host on
+	}
+}
+
+foundrytest.bossforge.dev {
+	header {
+		Strict-Transport-Security "max-age=86400"
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Content-Security-Policy "frame-ancestors 'none'"
+		Referrer-Policy same-origin
+		-Server
+	}
+
+	# Route order is explicit: no setup, join, asset, or websocket bypass.
+	route {
+		basic_auth {
+			import /run/secrets/owner-auth.caddy
+		}
+		reverse_proxy foundry:30000 {
+			# Do not forward the reusable gateway password to Foundry.
+			header_up -Authorization
+		}
+	}
+}

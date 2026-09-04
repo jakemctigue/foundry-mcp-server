@@ -1,0 +1,9 @@
+# Real secrets and runtime data belong outside the checkout, even when ignored.
+.env
+.env.*
+*.secret
+*.secrets.*
+foundry-runtime.json
+owner-auth.caddy
+data/
+container_cache/
