@@ -1,0 +1,52 @@
+name: Private MCP provisioning checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/foundry-test/private-mcp-release.mjs"
+      - "deploy/foundry-test/provision-private-mcp.mjs"
+      - "deploy/foundry-test/private-mcp.test.mjs"
+      - "deploy/foundry-test/docs/private-integration-notes.md"
+      - "deploy/foundry-test/docs/private-mcp-provisioning.md"
+      - "deploy/foundry-test/docs/activity-execution-contract.md"
+      - ".github/workflows/private-mcp-config.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "deploy/foundry-test/private-mcp-release.mjs"
+      - "deploy/foundry-test/provision-private-mcp.mjs"
+      - "deploy/foundry-test/private-mcp.test.mjs"
+      - "deploy/foundry-test/docs/private-integration-notes.md"
+      - "deploy/foundry-test/docs/private-mcp-provisioning.md"
+      - "deploy/foundry-test/docs/activity-execution-contract.md"
+      - ".github/workflows/private-mcp-config.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  private-mcp-security:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check private provisioning script syntax
+        run: |
+          node --check deploy/foundry-test/private-mcp-release.mjs
+          node --check deploy/foundry-test/provision-private-mcp.mjs
+          node --check deploy/foundry-test/private-mcp.test.mjs
+      - name: Test security contracts without provisioning or credentials
+        run: node --test deploy/foundry-test/private-mcp.test.mjs
