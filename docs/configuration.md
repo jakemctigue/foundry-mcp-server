@@ -75,6 +75,93 @@ foundry-mcp provider remove
 
 The provider sends the bearer credential only to `https://api.openai.com/v1/images/generations`, bounds output bytes/pixels, validates returned image data, and records provider/model provenance. No live provider call or cost is claimed by the repository tests.
 
+## Linux protected secret storage (opt-in)
+
+Linux services can use an independently provisioned master key instead of the
+development fallback. Set `FOUNDRY_MCP_SECRET_KEY_FILE` to an **absolute path to a
+regular file containing exactly 32 raw cryptographically random bytes** (not a
+hex string, Base64 text, password, or key derived from a username). The environment
+contains only the file path, never the key. Leave `NODE_ENV=production` enabled.
+
+Provision the key through the deployment's secret manager or credential injection
+mechanism. It must survive a VM stop/restart through that separate secret manager;
+do not generate a new master key on each boot. Mount/materialize the same key for
+the host, adapter, pairing bootstrap, and provider commands, running as the same
+dedicated service account. No cloud SDK, IAM grants, or key provisioning is
+performed by this backend.
+
+Requirements:
+
+- Master-key file: mode `0400` or `0600`, owned by the service account (or root if
+  the process can legitimately read it), no symlinks or hard links. Keep it outside
+  the encrypted `secrets` directory and out of the same backup/archive.
+- The encrypted `secrets` directory: owned by the service account, mode `0700`;
+  ciphertext files are written with mode `0600`. Parent directories must be owned
+  by root or that account and not group/world writable; root-owned sticky `/tmp`
+  is permitted as an ancestor. Symlinked path segments are rejected.
+- Use a local POSIX filesystem (for example ext4 on a persistent disk), not a
+  network/object-store mount. Exclusive file creation has filesystem-specific
+  semantics; see the [Node.js filesystem documentation](https://nodejs.org/docs/latest-v22.x/api/fs.html#file-system-flags).
+- A missing, exposed, invalid, or wrong key fails closed. The versioned AES-256-GCM
+  ciphertext authenticates the secret name as well as the contents. Existing
+  DPAPI/development ciphertext is **not automatically migrated or reinterpreted**.
+  Rotating the master key requires a separately reviewed re-encryption/re-pairing
+  procedure; replacing the key alone makes existing credentials unreadable.
+
+This is a secret-storage prerequisite, not certification of the entire Linux
+deployment. It does not expose a new listener, change Origin policy, bypass
+bridge HMAC authentication, or make the MCP transports public. Keep the companion
+WebSocket on loopback, the adapter on local stdio, and the Unix socket private.
+Only Foundry's owner-protected web interface should be reachable through the
+`foundrytest.bossforge.dev` HTTPS proxy; never add an MCP proxy route or firewall
+opening. Root and processes running as the same service account remain trusted.
+Windows continues to use current-user DPAPI; configuring this Linux-only variable
+on Windows is rejected rather than silently replacing DPAPI.
+
+### Private Linux pairing bootstrap
+
+The existing `scripts/windows/pair.ps1` is Windows-only. After building the
+workspace, Linux uses `scripts/linux/pair.mjs`. Before running it, the deployment
+must create the app-data directory and a private temporary output directory owned
+by the service account, with mode `0700`, and provision the master key above.
+Run bootstrap with the host stopped and only one setup process at a time.
+For example, run the following **as that service account from the repository
+root**, with those paths already provisioned:
+
+```sh
+export NODE_ENV=production
+export XDG_DATA_HOME=/var/lib
+export FOUNDRY_MCP_SECRET_KEY_FILE=/run/foundry-mcp-credentials/storage-key
+
+node scripts/linux/pair.mjs \
+  --app-data /var/lib/foundry-mcp \
+  --output-file /run/foundry-mcp-private/pairing-code.txt
+
+node packages/cli/dist/bin.js host --app-data /var/lib/foundry-mcp
+```
+
+The bootstrap writes the Base32 pairing code only to the explicitly requested,
+new `0600` file. It never prints the code to stdout/stderr and refuses to overwrite
+an existing output. Retrieve it through an owner-only administration channel or
+let the trusted local browser runner read it, then remove that temporary plaintext
+file after configuring the companion. It is not a build artifact or log attachment.
+Re-running with a new output filename recovers the existing pairing code without
+rotating it or disconnecting a paired world.
+
+The adapter resolves app data from `XDG_DATA_HOME`; it does not use the host's
+`--app-data` flag. Ensure it inherits the same three environment values above and
+runs as the same account. `XDG_DATA_HOME=/var/lib` resolves to
+`/var/lib/foundry-mcp` for the host, provider command, and adapter. Start the local
+adapter with `node packages/mcp-adapter/dist/cli.js`; no public TCP endpoint is
+required. Optional provider configure/status/remove commands automatically use
+this same protected backend. Never put provider credentials or the master-key
+bytes in command arguments, checked-in configuration, CI logs, or MCP responses.
+
+Linux-only tests exercise actual filesystem permissions, link rejection, tamper
+detection, provider/pairing persistence, and separate host/adapter bridge-key
+loading. Those tests are skipped on Windows; a Windows-only pass does not establish
+Linux readiness. The complete Linux CI suite must pass before using this in the lab.
+
 ## Developer notes
 
 Use Node.js 22 and the pinned pnpm version. Keep adapter stdout protocol-only; diagnostics belong on stderr. Run `pnpm build`, `pnpm typecheck`, `pnpm lint`, `pnpm test`, and `pnpm test:e2e` before release. Build a distributable companion with `foundry-mcp build-module`; do not install `packages\foundry-module\dist` directly. The release builder allowlists only the manifest and browser bundle and refuses to overwrite an existing artifact.
