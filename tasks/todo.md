@@ -127,12 +127,32 @@ Status: not started. See [plan](plan.md). Each task is a separate reviewable sli
 
 - [ ] Review a representative exported caster, class spell-count minimums, and custom abilities in real Foundry. Confirm no billing/export-access changes.
 
+## 10d. Correct attack dice and typed damage components
+
+- [ ] Derive attack count, exact dice formulas, modifiers, typed damage parts, and conditional triggers from an independently reviewed ability specification; preserve appropriate mixed damage without inventing extra types.
+- [ ] Fix generation/scaling/normalization/export paths that drop riders, flatten types, duplicate modifiers, or confuse multiattack with per-hit damage. Preserve alternate modes and once-per-turn conditions.
+- Verification: failing-then-passing tests for `2d6 + 4 slashing plus 1d6 fire`, wrong dice with similar totals, repeated transforms, conditional riders, and actual normal/critical Foundry roll terms; BossForge lint/test/build.
+- Dependencies: 2, 7, 10. Scope: medium, up to 5 files.
+- Likely files: BossForge `server/routes.ts`, `src/types.ts`, damage contract/helper (new), export helper, focused tests.
+
+## 10e. Align intended descriptions and executed ability behavior
+
+- [ ] Ensure each intended save DC/ability matches description, serialized activity, and actual Foundry execution, preserving legitimate per-ability and follow-up DC differences.
+- [ ] Validate supported activation, range, targets, save outcomes, duration, effects, and resource limits; report ambiguous/manual mechanics explicitly. Do not rewrite correct prose to conceal broken automation.
+- Verification: independent intent fixtures, deliberate prose DC 16 versus activity DC 14 mismatch, separate escape save, typed conditional rider, and save-success/failure runtime cases; BossForge lint/test/build.
+- Dependencies: 7, 10c, 10d. Scope: medium, up to 5 files.
+- Likely files: BossForge `src/types.ts`, ability validator (new), description rendering helper, focused tests, live behavior fixtures.
+
+## Checkpoint D2: Attack and ability fidelity
+
+- [ ] Freshly generated, unmodified exports match the reviewed intent in Foundry; multi-type damage and individual DCs are verified from executed data, not chat text alone.
+
 ## 11. Add disposable-world regression lifecycle
 
 - [ ] Implement stopped-world reset with exact path/world guards and a single-run lock.
 - [ ] Run the agreed fixture corpus with deterministic targets and bounded dialogs; report unsupported/manual behavior separately.
 - Verification: full runtime corpus, cross-run contamination test, crash/reconnect/duplicate-request tests, cleanup-boundary tests.
-- Dependencies: 7, 10, 10b, 10c. Scope: medium, up to 5 new runner/fixture/test files; split corpus expansion into additional small PRs.
+- Dependencies: 7, 10, 10b, 10c, 10d, 10e. Scope: medium, up to 5 new runner/fixture/test files; split corpus expansion into additional small PRs.
 - Likely files: `tests/live/` runner, lifecycle helper, fixture definitions, report schema, lifecycle tests.
 
 ## 12. Connect an owner-only BossForge validation job
@@ -151,6 +171,15 @@ Status: not started. See [plan](plan.md). Each task is a separate reviewable sli
 - Dependencies: 5, 12. Scope: medium, up to 4 lifecycle/deployment/test files.
 - Likely files: VM lifecycle controller, watchdog definition, report retention configuration, failure tests.
 
+## 14. Verify corrected generation and leave the lab stopped
+
+- [ ] Turn confirmed validation defects into source-code fixes and persistent regressions; prove fresh monsters from the normal creation path pass without manual repairs, using the exact merged generator build and catalog.
+- [ ] Publish verified changes through the required PR/CI workflow and record source/artifact/runtime evidence. Do not count repaired stored actors or prompt-only changes as proof that future generation is fixed.
+- [ ] Save the report, close the browser/MCP host, cleanly stop Foundry and the test VM, and verify the stopped state. Firebase spells and retained setup remain intact; BossForge creation/export works with the lab off and does not wake it. RackNerd Foundry remains untouched.
+- Verification: full agreed runtime corpus, independently checked new generated samples, GitHub/main and running-build evidence, cloud stopped-state check, and lab-offline generation/export test.
+- Dependencies: 11, 12, 13. Scope: medium, up to 4 release-validation/runbook/report files; any further code defects return to their focused implementation task before completion.
+- Likely files: release verification script, regression report, `docs/gcp-test-host.md`, deployment/runbook checklist.
+
 ## Checkpoint E / release gate
 
 - [ ] Relevant tests, lint, typecheck, build, CI, and real Foundry regressions pass for merged GitHub SHAs.
@@ -158,3 +187,4 @@ Status: not started. See [plan](plan.md). Each task is a separate reviewable sli
 - [ ] Document install/update/rollback for Claude Code, Codex, Cursor, and the cloud runner using the final transport, without claiming current stdio clients already support a remote URL.
 - [ ] Owner verifies internet-accessible `foundrytest.bossforge.dev`, retained setup, costs, and complete actor behavior. External checks confirm no MCP socket or proxy route is reachable. Existing RackNerd Foundry and normal customer exports remain unaffected.
 - [ ] Review controlled BossForge rollout and rollback before changing production.
+- [ ] Corrected fresh generation is verified and published; the test Foundry compute is confirmed stopped, with Firebase catalog and retained setup available for future targeted regression runs.

@@ -129,7 +129,29 @@ Every supported fixture must import without schema errors; resolve all artwork a
 
 Run fast unit/contract tests on code changes. Run real Foundry regressions for relevant generator/export/MCP changes and pinned-version upgrades, not for every customer download. Retain a compact report identifying both repository SHAs, artifact digest, Foundry/system versions, fixture identity, and observed results.
 
-## Publication, rollback, and review gates
+## Monster behavior validation and delivery
+
+### Attack damage and description-to-automation fidelity
+
+Use a reviewed structured ability specification (or canonical SRD record) as the expected behavior, then derive both the description and Foundry activities from it. Merely making those two outputs agree is insufficient if they both lose the original mechanics. Do not resolve validation failures by rewriting an intended description to match broken automation, changing the expected test result to the observed result, or hand-editing only the imported actor.
+
+For every attack, verify the attack bonus, count of attacks, each damage component's dice count and die size, flat modifiers, damage type, and triggering condition. For example, an intended hit of `2d6 + 4 slashing plus 1d6 fire` must retain two separately typed components with those formulas. It must not become `3d6 + 4 slashing`, duplicate the ability modifier on the fire component, or lose the fire rider. Use mixed damage when justified by the monster's abilities and theme; do not force every monster to have multiple damage types. Multiattack count is not an instruction to silently multiply the dice of one hit.
+
+Inspect evaluated Foundry roll terms and their typed results, not just a plausible random total or chat label. Include normal/critical hits according to the pinned rules, misses, conditional riders, alternative damage modes, and save-success/failure behavior. Assert that modifiers are applied exactly once and that repeated normalization/scaling/export preserves each component. Verify type-specific resistance/immunity handling where supported by the installed automation; explicitly identify manual adjudication instead of inventing a successful automated result.
+
+For each save-based effect, compare the intended DC and save ability with the displayed description, serialized activity, and DC actually used in Foundry. Test multiple different DCs on the same monster and separate follow-up or escape saves; a global override must not collapse them accidentally. Validate targeting, range, activation, durations, conditions, recharge/uses, and supported effect application against the same specification. Ambiguous or unsupported mechanics require an explicit incomplete/manual result and review, not a full-pass claim.
+
+The fixture set must include single-type and split-type attacks, a modifier-free rider, multiple attacks, a critical-hit case, a successful-save case, and a deliberate prose-versus-activity DC mismatch. Expected formulas/types/triggers/DCs must be independent of the code under test. Retain before/after findings and convert every confirmed defect into a failing automated regression before fixing the generator or serializer.
+
+### Permanent source fixes, regeneration, and shutdown
+
+Completion sequence: capture failing Foundry behavior -> add regression -> fix BossForge generation/normalization/scaling/export code -> generate fresh monsters -> import untouched exports into a clean test world -> rerun the relevant and full agreed regression corpus -> publish verified source/artifacts -> stop the test stack. Repeat the fix-and-validation loop until the supported acceptance criteria pass. Prompt edits alone are insufficient when deterministic code discards or overwrites correct data.
+
+Verify fresh output from the exact merged generator version, not just saved actors repaired in Foundry. Use representative newly generated monsters plus stable fixtures; assert that generation, editing, save/reload, scaling, and export retain intended mechanics. Record source SHAs and catalog version in the final report. Retain fast tests for future code changes and restart the lab only for explicitly requested or configured relevant regression runs, not ordinary customer creation/export.
+
+After results are saved and the corrected generator is published and verified, close the automated browser and MCP host, stop Foundry cleanly, and stop the test VM. Verify the actual stopped state rather than just sending a stop request. Preserve installed license/system, GM account, configuration, regression reports, and Firebase spells. Verify BossForge can still generate and export from Firebase while the lab is off and does not automatically wake it. This shutdown applies only to the test backend; never stop BossForge or the existing RackNerd Foundry server. Retain failure/idle timeouts between test sessions rather than leaving the lab running indefinitely while fixes are developed.
+
+### PR and deployment gates
 
 Each implementation slice uses a short-lived `codex/` branch and PR. Fetch GitHub before branching; inspect Archon refs and dirty worktrees; do not mistake the local `origin` cache for GitHub. Run relevant tests, lint/typecheck/build, and inspect CI before merging. Never bypass a failing check merely to troubleshoot access.
 

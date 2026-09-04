@@ -19,7 +19,10 @@ BossForge.dev must export complete D&D 5E Foundry actors whose spells and suppor
 - Every generated caster must have the class-appropriate spellcasting ability and consistent ability modifier, spell attack bonus, and spell save DC. Validate the values that Foundry actually uses, not only displayed prose, and preserve them through save/reload/export.
 - Execute spells and abilities in a disposable test world. JSON/schema checks alone are insufficient.
 - Check actor completeness, real rolls, resource consumption, and supported ability behavior.
+- Monster attacks must roll the intended number and size of dice, with the correct modifiers and attack count. Preserve separate damage components when an ability appropriately deals multiple damage types; do not flatten them into one type or invent arbitrary mixed damage.
+- Each ability's executed save DC and save ability must match its intended description and VTT automation data. Clean up supported actions, riders, targeting, effects, and resource behavior to match that intent, rather than merely changing the description to agree with faulty automation.
 - Use initial testing to correct the generator, then retain regression tests for relevant code or system updates. Normal customer exports must not permanently depend on a live test server.
+- Validation findings must become lasting BossForge source-code fixes with regression tests. Recreate fresh monsters using the corrected generator, validate their untouched exports in Foundry, publish the verified changes, then shut down the Foundry test server while preserving its configuration and the Firebase spell catalog. Hand-repaired test actors do not establish completion.
 - Prefer the lowest practical Google Cloud cost. Cloud Run was the initial preference; other Google services are permitted when more suitable and economical.
 - Permit stopping the backend between runs and waiting for startup. Preserve license, installed system, and test configuration across stops.
 - Keep stored content small: the D&D 5E system, required runtime components, and disposable fixtures; no campaign library.
