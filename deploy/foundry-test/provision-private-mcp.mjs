@@ -19,7 +19,7 @@ const fail = (phase) => {
 function safeAbsolute(value) {
   if (
     typeof value !== "string" ||
-    !/^\/[a-zA-Z0-9._/-]+$/u.test(value) ||
+    !/^\/[a-zA-Z0-9._@+/-]+$/u.test(value) ||
     value
       .split("/")
       .slice(1)

@@ -66,6 +66,21 @@ test("manifest paths cannot traverse, inject controls, or name an absolute path"
   );
 });
 
+test("immutable directory checks accept ordinary scoped pnpm dependency paths", (t) => {
+  const dependency = `${releaseDir}/node_modules/.pnpm/@babel+helper-string-parser@7.29.7/node_modules/@babel/helper-string-parser`;
+  const lstat = t.mock.method(fs, "lstatSync", () => ({
+    isDirectory: () => true,
+    isSymbolicLink: () => false,
+    uid: 0,
+    mode: 0o40555,
+  }));
+  assertDirectoryChain(dependency, [0], true);
+  assert.ok(lstat.mock.calls.some((call) => call.arguments[0] === dependency));
+  for (const suffix of ["/../other", "/./other", "//other", "\nother", " other", "$other"]) {
+    assert.throws(() => assertDirectoryChain(dependency + suffix, [0], true), /unsafe path/);
+  }
+});
+
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-release-test-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -284,6 +299,12 @@ test(
     t.after(() => fs.rmSync(safeRoot, { recursive: true, force: true }));
     const allowed = [0, process.getuid()];
     assertDirectoryChain(safeRoot, allowed);
+    const dependency = path.join(
+      safeRoot,
+      "node_modules/.pnpm/@babel+helper-string-parser@7.29.7/node_modules/@babel/helper-string-parser",
+    );
+    fs.mkdirSync(dependency, { recursive: true, mode: 0o755 });
+    assertDirectoryChain(dependency, allowed);
     const real = path.join(safeRoot, "real");
     fs.mkdirSync(real, { mode: 0o700 });
     assertDirectoryChain(real, allowed);
