@@ -1,0 +1,29 @@
+name: Foundry test host configuration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/foundry-test/**"
+      - ".github/workflows/foundry-test-config.yml"
+  pull_request:
+    paths:
+      - "deploy/foundry-test/**"
+      - ".github/workflows/foundry-test-config.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  configuration-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check Linux bootstrap syntax
+        run: bash -n deploy/foundry-test/bootstrap.sh
+      - name: Verify public access and secret-file boundaries
+        run: node --test deploy/foundry-test/security.test.mjs
