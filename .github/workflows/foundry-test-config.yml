@@ -27,5 +27,7 @@ jobs:
         run: bash -n deploy/foundry-test/bootstrap.sh
       - name: Verify public access and secret-file boundaries
         run: node --test deploy/foundry-test/security.test.mjs
+      - name: Verify pinned Caddy security candidate recipe
+        run: node --test deploy/foundry-test/caddy-security/recipe.test.mjs
       - name: Verify owner-gateway probe without credentials or network
         run: python3 -B -m unittest discover -s deploy/foundry-test -p test_probe_gateway.py -v
