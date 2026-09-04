@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const composePath = fileURLToPath(new URL("./compose.yaml", import.meta.url));
+const composeSource = readFileSync(composePath, "utf8");
 const caddy = readFileSync(new URL("./Caddyfile", import.meta.url), "utf8")
   .split("\n")
   .filter((line) => !line.trim().startsWith("#"))
@@ -90,7 +91,14 @@ test("test-only data survives container recreation without broad or automatic mo
   const data = config.services.foundry.volumes.find((volume) => volume.target === "/data");
   assert.equal(data.type, "bind");
   assert.equal(data.source, "/var/lib/foundry-test/data");
-  assert.equal(data.bind.create_host_path, false);
+  // Some Compose versions omit false-valued fields from their JSON output.
+  // Check both the parsed value and the explicit source guard so omission of
+  // create_host_path from the actual deployment cannot pass unnoticed.
+  assert.equal(data.bind.create_host_path ?? false, false);
+  assert.match(
+    composeSource,
+    /source: \/var\/lib\/foundry-test\/data\s+target: \/data\s+bind:\s+create_host_path: false/,
+  );
   assert.equal(config.services.foundry.environment.CONTAINER_CACHE_SIZE, "1");
   assert.equal(config.services.foundry.environment.CONTAINER_UMASK, "0077");
   assert.equal(config.services.caddy.read_only, true);
