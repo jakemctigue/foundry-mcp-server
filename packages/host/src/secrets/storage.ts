@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import type { Logger } from "../logger.js";
+import { createLinuxFileSecretStorage } from "./linux-file-storage.js";
+export { writeLinuxPairingCode } from "./linux-file-storage.js";
 
 export interface SecretStorage {
   save: (key: string, value: Buffer) => Promise<void>;
@@ -99,9 +101,17 @@ function requireDevelopmentFallback(options: CreateSecretStorageOptions): void {
  * DPAPI (current-user scope). An AES-256-GCM encrypted-file fallback is
  * available only to explicitly opted-in development/test runtimes and is
  * always refused when NODE_ENV=production.
+ * On Linux, FOUNDRY_MCP_SECRET_KEY_FILE selects an independent protected-key
+ * production backend for every consumer, including CLI and bridge key loading.
  */
 export function createSecretStorage(options: CreateSecretStorageOptions): SecretStorage {
   const { dir, logger } = options;
+  const masterKeyFile = process.env["FOUNDRY_MCP_SECRET_KEY_FILE"];
+  if (masterKeyFile !== undefined) {
+    if (options.forceFallback)
+      throw new Error("Linux master key cannot be combined with forced development fallback");
+    return createLinuxFileSecretStorage(dir, masterKeyFile);
+  }
 
   async function resolveDpapi(): Promise<DpapiModule | undefined> {
     if (options.forceFallback) {
