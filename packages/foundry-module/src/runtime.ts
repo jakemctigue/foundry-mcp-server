@@ -199,7 +199,8 @@ function wrapDocument(raw: unknown): RuntimeDocument {
     ...(item.ownership !== undefined ? { ownership: item.ownership } : {}),
     ...(revision !== undefined ? { revision } : {}),
     schemaVersion,
-    toObject: () => call(raw, "toObject", false),
+    // Export canonical source, not prepared system values or calculated fields.
+    toObject: () => call(raw, "toObject", true),
     raw,
   };
 }
