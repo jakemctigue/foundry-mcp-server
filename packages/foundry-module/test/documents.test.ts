@@ -32,6 +32,75 @@ async function allPages(
 }
 
 describe("FoundryDocumentService type discovery", () => {
+  it("exports canonical source for hydrated compendiums and UUID reads", async () => {
+    const source = {
+      _id: "spell-source",
+      name: "Source Spell",
+      type: "spell",
+      img: "icons/magic/fire/projectile-fireball-smoke-orange.webp",
+      system: {
+        properties: ["vocal", "somatic"],
+        activities: {
+          cast: {
+            type: "save",
+            save: { dc: { calculation: "spellcasting", formula: "" } },
+            damage: { parts: [{ number: 2, denomination: 6, types: ["fire"] }] },
+          },
+        },
+      },
+    };
+    const transformed = {
+      ...source,
+      system: { ...source.system, properties: new Set(source.system.properties), derivedDc: 17 },
+    };
+    const toObject = vi.fn((useSource: boolean) => (useSource ? source : transformed));
+    const raw = {
+      id: source._id,
+      uuid: `Compendium.world.spells.Item.${source._id}`,
+      documentName: "Item",
+      type: "spell",
+      pack: "world.spells",
+      toObject,
+    };
+    const runtime = new BrowserFoundryRuntime({
+      game: {
+        ready: true,
+        user: { isGM: true },
+        packs: new Map([
+          [
+            raw.pack,
+            {
+              collection: raw.pack,
+              documentName: "Item",
+              visible: true,
+              locked: true,
+              getDocuments: async () => [raw],
+            },
+          ],
+        ]),
+      },
+      foundry: { utils: { parseUuid: (uuid: string) => ({ uuid }) } },
+      fromUuid: async () => raw,
+    });
+    expect((await runtime.fromUuid(raw.uuid))?.toObject()).toBe(source);
+
+    const service = new FoundryDocumentService(runtime);
+    const hydrated = unwrap(
+      await service.compendiumDocumentsList({ packId: raw.pack, hydrate: true }),
+    );
+    const document = unwrap(await service.get({ uuid: raw.uuid }));
+    for (const view of [hydrated.items[0], document]) {
+      expect(view).toMatchObject({ data: source, sourceHash: sourceHash(source) });
+      expect(view).not.toHaveProperty("data.system.derivedDc");
+      expect(JSON.parse(JSON.stringify(view))).toHaveProperty("data.system.properties", [
+        "vocal",
+        "somatic",
+      ]);
+    }
+    expect(toObject).toHaveBeenCalledWith(true);
+    expect(toObject.mock.calls.every(([useSource]) => useSource === true)).toBe(true);
+  });
+
   it("adapts Foundry globals structurally without a compiled-in Document registry", async () => {
     const rawDocument = {
       id: "actor-a",
