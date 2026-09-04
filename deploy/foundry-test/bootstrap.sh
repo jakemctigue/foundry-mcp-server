@@ -103,7 +103,7 @@ try:
     stage = "owner password hashing"
     hashed = subprocess.run(["docker", "run", "--rm", "-i", "--network", "none", "--log-driver", "none",
                              "--read-only", "--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE", "--security-opt", "no-new-privileges:true",
-                             "caddy:2.11.4-alpine", "caddy", "hash-password", "--algorithm", "bcrypt", "--bcrypt-cost", "14"],
+                             "caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648", "caddy", "hash-password", "--algorithm", "bcrypt", "--bcrypt-cost", "14"],
                             input=owner["owner_password"].encode() + b"\n", capture_output=True, check=True, timeout=120).stdout.strip()
     if not re.fullmatch(rb"\$2[aby]\$14\$[./A-Za-z0-9]{53}", hashed):
         raise ValueError("Invalid bcrypt output")

@@ -47,8 +47,8 @@ test("only HTTPS gateway ports are public; Foundry is loopback-only and MCP is a
 });
 
 test("released images are fixed and Foundry has a stable license hostname", () => {
-  assert.equal(config.services.foundry.image, "ghcr.io/felddy/foundryvtt:14.367.0");
-  assert.equal(config.services.caddy.image, "caddy:2.11.4-alpine");
+  assert.equal(config.services.foundry.image, "ghcr.io/felddy/foundryvtt:14.367.0@sha256:5004a67fbbef8e3f5f82afb01c8dbe06626c57519cad541a59b1bdce3c2a97ac");
+  assert.equal(config.services.caddy.image, "caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648");
   assert.equal(config.services.foundry.hostname, "bossforge-foundry-test");
   const env = config.services.foundry.environment;
   assert.equal(env.FOUNDRY_HOSTNAME, "foundrytest.bossforge.dev");
@@ -167,6 +167,7 @@ test("bootstrap uses only version-pinned secret resources and ephemeral file hyd
 });
 
 test("bootstrap hashes through stdin and gates Foundry startup on trusted HTTPS rejection", () => {
+  assert.ok(bootstrap.includes(`"${config.services.caddy.image}"`), "password helper must use the same immutable Caddy image");
   assert.match(bootstrap, /"--network", "none", "--log-driver", "none"/);
   assert.match(bootstrap, /input=owner\["owner_password"\]\.encode\(\) \+ b"\\n"/);
   assert.match(bootstrap, /capture_output=True/);

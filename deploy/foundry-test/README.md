@@ -22,9 +22,10 @@ Firebase catalog persistence, delete the disposable VM and its test disk.
 | Container restart to test data    | Stable container hostname and test-only `/data` bind mount, with configuration preservation      |
 
 Image versions are `ghcr.io/felddy/foundryvtt:14.367.0` (Foundry 14.367, Node 24)
-and `caddy:2.11.4-alpine`. These are exact released tags, not immutable digest
-pins. Review image scan results and record pulled digests before deployment;
-updates require review. The target D&D system release is **5.3.3**. Do not silently
+and `caddy:2.11.4-alpine`, pinned by immutable SHA-256 digest in Compose and the
+password-hashing helper. Review image scan results before deployment; updates
+require review. See the [dated runtime evidence](docs/deployment-verification.md)
+for the pulled digests and demonstrated boundaries. The target D&D system release is **5.3.3**. Do not silently
 substitute a development branch or migrate production worlds into this host.
 
 ## Bootstrap gates
@@ -158,9 +159,11 @@ verified for Foundry 14). Do not use Update All during the validation campaign:
 the installed manifest's update pointer targets the moving `master` branch.
 From **Game Worlds > Create World**, create a new disposable world with a simple
 hyphenated data path and choose Dungeons & Dragons Fifth Edition as its system.
-Launch the world and select the initial Gamemaster. A new world's default GM has
-no password; leave the field empty for this first login, then immediately use
-**Game Settings > User Management** to assign a unique GM password and save.
+In the observed 14.367 flow, select the system tile before **Continue**. Creation
+opens **User Management** for the new world. The default Gamemaster has no
+password: the owner should set a unique GM password and choose **Save and Continue**
+before proceeding. If an existing world opens its Join page instead, use
+**Game Settings > User Management** after GM login to secure its account.
 That world password is distinct from the gateway and Setup administrator passwords.
 No premium adventure/world package is required for the system's SRD compendia.
 These UI instructions follow the official knowledge base; exact button placement

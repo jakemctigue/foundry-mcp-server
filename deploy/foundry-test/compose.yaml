@@ -3,7 +3,7 @@ name: bossforge-foundry-test
 # Dedicated disposable Linux host. Never merge the MCP example Compose file here.
 services:
   foundry:
-    image: ghcr.io/felddy/foundryvtt:14.367.0
+    image: ghcr.io/felddy/foundryvtt:14.367.0@sha256:5004a67fbbef8e3f5f82afb01c8dbe06626c57519cad541a59b1bdce3c2a97ac
     hostname: bossforge-foundry-test
     restart: "no"
     init: true
@@ -53,7 +53,7 @@ services:
     # Public access is exclusively through the owner-gated proxy.
 
   caddy:
-    image: caddy:2.11.4-alpine
+    image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
     restart: "no"
     stop_grace_period: 30s
     security_opt:
