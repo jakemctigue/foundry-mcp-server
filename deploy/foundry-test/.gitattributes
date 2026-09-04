@@ -1,0 +1,2 @@
+# The bootstrap runs on Linux even when this repository is checked out on Windows.
+*.sh text eol=lf

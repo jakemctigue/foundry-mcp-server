@@ -1,0 +1,113 @@
+name: bossforge-foundry-test
+
+# Dedicated disposable Linux host. Never merge the MCP example Compose file here.
+services:
+  foundry:
+    image: ghcr.io/felddy/foundryvtt:14.367.0
+    hostname: bossforge-foundry-test
+    restart: "no"
+    init: true
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      FOUNDRY_HOSTNAME: foundrytest.bossforge.dev
+      FOUNDRY_PROXY_SSL: "true"
+      FOUNDRY_PROXY_PORT: "443"
+      FOUNDRY_IP_DISCOVERY: "false"
+      FOUNDRY_UPNP: "false"
+      FOUNDRY_TELEMETRY: "false"
+      FOUNDRY_LOG_SIZE: 5m
+      FOUNDRY_MAX_LOGS: "3"
+      CONTAINER_CACHE: /data/container_cache
+      CONTAINER_CACHE_SIZE: "1"
+      CONTAINER_PRESERVE_CONFIG: "true"
+      CONTAINER_UMASK: "0077"
+    secrets:
+      - source: foundry_runtime
+        target: config.json
+    volumes:
+      - type: bind
+        source: /var/lib/foundry-test/data
+        target: /data
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777
+    networks:
+      - foundry_web
+    ports:
+      # The VM-local GM browser uses HTTP loopback for its private MCP socket.
+      # Never remove host_ip or change this to an external interface.
+      - target: 30000
+        published: "30000"
+        host_ip: 127.0.0.1
+        protocol: tcp
+    logging:
+      driver: local
+      options:
+        max-size: 5m
+        max-file: "3"
+    # Public access is exclusively through the owner-gated proxy.
+
+  caddy:
+    image: caddy:2.11.4-alpine
+    restart: "no"
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    ports:
+      - target: 80
+        published: "80"
+        protocol: tcp
+      - target: 443
+        published: "443"
+        protocol: tcp
+    secrets:
+      - source: owner_auth
+        target: owner-auth.caddy
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/lib/foundry-test/caddy-data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/lib/foundry-test/caddy-config
+        target: /config
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    networks:
+      - foundry_web
+    logging:
+      driver: local
+      options:
+        max-size: 5m
+        max-file: "3"
+
+secrets:
+  foundry_runtime:
+    file: /run/foundry-test/foundry-runtime.json
+  owner_auth:
+    file: /run/foundry-test/owner-auth.caddy
+
+networks:
+  foundry_web:
+    driver: bridge
+    # Outbound access is needed for license verification and 5E installation.
+    # A private Docker bridge is not a substitute for host/cloud ingress rules.
