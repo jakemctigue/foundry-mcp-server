@@ -6,6 +6,57 @@ describe("MOCKED FOUNDRY v14 module entry settings", () => {
     vi.resetModules();
   });
 
+  it.each([
+    ["late GM", undefined, { isGM: true }, true],
+    ["late player", undefined, { isGM: false }, false],
+    ["unresolved user", undefined, undefined, false],
+    ["no longer GM", { isGM: true }, { isGM: false }, false],
+  ] as const)(
+    "updates settings visibility for the %s at ready",
+    async (_label, initialUser, readyUser, visible) => {
+      const callbacks = new Map<string, () => void>();
+      const definitions = new Map<string, Record<string, unknown>>();
+      const register = vi.fn((namespace: string, key: string, config: Record<string, unknown>) => {
+        definitions.set(`${namespace}.${key}`, { ...config });
+      });
+      const get = vi.fn(() => "");
+      const game = {
+        user: initialUser as { isGM: boolean } | undefined,
+        settings: { register, get, settings: definitions },
+      };
+      const Socket = vi.fn();
+      vi.stubGlobal("Hooks", {
+        once: (event: string, callback: () => void) => callbacks.set(event, callback),
+      });
+      vi.stubGlobal("game", game);
+      vi.stubGlobal("WebSocket", Socket);
+
+      await import("../src/module-entry.js");
+      callbacks.get("init")?.();
+      expect([...definitions.values()].map((setting) => setting.config)).toEqual([
+        initialUser?.isGM === true,
+        initialUser?.isGM === true,
+        initialUser?.isGM === true,
+      ]);
+      game.user = readyUser;
+      callbacks.get("ready")?.();
+      await Promise.resolve();
+
+      expect(register).toHaveBeenCalledTimes(3);
+      expect([...definitions.values()].map((setting) => setting.config)).toEqual([
+        visible,
+        visible,
+        visible,
+      ]);
+      expect(definitions.get("foundry-mcp.pairingSecret")).toMatchObject({
+        scope: "client",
+        config: visible,
+      });
+      expect(Socket).not.toHaveBeenCalled();
+      if (!visible) expect(get).not.toHaveBeenCalled();
+    },
+  );
+
   it("stores the pairing value client-side and renders it as a password input", async () => {
     const callbacks = new Map<string, () => void>();
     const register = vi.fn();

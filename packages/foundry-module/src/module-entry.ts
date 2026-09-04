@@ -160,6 +160,18 @@ function registerSettings(): void {
   });
 }
 
+function updateSettingsVisibility(): void {
+  const settings = record(record(record(globalThis).game).settings);
+  const definitions = record(settings.settings);
+  const get = definitions.get;
+  if (typeof get !== "function") return;
+  const visible = currentUserIsGameMaster();
+  for (const key of [ENDPOINT_SETTING, PAIRING_SECRET_SETTING, ASSET_SOURCE_CAPABILITIES_SETTING]) {
+    const definition = get.call(definitions, `${MODULE_ID}.${key}`);
+    if (definition && typeof definition === "object") record(definition).config = visible;
+  }
+}
+
 function configuredEndpoint(): string {
   const settings = record(record(record(globalThis).game).settings);
   const get = settings.get;
@@ -282,6 +294,8 @@ const once = hooks.once;
 if (typeof once === "function") {
   once.call(hooks, "init", registerSettings);
   once.call(hooks, "ready", () => {
+    // game.user is not resolved at init; refresh only visibility, not stored values.
+    updateSettingsVisibility();
     void startCompanion().catch((error: unknown) => {
       notify(
         "error",
