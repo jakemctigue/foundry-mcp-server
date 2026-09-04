@@ -100,6 +100,20 @@ interface InFlightRequest {
 
 const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+const MAX_CACHED_READ_RESPONSE_BYTES = 1024 * 1024;
+const READ_METHODS = new Set([
+  "documents.types",
+  "documents.list",
+  "documents.get",
+  "documents.embedded.list",
+  "documents.snapshot",
+  "compendiums.list",
+  "compendiums.documents.list",
+  "assets.images.list",
+  "assets.references.find",
+  "sessions.list",
+  "sessions.get",
+]);
 const MUTATION_METHODS = new Set([
   "documents.create",
   "documents.update",
@@ -683,14 +697,38 @@ export class CompanionBridgeClient {
         (entry) => entry.id !== request.id,
       );
       this.#cacheResponse(response, identity);
-      this.#persist();
+      try {
+        this.#persist();
+      } catch {
+        // The older durable guard still prevents replay after a reload.
+        this.#state.inFlightMutations.push(recoveredMutation);
+      }
       this.#send(response);
       return;
     }
     const isMutation = MUTATION_METHODS.has(request.method);
     if (isMutation) {
       this.#state.inFlightMutations.push(identity);
-      this.#persist();
+      try {
+        this.#persist();
+      } catch {
+        this.#state.inFlightMutations = this.#state.inFlightMutations.filter(
+          (entry) => entry.id !== request.id,
+        );
+        this.#send({
+          type: "response",
+          id: request.id,
+          ok: false,
+          error: {
+            code: "FOUNDRY_ERROR",
+            message:
+              "Companion storage could not record the mutation guard; no mutation was dispatched",
+            retryable: false,
+            details: { notDispatched: true },
+          },
+        });
+        return;
+      }
     }
     const now = Date.now();
     const deadline = Math.min(
@@ -727,8 +765,30 @@ export class CompanionBridgeClient {
         );
       }
       this.#cacheResponse(response, identity);
-      this.#persist();
-      for (let index = 0; index < state.waiters; index += 1) this.#send(response);
+      let delivered = response;
+      try {
+        this.#persist();
+      } catch {
+        // Read responses need not be durable. A dispatched mutation must retain
+        // its older durable guard and cannot be reported as safely replayable.
+        if (isMutation) {
+          this.#state.inFlightMutations.push(identity);
+          delivered = {
+            type: "response",
+            id: request.id,
+            ok: false,
+            error: {
+              code: "INDETERMINATE_MUTATION",
+              message:
+                "Mutation completion could not be persisted; reconcile state before retrying",
+              retryable: false,
+              details: { indeterminate: true, reconciliationRequired: true },
+            },
+          };
+          this.#cacheResponse(delivered, identity);
+        }
+      }
+      for (let index = 0; index < state.waiters; index += 1) this.#send(delivered);
     });
   }
 
@@ -736,7 +796,7 @@ export class CompanionBridgeClient {
     this.#state.responses = [
       ...this.#state.responses.filter((entry) => entry.id !== response.id),
       response,
-    ].slice(-this.#maxCachedResponses);
+    ];
     const retainedIds = new Set(this.#state.responses.map((entry) => entry.id));
     this.#state.responseIdentities = [
       ...this.#state.responseIdentities.filter((entry) => entry.id !== identity.id),
@@ -852,7 +912,51 @@ export class CompanionBridgeClient {
   }
 
   #persist(): void {
-    this.options.storage.setItem(this.#storageKey, JSON.stringify(this.#state));
+    const reads = this.#cachedReadResponses().map((response) => ({
+      id: response.id,
+      bytes: new TextEncoder().encode(JSON.stringify(response)).length,
+    }));
+    let readBytes = reads.reduce((total, response) => total + response.bytes, 0);
+    while (
+      reads.length > 0 &&
+      (readBytes > MAX_CACHED_READ_RESPONSE_BYTES ||
+        this.#state.responses.length > this.#maxCachedResponses)
+    ) {
+      const oldest = reads.shift();
+      if (!oldest) break;
+      this.#removeCachedReadResponse(oldest.id);
+      readBytes -= oldest.bytes;
+    }
+    for (;;) {
+      try {
+        this.options.storage.setItem(this.#storageKey, JSON.stringify(this.#state));
+        return;
+      } catch (error) {
+        const oldest = this.#cachedReadResponses()[0];
+        if ((error as { name?: unknown } | null)?.name !== "QuotaExceededError" || !oldest) {
+          throw error;
+        }
+        this.#removeCachedReadResponse(oldest.id);
+      }
+    }
+  }
+
+  #cachedReadResponses(): CompanionResponseMessage[] {
+    const readIds = new Set(
+      this.#state.responseIdentities
+        .filter((identity) => READ_METHODS.has(identity.method))
+        .map((identity) => identity.id),
+    );
+    // Missing/unknown identities may be legacy mutation receipts. Never evict
+    // them, mutation responses, or in-flight guards to make room for reads.
+    return this.#state.responses.filter((response) => readIds.has(response.id));
+  }
+
+  #removeCachedReadResponse(id: string): void {
+    this.#state.responses = this.#state.responses.filter((response) => response.id !== id);
+    this.#state.responseIdentities = this.#state.responseIdentities.filter(
+      (identity) => identity.id !== id,
+    );
   }
 }
 

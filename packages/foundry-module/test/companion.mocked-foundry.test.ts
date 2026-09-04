@@ -27,6 +27,16 @@ class MemoryStorage implements CompanionStorage {
   }
 }
 
+class QuotaStorage extends MemoryStorage {
+  limit = Number.POSITIVE_INFINITY;
+  override setItem(key: string, value: string): void {
+    if (new TextEncoder().encode(value).length > this.limit) {
+      throw new DOMException("Synthetic storage quota exceeded", "QuotaExceededError");
+    }
+    super.setItem(key, value);
+  }
+}
+
 class MockSocket implements CompanionSocket {
   readyState = 1;
   closeCode: number | undefined;
@@ -125,6 +135,223 @@ async function authenticate(socket: MockSocket, connectionId = "world-a"): Promi
 }
 
 describe("browser companion (mocked Foundry global)", () => {
+  it("bounds large read responses without evicting mutation dedupe under cache pressure", async () => {
+    const storage = new QuotaStorage();
+    storage.limit = 1_100_000;
+    const socket = new MockSocket();
+    const handler = vi.fn(async (method: string): Promise<JsonValue> =>
+      method === "documents.create"
+        ? { created: "Actor.a" }
+        : method === "documents.list"
+          ? { items: [] }
+          : { data: "s".repeat(600_000) },
+    );
+    const options = {
+      endpoint: "ws://127.0.0.1:3210",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
+      ...pairedOptions(),
+      storage,
+      handleRequest: handler,
+      maxCachedResponses: 2,
+    };
+    const client = new CompanionBridgeClient({ ...options, createSocket: () => socket });
+    client.start();
+    await authenticate(socket);
+    const mutation = {
+      type: "request",
+      id: "protected-create",
+      method: "documents.create",
+      params: {},
+    };
+    const requests = [
+      mutation,
+      ...Array.from({ length: 4 }, (_, index) => ({
+        type: "request",
+        id: `read-${index.toString()}`,
+        method: "compendiums.documents.list",
+        params: {},
+      })),
+      { type: "request", id: "actors", method: "documents.list", params: { type: "Actor" } },
+    ];
+    for (const [index, request] of requests.entries()) {
+      await socket.emitMessage(request);
+      await vi.waitFor(() => expect(socket.sent).toHaveLength(index + 1));
+      expect(socket.sent[index]).toMatchObject({ id: request.id, ok: true });
+    }
+    const saved = storage.getItem("foundry-mcp:world-a:bridge-state") ?? "";
+    expect(new TextEncoder().encode(saved).length).toBeLessThan(1_100_000);
+    expect(JSON.parse(saved)).toMatchObject({
+      responses: expect.arrayContaining([expect.objectContaining({ id: mutation.id, ok: true })]),
+    });
+    client.stop();
+    const restartedSocket = new MockSocket();
+    const restarted = new CompanionBridgeClient({
+      ...options,
+      createSocket: () => restartedSocket,
+    });
+    restarted.start();
+    await authenticate(restartedSocket);
+    await restartedSocket.emitMessage(mutation);
+    await vi.waitFor(() => expect(restartedSocket.sent).toHaveLength(1));
+    expect(handler).toHaveBeenCalledTimes(requests.length);
+    expect(restartedSocket.sent[0]).toMatchObject({ id: mutation.id, ok: true });
+    restarted.stop();
+  });
+
+  it("recovers a legacy oversized read cache at startup without dropping unknown mutation evidence", async () => {
+    const storage = new QuotaStorage();
+    const key = "foundry-mcp:world-a:bridge-state";
+    storage.values.set(
+      key,
+      JSON.stringify({
+        nextSequenceId: 1,
+        pendingEvents: [],
+        responses: [
+          { type: "response", id: "legacy-protected", ok: true, value: { created: "Actor.a" } },
+          ...Array.from({ length: 4 }, (_, index) => ({
+            type: "response",
+            id: `old-read-${index.toString()}`,
+            ok: true,
+            value: { data: "s".repeat(400_000) },
+          })),
+        ],
+        responseIdentities: Array.from({ length: 4 }, (_, index) => ({
+          id: `old-read-${index.toString()}`,
+          correlationId: `old-read-${index.toString()}`,
+          method: "compendiums.documents.list",
+          paramsHash: "A".repeat(43),
+        })),
+        inFlightMutations: [{ id: "pending-create", method: "documents.create" }],
+      }),
+    );
+    storage.limit = 100_000;
+    const socket = new MockSocket();
+    const client = new CompanionBridgeClient({
+      endpoint: "ws://127.0.0.1:3210",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
+      ...pairedOptions(),
+      storage,
+      createSocket: () => socket,
+      handleRequest: async () => ({ items: [] }),
+    });
+    client.start();
+    await authenticate(socket);
+    expect(socket.closeCode).toBeUndefined();
+    await socket.emitMessage({
+      type: "request",
+      id: "after-recovery",
+      method: "documents.list",
+      params: { type: "Actor" },
+    });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    expect(socket.sent[0]).toMatchObject({ id: "after-recovery", ok: true });
+    expect(JSON.parse(storage.getItem(key) ?? "null")).toMatchObject({
+      responses: expect.arrayContaining([expect.objectContaining({ id: "legacy-protected" })]),
+      inFlightMutations: [{ id: "pending-create", method: "documents.create" }],
+    });
+    client.stop();
+  });
+
+  it("does not dispatch mutations when their durable guard cannot be written, while reads still respond", async () => {
+    const storage = new QuotaStorage();
+    const socket = new MockSocket();
+    const handler = vi.fn(async (): Promise<JsonValue> => ({ items: [] }));
+    const client = new CompanionBridgeClient({
+      endpoint: "ws://127.0.0.1:3210",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
+      ...pairedOptions(),
+      storage,
+      createSocket: () => socket,
+      handleRequest: handler,
+    });
+    client.start();
+    await authenticate(socket);
+    storage.limit = 0;
+    await socket.emitMessage({
+      type: "request",
+      id: "blocked-create",
+      method: "documents.create",
+      params: {},
+    });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    expect(handler).not.toHaveBeenCalled();
+    expect(socket.sent[0]).toMatchObject({
+      id: "blocked-create",
+      ok: false,
+      error: { code: "FOUNDRY_ERROR", details: { notDispatched: true } },
+    });
+    await socket.emitMessage({
+      type: "request",
+      id: "read-after-quota",
+      method: "documents.list",
+      params: {},
+    });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
+    expect(socket.sent[1]).toMatchObject({ id: "read-after-quota", ok: true });
+    expect(handler).toHaveBeenCalledTimes(1);
+    client.stop();
+  });
+
+  it("retains a completed mutation guard after quota failure and never replays it across restart", async () => {
+    const storage = new QuotaStorage();
+    const socket = new MockSocket();
+    const handler = vi.fn(async (): Promise<JsonValue> => {
+      storage.limit = 0;
+      return { created: "Actor.a" };
+    });
+    const options = {
+      endpoint: "ws://127.0.0.1:3210",
+      allowedOrigins: [PAGE_ORIGIN],
+      pageOrigin: PAGE_ORIGIN,
+      ...pairedOptions(),
+      storage,
+      handleRequest: handler,
+    };
+    const client = new CompanionBridgeClient({ ...options, createSocket: () => socket });
+    client.start();
+    await authenticate(socket);
+    const request = {
+      type: "request",
+      id: "uncertain-create",
+      method: "documents.create",
+      params: { name: "Hero" },
+    };
+    await socket.emitMessage(request);
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    expect(socket.sent[0]).toMatchObject({ ok: false, error: { code: "INDETERMINATE_MUTATION" } });
+    expect(JSON.parse(storage.getItem("foundry-mcp:world-a:bridge-state") ?? "null")).toMatchObject(
+      {
+        inFlightMutations: [expect.objectContaining({ id: request.id })],
+      },
+    );
+    await socket.emitMessage(request);
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
+    expect(socket.sent[1]).toMatchObject({ ok: false, error: { code: "INDETERMINATE_MUTATION" } });
+    await socket.emitMessage({ ...request, params: { name: "Different" } });
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(3));
+    expect(socket.sent[2]).toMatchObject({ ok: false, error: { code: "CONFLICT" } });
+    client.stop();
+    storage.limit = Number.POSITIVE_INFINITY;
+    const restartedSocket = new MockSocket();
+    const restarted = new CompanionBridgeClient({
+      ...options,
+      createSocket: () => restartedSocket,
+    });
+    restarted.start();
+    await authenticate(restartedSocket);
+    await restartedSocket.emitMessage(request);
+    await vi.waitFor(() => expect(restartedSocket.sent).toHaveLength(1));
+    expect(restartedSocket.sent[0]).toMatchObject({
+      ok: false,
+      error: { code: "INDETERMINATE_MUTATION" },
+    });
+    expect(handler).toHaveBeenCalledTimes(1);
+    restarted.stop();
+  });
+
   it("replays only from the host resume point and keeps sequence state across restart", async () => {
     const storage = new MemoryStorage();
     const sockets: MockSocket[] = [];
