@@ -5,7 +5,7 @@ Status: not started. See [plan](plan.md). Each task is a separate reviewable sli
 ## 1. Establish compatibility and deployment contract
 
 - [ ] Record supported Foundry/dnd5e/rules versions, licensed content scope, and test-world identity.
-- [ ] Obtain approval for VM/tunnel architecture and budget; verify project/DNS access without changing production.
+- [ ] Review the VM budget and owner-authentication mechanism for confirmed public HTTPS Foundry/private MCP access; verify project/DNS access without changing production.
 - Verification: review manifests and official compatibility docs; owner reviews recorded decisions.
 - Dependencies: none. Scope: small, 1-2 files.
 - Likely files: `tasks/plan.md`, `docs/validation-compatibility.md` (new).
@@ -40,9 +40,9 @@ Status: not started. See [plan](plan.md). Each task is a separate reviewable sli
 
 ## 5. Provision the private test host after approval
 
-- [ ] Define VM, small persistent disk, scoped identity, private ingress, and owner domain/tunnel setup as reproducible configuration.
-- [ ] Owner can install license and dnd5e; stop/start preserves setup. RackNerd/DNS production records remain unchanged.
-- Verification: infrastructure plan review, private-access denial test, owner setup walkthrough, stop/start test, cost estimate.
+- [ ] Define VM, small persistent disk, scoped identity, and public HTTPS Foundry proxy/DNS with owner authentication in place before first exposure. Keep raw Foundry and all MCP endpoints non-public; no public MCP proxy routes.
+- [ ] Owner can enter the license, create a GM account, and install dnd5e in a normal browser without a tunnel. Verify Foundry browser WebSockets, a bounded setup maintenance window, and setup persistence across stop/start. RackNerd/DNS production records remain unchanged.
+- Verification: external owner setup walkthrough, unauthenticated denial, backend/MCP port and proxy-route denial (IPv4/IPv6 as configured), private runner handshake, stop/start DNS/TLS checks, and revised cost estimate.
 - Dependencies: 1, 4. Scope: medium, up to 5 new deployment/runbook files.
 - Likely files: `deploy/gcp/` infrastructure definitions, service configuration, and `docs/gcp-test-host.md`.
 
@@ -156,5 +156,5 @@ Status: not started. See [plan](plan.md). Each task is a separate reviewable sli
 - [ ] Relevant tests, lint, typecheck, build, CI, and real Foundry regressions pass for merged GitHub SHAs.
 - [ ] Published source, packaged artifacts, installed runtime, and catalog versions are recorded; no completed fixes exist only in Archon.
 - [ ] Document install/update/rollback for Claude Code, Codex, Cursor, and the cloud runner using the final transport, without claiming current stdio clients already support a remote URL.
-- [ ] Owner verifies `foundrytest.bossforge.dev`, retained setup, costs, and complete actor behavior. Existing RackNerd Foundry and normal customer exports remain unaffected.
+- [ ] Owner verifies internet-accessible `foundrytest.bossforge.dev`, retained setup, costs, and complete actor behavior. External checks confirm no MCP socket or proxy route is reachable. Existing RackNerd Foundry and normal customer exports remain unaffected.
 - [ ] Review controlled BossForge rollout and rollback before changing production.

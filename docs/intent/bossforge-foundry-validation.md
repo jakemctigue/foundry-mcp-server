@@ -10,7 +10,8 @@ BossForge.dev must export complete D&D 5E Foundry actors whose spells and suppor
 ## Confirmed requirements
 
 - Build a private development and regression-testing backend, not a public gameplay service.
-- Provide an owner-accessible Foundry administration interface at `foundrytest.bossforge.dev` to enter the license and install the D&D 5E system.
+- Provide an internet-accessible HTTPS Foundry interface at `foundrytest.bossforge.dev` so the owner can enter the license, create a Game Master account, and install the D&D 5E system from a normal browser without a tunnel or VPN. Protect setup and administration with owner authentication; internet-accessible does not mean anonymous administration.
+- Never expose MCP sockets to the internet, even behind authentication. Keep the MCP adapter, host bridge, and companion connection local/private and separate from Foundry's public browser traffic.
 - Leave `foundry.bossforge.dev` and its existing RackNerd instance untouched.
 - Let BossForge retrieve approved spell data and validate generated actors through Foundry MCP.
 - Use Foundry's SRD 5.2 spell items as the source for persistent Firebase spell objects. When creating a spellcasting NPC, copy the selected canonical spells onto its sheet instead of generating their mechanics from scratch. Record the exact installed SRD patch and system version; do not silently substitute SRD 5.1.
