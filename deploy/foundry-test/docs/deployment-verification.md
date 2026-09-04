@@ -4,15 +4,17 @@ This is a dated deployment and representative gameplay-test snapshot, not ongoin
 monitoring or proof that every ability or future generated actor is correct.
 The owner authorized this on-demand Google VM, the public test hostname, runtime
 credential retrieval from Secret Manager, and acceptance of the displayed Foundry
-license agreement. The existing RackNerd server and production BossForge service
-were not changed.
+license agreement. The existing RackNerd server was not changed. The subsequent
+BossForge production release is recorded separately below.
 
 ## Verified runtime
 
 - Project `bossforgedev` (number `278230599227`), zone `us-central1-a`.
 - Disposable `foundry-test` VM, instance ID `7129623805755333028`, Ubuntu 24.04,
-  e2-small, 20 GB disposable standard boot disk, four-hour maximum run duration
-  with stop action. A stopped VM still retains its billed disk; it is not teardown.
+  e2-small, 20 GB disposable standard boot disk. Its initial four-hour run stopped
+  automatically at approximately 15:34 UTC. The preserved test session was
+  restarted with a one-hour maximum run duration and stop action for remaining
+  functional checks. A stopped VM still retains its billed disk; it is not teardown.
 - Dedicated VPC/subnet and service account. Secret accessor grants are limited to
   the two pinned Foundry bootstrap/owner secret versions documented in the README.
 - Only TCP 80/443 public. SSH is restricted to IAP. External checks could not
@@ -130,9 +132,9 @@ when explicitly configured; no mutable active-pointer promotion is required.
 The saved JSON does not depend on this VM staying online. Destination Foundry
 installations still need compatible core/D&D system assets to resolve their
 relative artwork and compendium references. Retain the Firebase catalog during
-teardown. Publishing the generator integration and setting
-`FOUNDRY_SPELL_CATALOG_REVISION` to the full revision above are still deployment
-gates, not outcomes established by the import alone.
+teardown. The production release below now selects this exact revision through
+`FOUNDRY_SPELL_CATALOG_REVISION`; the import alone did not establish production
+generation behavior.
 
 Local catalog compatibility checks passed all 160 supported class/level
 combinations. Five disposable actor fixtures subsequently passed live schema and
@@ -200,7 +202,42 @@ these captures. Live inspection found the canonical pact Hex duration remained
 one hour; a narrowly scoped generator correction for pact-tier duration has
 local regression coverage, but its refreshed live workflow remains pending.
 The BossForge suite passed 674 local tests (650 Vitest and 24 Node tests), plus
-type checking; these do not substitute for the still-pending production rollout.
+type checking; these do not substitute for checking actual production-generated
+actors in Foundry.
+
+## BossForge production deployment
+
+[BossForge PR #120](https://github.com/jakemctigue/bossforge.dev/pull/120) merged
+as `0c99b320da79ad4e529369013f2d039604a20348`. Google Cloud Build
+`e25a6a57-5df8-446c-91e7-5520f8a3fae3` completed successfully at
+`2026-09-04T14:49:20.884823Z`. The deployed image from
+`gcr.io/bossforgedev/boss-forge` has digest
+`sha256:d2ddca0b7a066e89bf0b5e557dff865479ce008ba288746da23c2a93b8858391`.
+
+Cloud Run revision `boss-forge-00031-zxh` serves 100% of traffic. Its
+`FOUNDRY_SPELL_CATALOG_REVISION` was verified as
+`a88a57bc0b1dfdad3548665ab42ad712af7c0c9377ad45e30d180d0a4b072fc8`.
+The production UI shows the new SRD 5.2 caption, and the authenticated owner's
+eight saved NPC records loaded from Firebase.
+
+A real production request for a level-11 warlock, CR 9, with two explicitly
+specified typed-attack/save-DC features was rejected by the parity validator:
+the model omitted the nested attack/save configurations and damage parts.
+No broken actor was added to the owner's eight-record roster. The model response
+schema had made those nested fields optional despite requiring them in prose.
+
+[BossForge PR #122](https://github.com/jakemctigue/bossforge.dev/pull/122) fixes
+that contract using type-specific required fields, without weakening the parity
+validator. It merged as `fe65cb9afb95f5a6bcbc880cf6ad79b20901abd9`.
+TypeScript and 694 tests passed (670 Vitest, 24 Node). Cloud Build
+`f144c67f-ec5d-46f5-9b4f-5826cd511fd4` succeeded at
+`2026-09-04T15:41:22.533150Z`; revision `boss-forge-00032-67s` serves 100% of
+traffic with image digest
+`sha256:a95d4be2cb6f74360c9027040af6abe7ac4a33743780dca700cc9e8e79c80d6e`.
+The exact catalog revision above was reverified on the deployed revision.
+The subsequent production-generated JSON, Foundry import, and native activity
+execution remain acceptance gates; the passing release checks are not a claim
+that this production-generated actor has passed them.
 
 ## Historical image scan and unused candidate
 
@@ -225,9 +262,9 @@ is claimed in this snapshot.
 - Verify the refreshed Hex pact-duration workflow in the disposable world and
   retain explicit limits for unexecuted feature/target interactions. Existing
   MCP does not execute D&D activities; the demonstrated rolls used native UI.
-- Ship the verified generator integration with the explicit saved catalog
-  revision and confirm the deployed BossForge behavior.
+- Inspect the pending production-generated NPC and its Foundry import/activities
+  to confirm the deployed BossForge behavior, including the requested mechanics.
 - Stop the browser, adapter, MCP host, and Foundry, then delete only the approved
   disposable resources while retaining the Firebase catalog. The outstanding
-  targeted live checks, generator deployment, and completed teardown remain
+  targeted live checks, production-generation verification, and completed teardown remain
   pending; the representative tests above are not a blanket validation pass.
