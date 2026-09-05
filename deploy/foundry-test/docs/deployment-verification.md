@@ -525,10 +525,11 @@ boot disk were deleted. The two dedicated firewall rules
 account, and `foundry-test-owner-access` secret were also deleted. Local private
 owner and pairing files were removed and verified absent.
 
-A filtered post-delete inventory returned no disposable test resources and only
-the reusable `foundry-test-account-bootstrap` secret, intentionally retained.
-The immutable Firebase spell catalog was also retained. The existing RackNerd
-Foundry server and production BossForge resources were not teardown targets.
+A filtered post-delete Google Cloud inventory returned no disposable Google
+Cloud test resources and only the reusable `foundry-test-account-bootstrap`
+secret, intentionally retained. The immutable Firebase spell catalog was also
+retained. The existing RackNerd Foundry server and production BossForge
+resources were not teardown targets.
 
 The Cloudflare `foundrytest` A record still points to the former ephemeral
 address, but there is no longer a test server behind it. Deleting that record is

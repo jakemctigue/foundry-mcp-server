@@ -284,8 +284,10 @@ Sorcerer, Warlock, Ranger, and Paladin. For every actor, verify:
 The Compose data bind persists while the disposable disk exists, but `/run` is
 tmpfs. After a VM restart:
 
-1. Re-run the reviewed Foundry bootstrap to recreate `foundry-runtime.json` and
-   `owner-auth.caddy` from Secret Manager before starting the containers.
+1. With the Compose stack stopped, re-run the reviewed Foundry bootstrap. It
+   recreates `foundry-runtime.json` and `owner-auth.caddy` from Secret Manager,
+   validates Caddy, and starts the Foundry and Caddy containers; do not start the
+   stack separately first.
 2. Rehydrate the **same** MCP storage key before starting the host and adapter.
 3. Re-establish both owner-loopback tunnels and reopen the authenticated GM page.
 4. Confirm the world, system, companion, host connection, and gateway again.
@@ -301,8 +303,8 @@ Before deletion, preserve only:
 - The verified immutable Firebase catalog and revision identifier.
 - Sanitized test receipts, hashes, source commits, image digests, and explicit
   limitations.
-- The reusable `foundry-test-account-bootstrap` secret, unless the owner asks to
-  remove it.
+- The reusable `foundry-test-account-bootstrap` secret for future test-server
+  launches.
 - Merged application/MCP source and documentation through reviewed PRs.
   Then stop in this order: owner browser, adapter, MCP host, Foundry, and the Compose
   stack. Verify the exact resource names and delete only the disposable targets:
