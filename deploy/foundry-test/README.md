@@ -10,6 +10,11 @@ than a bare server; measure the actual workload before selecting the smallest VM
 Keep data only for the test campaign. After successful validation and verified
 Firebase catalog persistence, delete the disposable VM and its test disk.
 
+For the repeatable operator sequence, identities, restart recovery, and teardown
+checklist, use the [reusable test-server runbook](docs/test-server-runbook.md).
+This README remains the detailed deployment contract; the runbook is the shortest
+safe path for creating the next instance without rediscovering the setup flow.
+
 ## Boundaries and pinned versions
 
 | Boundary                          | Enforcement                                                                                      |
@@ -176,8 +181,8 @@ documents the host, companion, stdio adapter, and owner-IAP browser path; it is
 not part of this Compose bundle. The current campaign uses that interactive
 owner browser, not an unattended VM browser worker. See the
 [dated evidence and remaining gates](docs/deployment-verification.md) for the
-saved catalog, deployed response-cache recovery, representative native dice/save
-and damage-application results, and pending generator delivery and teardown.
+saved catalog, deployed generator and response-cache corrections, representative
+native dice/save and damage-application results, and final teardown status.
 
 The eventual GM browser worker runs on the host and uses `http://127.0.0.1:30000`
 so its private loopback MCP websocket is not blocked as mixed content from a
